@@ -29,7 +29,7 @@ local OPTIONS = {
 }
 
 -- Diagnostic log: capped circular buffer, timestamps, categories, and counters.
-local BUILD = "2.5.5 Organized UI / HUD Ability + Samples"
+local BUILD = "2.5.7 Ability HUD Zero / Organized UI"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -37,6 +37,8 @@ local debugStats = {
 	teleports = 0, teleportFailures = 0, unsafeDestinations = 0,
 	pickupTweens = 0, pickupTweenAborts = 0, pickupTweenDetours = 0,
 	pickupPreemptions = 0,
+	finalSweeps = 0, finalSweepChecks = 0, finalSweepCompleted = 0,
+	finalSweepTimeouts = 0, finalSweepResets = 0, finalSweepLastSecond = 0,
 	pickupTweenUnsafe = 0, pickupTweenDistance = 0, pickupTravelMs = 0,
 	pickupAttempts = 0, pickupConfirmed = 0, pickupUnconfirmed = 0,
 	promptAttempts = 0, promptFailures = 0, machineTargetChanges = 0,
@@ -535,7 +537,7 @@ local top = new("Frame", { Size = UDim2.new(1, 0, 0, 64), BackgroundColor3 = UI.
 new("Frame", { Size = UDim2.new(1, 0, 0, 2), Position = UDim2.new(0, 0, 1, -2),
 	BackgroundColor3 = UI.accent, BorderSizePixel = 0 }, top)
 uiText(top, "RAVA HUB", 21, true, UI.text, { Position = UDim2.fromOffset(22, 10), Size = UDim2.fromOffset(166, 27) })
-uiText(top, "TU / v2.5.5 / ORGANIZED", 10, true, UI.muted,
+uiText(top, "TU / v2.5.6 / FINAL PICKUP SWEEP", 10, true, UI.muted,
 	{ Position = UDim2.fromOffset(23, 37), Size = UDim2.fromOffset(190, 15) })
 local headerStatus = uiText(top, "SYSTEM READY", 12, true, UI.good,
 	{ Position = UDim2.fromOffset(346, 20), Size = UDim2.fromOffset(192, 24), TextXAlignment = Enum.TextXAlignment.Right })
@@ -557,7 +559,7 @@ local mainArea = new("Frame", { Position = UDim2.fromOffset(158, 64),
 	Size = UDim2.new(1, -158, 1, -94), BackgroundTransparency = 1 }, main)
 local footer = new("Frame", { Position = UDim2.new(0, 0, 1, -30), Size = UDim2.new(1, 0, 0, 30),
 	BackgroundColor3 = UI.surface, BorderSizePixel = 0 }, main)
-local footerLabel = uiText(footer, "v2.5.5   •   PICKUP TWEEN   •   OBJECTIVE TELEPORT", 11, false, UI.muted,
+local footerLabel = uiText(footer, "v2.5.6   •   FINAL PICKUP CHECK   •   SAFE FARM", 11, false, UI.muted,
 	{ Position = UDim2.fromOffset(17, 5), Size = UDim2.new(1, -30, 0, 21) })
 local pages, menuButtons, activeTab = {}, {}, "Autofarm"
 local toggleRefreshers = {}
@@ -1666,8 +1668,13 @@ end
 
 -- The HUD CoolDown.Time label is the source of truth for ability readiness.
 -- Do not guess an 8-second cooldown or spam a remote while its state is unknown.
-local ABILITY = { Poll = 0.12, ErrorRetry = 2, RejectedRetry = 1.2, ExitWait = 0.45, ExitSettle = 0.10 }
+local ABILITY = { Poll = 0.12, ErrorRetry = 2, RejectedRetry = 1.2,
+	ExitWait = 0.45, ExitSettle = 0.20, NoTransitionRetry = 2.5 }
+local abilityStatusLabel -- Created under Autofarm after the automation functions.
 local function readAbilityCooldown()
+	-- Roblox's "Aa" Explorer icon is commonly a TextLabel. Read the *Text*
+	-- property of the exact Time object rather than its visibility or a guessed
+	-- timer. "0" (also "0.0", "00", "0s") means usable; positive means cooling.
 	local hud = playerGui:FindFirstChild("HUD")
 	local items = hud and hud:FindFirstChild("ItemsHolder")
 	local main = items and items:FindFirstChild("MainFrame")
@@ -1675,28 +1682,30 @@ local function readAbilityCooldown()
 	local button = ability and ability:FindFirstChild("Button")
 	local cooldown = button and button:FindFirstChild("CoolDown")
 	local time = cooldown and cooldown:FindFirstChild("Time")
-	if not time then return nil, "HUD_missing", "", nil end
-	local text = (time:IsA("TextLabel") or time:IsA("TextButton") or time:IsA("TextBox"))
-		and time.Text or (time:IsA("StringValue") and time.Value or "")
+	if not time then return nil, "Time_not_found", "", nil end
+	local text
+	if time:IsA("TextLabel") or time:IsA("TextButton") or time:IsA("TextBox") then
+		text = time.Text
+	elseif time:IsA("StringValue") then
+		text = time.Value
+	else
+		return nil, "Time_unexpected_" .. time.ClassName, "", nil
+	end
 	text = tostring(text or "")
-	-- Some HUDs hide CoolDown entirely when the ability becomes available.
-	if cooldown:IsA("GuiObject") and not cooldown.Visible then
-		return true, "HUD_CoolDown_hidden", text, 0
-	end
-	local trimmed = text:match("^%s*(.-)%s*$") or ""
+	local trimmed = text:gsub("<[^>]->", ""):gsub("^%s+", ""):gsub("%s+$", "")
 	local lower = trimmed:lower()
-	if lower == "ready" or lower == "available" or lower == "use" then
-		return true, "HUD_ready_label", text, 0
-	end
-	-- Accept a standalone number (e.g. 6, 2.5, 0, 0.0, 2s).
 	local numeric = lower:match("^(%d+%.?%d*)%s*s?$")
 	local seconds = numeric and tonumber(numeric) or nil
 	if seconds == nil and lower:match("^%d+:%d%d:?%d?%d?$") then
 		seconds = 0
 		for part in lower:gmatch("%d+") do seconds = seconds * 60 + tonumber(part) end
 	end
-	if seconds ~= nil then return seconds <= 0, "HUD_CoolDown_Time", text, seconds end
-	return nil, "HUD_unrecognized_text", text, nil
+	if seconds ~= nil then
+		-- Deliberately IGNORE CoolDown.Visible. The on-screen text is the
+		-- specified source of truth even when a parent GUI is hidden.
+		return seconds == 0, "Time.Text:" .. time.ClassName, text, seconds
+	end
+	return nil, "Time_text_not_numeric:" .. time.ClassName, text, nil
 end
 
 -- These are assigned when the machine subsystem is created farther down.
@@ -1727,10 +1736,18 @@ function autoAbility.enable()
 	end, function()
 		local nextAttempt = 0
 		local waitForCooldown, cooldownObserved = false, false
+		local requestAt = 0
 		local lastState = ""
 		while alive and autoAbility.enabled and autoAbility.run == token do
 			local ready, source, label, seconds = readAbilityCooldown()
-			local signature = source .. ":" .. tostring(ready)
+			local signature = source .. ":" .. tostring(ready) .. ":" .. tostring(label)
+			if abilityStatusLabel then
+				abilityStatusLabel.Text = "Cooldown HUD: " .. (label ~= "" and label or "<missing>")
+					.. "  |  " .. (ready == nil and ("UNREADABLE (" .. source .. ")")
+						or (ready and "READY (0)" or "COOLING DOWN"))
+				abilityStatusLabel.TextColor3 = ready == true and UI.good
+					or (ready == nil and UI.bad or UI.muted)
+			end
 			if signature ~= lastState then
 				increment("abilityCooldownTransitions")
 				debugEvent("ABILITY", "cooldown_state", {
@@ -1748,7 +1765,18 @@ function autoAbility.enable()
 			elseif waitForCooldown and cooldownObserved then
 				waitForCooldown, cooldownObserved = false, false
 				increment("abilityCooldownRearms")
-				debugEvent("ABILITY", "cooldown_completed", { source = source })
+				debugEvent("ABILITY", "cooldown_completed", { source = source, label = label })
+			elseif ready and waitForCooldown and not cooldownObserved
+				and os.clock() - requestAt >= ABILITY.NoTransitionRetry then
+				-- An InvokeServer() return value (especially nil) is NOT proof of
+				-- activation. If the HUD never leaves zero, allow another attempt.
+				-- This is not a cooldown guess: the label still explicitly says 0.
+				waitForCooldown = false
+				increment("abilityCooldownAwait")
+				debugEvent("ABILITY", "no_cooldown_started_retrying", {
+					elapsedMs = math.floor((os.clock() - requestAt) * 1000 + 0.5),
+					label = label, reason = "Time.Text remained zero",
+				}, "WARN")
 			end
 
 			local health = getHealth()
@@ -1810,6 +1838,8 @@ function autoAbility.enable()
 						else
 							increment("abilityDispatched")
 							waitForCooldown, cooldownObserved = true, false
+							requestAt = os.clock()
+							nextAttempt = requestAt + ABILITY.NoTransitionRetry
 							debugEvent("ABILITY", "used_waiting_for_cooldown", {
 								latencyMs = latency, label = label, source = source,
 								response = response == nil and "nil_unverified" or tostring(response),
@@ -1913,7 +1943,8 @@ local function machineBusy()
 	-- machine was temporarily neither, letting pickups steal the character.
 	-- Claim priority as soon as an objective is selected, including handoffs.
 	return machineFarm ~= nil and machineFarm.enabled == true and
-		(machineFarm.target ~= nil or machineFarm.placed == true or machineFarm.moving == true)
+		(machineFarm.target ~= nil or machineFarm.placed == true or machineFarm.moving == true
+			or machineFarm.finalizing == true)
 end
 
 -- One Capsule Autofarm toggle handles both capsule sources.
@@ -1933,6 +1964,50 @@ PICKUPS = {
 	{ farm = itemFarm, folder = "Items", held = true, filter = itemAllowed },
 	{ farm = candyFarm, folder = "Candies" },
 }
+
+-- Real inventory sweep, not the farm's cached hasWork flag. Verify all four
+-- pickup sources before exiting. Refresh the target cache so items that spawned
+-- immediately before machine completion are visible in this final pass.
+-- Only wait for pickups whose matching farm and filters are actually enabled;
+-- inaccessible/unsafe drops are reported but must not trap the player forever.
+local function scanFinalPickups()
+	local result = { eligible = 0, safe = 0, unsafe = 0, skipped = 0, sources = {} }
+	local inventoryFull = heldCount() >= FARM.HeldLimit
+	for _, entry in ipairs(PICKUPS) do
+		local found = 0
+		local folder = resolveWorkspacePath(entry.folder)
+		if folder then
+			local cache = targetCaches[folder]
+			if cache then cache.dirty = true end
+			for _, target in ipairs(getTargets(folder)) do
+				if target and target.Parent then
+					local prompt = getPrompt(target)
+					if prompt and prompt.Enabled then
+						local part = getPromptPart(prompt, target)
+						if part then
+							found += 1
+							local accepted = entry.farm.enabled and (not entry.held or not inventoryFull)
+								and (not entry.filter or entry.filter(target))
+							if accepted then
+								result.eligible += 1
+								if infectedNear and infectedNear(part.Position, FARM.InfectedClear) then
+									result.unsafe += 1
+								else
+									result.safe += 1
+								end
+							else
+								result.skipped += 1
+							end
+						end
+					end
+				end
+			end
+		end
+		table.insert(result.sources, entry.folder .. ":" .. found)
+	end
+	result.sourceSummary = table.concat(result.sources, ",")
+	return result
+end
 
 local function newOption(options, key, onChange)
 	local option = { enabled = options[key] }
@@ -1954,10 +2029,14 @@ local farmBody = createSection("Autofarm", 2)
 local farmActions = createSubcategory(farmBody, "AUTOMATIC ACTIONS", 1,
 	"NEW: HUD cooldown ability, tool and Waffle use", true)
 createToggleRow(farmActions, "Auto Use Ability", 1, autoAbility,
-	"HUD cooldown → leave machine → activate → resume")
-createToggleRow(farmActions, "Auto Use Items", 2, autoUse,
+	"Time.Text = 0 → exit machine → use ability → resume")
+abilityStatusLabel = uiText(farmActions, "Cooldown HUD: checking Time.Text...", 11, false, UI.muted, {
+	LayoutOrder = 2, Size = UDim2.new(1, -20, 0, 25),
+	TextTruncate = Enum.TextTruncate.AtEnd,
+})
+createToggleRow(farmActions, "Auto Use Items", 3, autoUse,
 	"Heal when injured and use matching machine tools")
-createToggleRow(farmActions, "Auto Use Trash Items (Waffle)", 3,
+createToggleRow(farmActions, "Auto Use Trash Items (Waffle)", 4,
 	newOption(ITEM_OPTIONS, "AutoTrashUse"), "Uses Waffle after ability activation")
 
 local farmPickups = createSubcategory(farmBody, "PICKUP ROUTES", 2,
@@ -1987,6 +2066,7 @@ local MACHINE = {
 	Tick = 0.03, Settle = 0.025, PromptRetry = 0.08,
 	RescanInterval = 0.12, StallTimeout = 3, UseTimeout = 8,
 	ClearHold = 1.0, ItemWaitMax = 1.25, CollectWaitMax = 20, ItemIdle = 0.2,
+	FinalSweepPoll = 0.25, FinalSweepClearTime = 0.7,
 	EyeHeight = 3,  SkillcheckPause = 3,  SkillcheckStale = 6,
 	ChaseHold = 3,  DoneValue = 100,  FuseDwell = 1,
 	Fuseboxes = {
@@ -2464,7 +2544,7 @@ end
 
 -- Machine automation
 local function newMachineAutofarm()
-	local farm = { enabled = false, target = nil }
+	local farm = { enabled = false, target = nil, finalizing = false }
 	local runId = 0
 	local elevatorPreference = 1
 	local pickupsAt, pickupsValue = 0, false
@@ -2560,7 +2640,7 @@ local function newMachineAutofarm()
 		local clearSince = nil
 		local waitStart = nil
 		local lastBusyAt = os.clock()
-		local collectStart = nil
+		local finalSweep = nil
 		local startupPickupsDone = false
 		local emergencyNextMove = false
 		local handoffStartedAt, handoffFrom, handoffReason = nil, nil, nil
@@ -2694,6 +2774,15 @@ local function newMachineAutofarm()
 				local prompt = target and getPrompt(target)
 				local part = prompt and getPromptPart(prompt, target)
 				if part then
+					if finalSweep then
+						increment("finalSweepResets")
+						debugEvent("SWEEP", "cancelled_new_objective", {
+							newTarget = target.Name,
+							previousMs = math.floor((os.clock() - finalSweep.started) * 1000 + 0.5),
+						})
+						finalSweep = nil
+					end
+					farm.finalizing = false
 					finished = false
 					local danger, dangerName, dangerDist = twistedNear(part.Position)
 					if danger then
@@ -2861,22 +2950,85 @@ local function newMachineAutofarm()
 						handoffStartedAt, handoffFrom, handoffReason = nil, nil, nil
 						debugStatus.handoffPending = "None"
 					end
-					local collecting = OPTIONS.CollectLast and waitingPickups
-					if collecting then
-						if not collectStart then
-							collectStart = os.clock()
-							debugLog("machines done, waiting for pickups")
+					-- Always do a final on-the-floor check before the elevator, even if
+					-- "Collect After Machines" is OFF. That toggle only controls when
+					-- ordinary pickup routes run; it does not skip this safety sweep.
+					if not finished then
+						local now = os.clock()
+						if not finalSweep then
+							finalSweep = { started = now, lastCheck = -math.huge, emptySince = nil,
+								emptyChecks = 0, checks = 0, confirmedStart = debugStats.pickupConfirmed }
+							increment("finalSweeps")
+							debugEvent("SWEEP", "start", {
+								maxWaitSeconds = MACHINE.CollectWaitMax,
+								collectAfterMachines = OPTIONS.CollectLast,
+								items = itemFarm.enabled, capsules = capsuleFarm.enabled, candies = candyFarm.enabled,
+							})
 						end
-					else
-						collectStart = nil
-					end
-					if not finished and not (collecting and os.clock() - collectStart < MACHINE.CollectWaitMax) then
-						finished = true
-						debugEvent("MACHINE", "all_complete", { autoElevator = OPTIONS.AutoElevator, fuseboxes = OPTIONS.Fuseboxes })
-						if OPTIONS.Fuseboxes then checkFuseboxes(active) end
-						if OPTIONS.AutoElevator then
-							debugLog("emergency teleport to elevator")
-							finishAtElevator(active)
+						if now - finalSweep.lastCheck >= MACHINE.FinalSweepPoll then
+							finalSweep.lastCheck = now
+							finalSweep.checks += 1
+							increment("finalSweepChecks")
+							local snapshot = scanFinalPickups()
+							local busyNow = pickupBusy() or pickupCoordinator.owner ~= nil
+							local pending = snapshot.safe > 0 or busyNow
+							if pending then
+								finalSweep.emptySince, finalSweep.emptyChecks = nil, 0
+							else
+								finalSweep.emptySince = finalSweep.emptySince or now
+								finalSweep.emptyChecks += 1
+							end
+							debugThrottled("final_sweep_check", 0.9, "SWEEP", "check", {
+								check = finalSweep.checks, safe = snapshot.safe, unsafe = snapshot.unsafe,
+								ignored = snapshot.skipped, pickupBusy = busyNow,
+								confirmedSoFar = debugStats.pickupConfirmed - finalSweep.confirmedStart,
+								sources = snapshot.sourceSummary,
+							})
+							local timedOut = now - finalSweep.started >= MACHINE.CollectWaitMax
+							local emptyVerified = finalSweep.emptySince
+								and finalSweep.emptyChecks >= 2
+								and now - finalSweep.emptySince >= MACHINE.FinalSweepClearTime
+							if timedOut or emptyVerified then
+								-- Last-moment forced cache refresh, immediately before claiming
+								-- movement for the elevator. If another pickup just spawned,
+								-- restart the clear-window instead of leaving it behind.
+								local verify = scanFinalPickups()
+								if not timedOut and (verify.safe > 0 or pickupBusy() or pickupCoordinator.owner ~= nil) then
+									finalSweep.emptySince, finalSweep.emptyChecks = nil, 0
+									increment("finalSweepLastSecond")
+									debugEvent("SWEEP", "last_second_pickup_detected", {
+										safe = verify.safe, sources = verify.sourceSummary,
+									})
+								else
+									-- Freeze pickups only while we actually leave the area;
+									-- keeping Auto Elevator OFF must not disable pickup farming.
+									farm.finalizing = OPTIONS.AutoElevator or OPTIONS.Fuseboxes
+									if farm.finalizing then
+										if activeMotion and activeMotion.owner == "pickup" then cancelMotion("pickup") end
+										pickupCoordinator.home = nil
+									end
+									finished = true
+									increment(timedOut and "finalSweepTimeouts" or "finalSweepCompleted")
+									debugEvent("SWEEP", timedOut and "timeout" or "complete", {
+										checks = finalSweep.checks, elapsedMs = math.floor((now - finalSweep.started) * 1000 + 0.5),
+										collected = debugStats.pickupConfirmed - finalSweep.confirmedStart,
+										safeRemaining = verify.safe, unsafeRemaining = verify.unsafe,
+										ignored = verify.skipped, sources = verify.sourceSummary,
+									}, timedOut and "WARN" or "INFO")
+									debugEvent("MACHINE", "all_complete", {
+										autoElevator = OPTIONS.AutoElevator, fuseboxes = OPTIONS.Fuseboxes,
+										finalSweep = timedOut and "timeout" or "verified_clear",
+									})
+									if OPTIONS.Fuseboxes then checkFuseboxes(active) end
+									if OPTIONS.AutoElevator and active() then
+										debugLog("final pickup sweep finished, teleporting to elevator")
+										finishAtElevator(active)
+									else
+										-- No elevator relocation was requested; pickups can resume.
+										farm.finalizing = false
+									end
+								end
+							end
 						end
 					end
 					task.wait(0.5)
@@ -2906,7 +3058,7 @@ local function newMachineAutofarm()
 		local wasEnabled = farm.enabled
 		farm.enabled = false
 		runId += 1
-		farm.target, farm.placed, farm.moving = nil, false, false
+		farm.target, farm.placed, farm.moving, farm.finalizing = nil, false, false, false
 		cancelMotion("machine")
 		restoreMachinePrompts()
 		if wasEnabled and alive then
@@ -3127,10 +3279,12 @@ createInputRow(machineSafety, "Danger range (studs)", 2, function(value)
 end)
 
 local machineFlow = createSubcategory(machinesBody, "EXIT & PRIORITIES", 3,
-	"Elevator and fusebox event detection to improve later", true)
+	"Automatic final floor sweep before elevator; detection TODO", true)
 createToggleRow(machineFlow, "Auto Elevator (Teleport)", 1, newOption(OPTIONS, "AutoElevator"))
 createToggleRow(machineFlow, "Fusebox Check", 2, newOption(OPTIONS, "Fuseboxes"))
 createToggleRow(machineFlow, "Items First", 3, newOption(OPTIONS, "ItemsFirst"))
+createSubcategoryNote(machineFlow,
+	"Before elevator: double-check enabled pickup sources. Wait up to 20 seconds if items remain.", 4)
 
 end
 
@@ -3198,8 +3352,10 @@ local function debugReport()
 		"Machine exit=SkillCheck:InvokeServer() with no arguments; ALL exits deferred while skillcheck UI is visible",
 		"Skillcheck protection=defer remote exits, teleports, pickup tweens, and danger/chase reroutes until UI disappears",
 		"TODO (later)=improve elevator and fusebox event / completion detection",
+		"Final sweep=always verifies enabled pickup sources (including InfectedSamples) before elevator; two checks and 20s maximum",
+		"Ability cooldown=Time.Text numeric zero is ready; positive is cooling; parent visibility ignored",
 		"Ability=HUD CoolDown.Time readiness; pauses active machines, leaves when no skillcheck, then uses ability and resumes farm",
-		"Ability=Ability:InvokeServer(nil), once per observed HUD cooldown cycle; nil response unverified",
+		"Ability=Ability:InvokeServer(nil); if HUD stays zero after invoke, retry after confirmation window",
 		"Item hotkeys=executor keypress preferred, VIM fallback; input success does not prove item effect",
 		"AbilityConfig: " .. fieldString(ABILITY),
 		"Death export=automatic when observed health <= 0 (once per life)",
@@ -3225,7 +3381,8 @@ local function debugReport()
 		"FARM: " .. fieldString(FARM),
 		"MACHINE: " .. fieldString({ Range = MACHINE.Range, StallTimeout = MACHINE.StallTimeout,
 			UseTimeout = MACHINE.UseTimeout, ChaseHold = MACHINE.ChaseHold,
-			ItemWaitMax = MACHINE.ItemWaitMax, CollectWaitMax = MACHINE.CollectWaitMax, RescanInterval = MACHINE.RescanInterval }),
+			ItemWaitMax = MACHINE.ItemWaitMax, CollectWaitMax = MACHINE.CollectWaitMax, RescanInterval = MACHINE.RescanInterval,
+			FinalSweepPoll = MACHINE.FinalSweepPoll, FinalSweepClearTime = MACHINE.FinalSweepClearTime }),
 		"ItemInput: " .. fieldString({ executorKeypress = typeof(keypress) == "function",
 			executorKeyrelease = typeof(keyrelease) == "function", virtualInput = pcall(function()
 				return game:GetService("VirtualInputManager") end) }),
@@ -3295,7 +3452,7 @@ supervise("diagnostic UI", function() return alive end, function()
 	end
 end)
 debugEvent("SYSTEM", "initialized", { build = BUILD, place = game.PlaceId, ui = "collapsible_subcategories",
-	mode = "tween_pickups_teleport_objectives", lineOfSight = "disabled", abilityAuto = true, abilityCooldown = "HUD.CoolDown.Time", sampleFarm = true, pickupSpeed = PICKUP_TRAVEL.Speed,
+	mode = "tween_pickups_teleport_objectives", lineOfSight = "disabled", abilityAuto = true, abilityCooldown = "HUD.CoolDown.Time.Text==0", sampleFarm = true, pickupSpeed = PICKUP_TRAVEL.Speed,
 	enemyClearance = PICKUP_TRAVEL.SafetyRadius, pickupSettle = FARM.Settle,
 	pickupDwell = FARM.Dwell, pickupRate = FARM.SpamRate, itemWaitMax = MACHINE.ItemWaitMax })
 -- World structure watcher reports renamed/missing objective folders without log spam.
