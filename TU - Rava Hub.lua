@@ -27,38 +27,118 @@ local OPTIONS = {
 	FastPickups = true,  CollectLast = false,
 }
 
-local debugLines = {}
+-- Diagnostic log: capped circular buffer, timestamps, categories, and counters.
+local BUILD = "2.1 Teleport UI / Diagnostics"
 local debugStart = os.clock()
-
+local LOG_LIMIT = 4000
+local debugLines, debugIndex, debugLast = {}, 0, {}
+local debugStats = {
+	teleports = 0, teleportFailures = 0, unsafeDestinations = 0,
+	pickupAttempts = 0, pickupConfirmed = 0, pickupUnconfirmed = 0,
+	promptAttempts = 0, promptFailures = 0, machineTargetChanges = 0,
+	machineStalls = 0, skillcheckInputs = 0, skillcheckInputFailures = 0,
+	chases = 0, workerErrors = 0, machineCompletions = 0,
+	machinePlacements = 0, machineDangers = 0, fuseAttempts = 0,
+	itemUseAttempts = 0, itemUseFailures = 0,
+}
+local debugStatus = { action = "Ready", lastWarning = "None", currentTarget = "None" }
+local function increment(metric, amount)
+	debugStats[metric] = (debugStats[metric] or 0) + (amount or 1)
+end
+local function fieldString(fields)
+	if not fields then return "" end
+	local keys, out = {}, {}
+	for key in pairs(fields) do table.insert(keys, key) end
+	table.sort(keys)
+	for _, key in ipairs(keys) do
+		local value = tostring(fields[key]):gsub("[\r\n|]", " "):sub(1, 240)
+		table.insert(out, key .. "=" .. value)
+	end
+	return table.concat(out, " ")
+end
+local function debugEvent(category, event, fields, level)
+	level = level or "INFO"
+	debugIndex += 1
+	local detail = fieldString(fields)
+	local message = string.format("[%s][+%.2fs][%s][%s] %s%s",
+		os.date("%H:%M:%S"), os.clock() - debugStart, level, category,
+		event, detail ~= "" and " | " .. detail or "")
+	debugLines[(debugIndex - 1) % LOG_LIMIT + 1] = message
+	if level == "ERROR" or level == "WARN" then
+		debugStatus.lastWarning = string.format("%s: %s", category, event)
+	elseif category == "MACHINE" or category == "PICKUP" or category == "MOVE" then
+		debugStatus.action = category .. ": " .. event
+	end
+end
+local function debugThrottled(key, interval, category, event, fields, level)
+	local now = os.clock()
+	if now - (debugLast[key] or -math.huge) < interval then return end
+	debugLast[key] = now
+	debugEvent(category, event, fields, level)
+end
 local function debugLog(message)
-	if #debugLines >= 3000 then table.remove(debugLines, 1) end
-	table.insert(debugLines, string.format("[%8.2f] %s", os.clock() - debugStart, message))
+	local msg = tostring(message)
+	local category = msg:find("pickup") and "PICKUP"
+		or (msg:find("machine") or msg:find("progress") or msg:find("place ")) and "MACHINE"
+		or msg:find("skillcheck") and "SKILLCHECK" or "SYSTEM"
+	local level = msg:find("^ERROR") and "ERROR" or "INFO"
+	debugEvent(category, "legacy", { message = msg }, level)
+end
+local function recentDebugLines(limit, warningsOnly)
+	local lines = {}
+	for i = debugIndex, math.max(1, debugIndex - LOG_LIMIT + 1), -1 do
+		local text = debugLines[(i - 1) % LOG_LIMIT + 1]
+		if text and (not warningsOnly or text:find("%[WARN%]") or text:find("%[ERROR%]")) then
+			table.insert(lines, text)
+			if limit and #lines >= limit then break end
+		end
+	end
+	return lines
+end
+local function allDebugLines()
+	local lines = {}
+	for i = math.max(1, debugIndex - LOG_LIMIT + 1), debugIndex do
+		local text = debugLines[(i - 1) % LOG_LIMIT + 1]
+		if text then table.insert(lines, text) end
+	end
+	return lines
 end
 
--- Shared, teleport-only travel controller. Emergency escapes override routine moves.
-local TRAVEL = { DangerRadius = 15, ArrivalTolerance = 4 }
+-- All travel is instantaneous; no interpolation or route sampling.
 local activeMotion
-local infectedNear
+local infectedNear -- Assigned after monster-folder helpers are defined.
 local motionPauseUntil = 0
 local function cancelMotion(owner)
-	if activeMotion and (not owner or owner == activeMotion) then activeMotion = nil end
+	if activeMotion and (not owner or activeMotion == owner) then
+		debugEvent("MOVE", "cancel", { owner = activeMotion })
+		activeMotion = nil
+	end
 end
 local function teleportCharacter(destination, keepGoing, owner, mode)
 	local emergency = mode == "emergency"
 	if not alive or not keepGoing() then return false end
-	if activeMotion and not emergency then return false end
+	if activeMotion and not emergency then
+		debugThrottled("move_busy_" .. owner, 3, "MOVE", "occupied", { owner = owner }, "WARN")
+		return false
+	end
 	if emergency then
 		cancelMotion()
 		motionPauseUntil = math.max(motionPauseUntil, os.clock() + 1.5)
 	end
-	local character = player.Character
-	local root = character and character:FindFirstChild("HumanoidRootPart")
-	if not root or not root:IsDescendantOf(workspace) then return false end
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not root or not root:IsDescendantOf(workspace) then
+		debugThrottled("root_" .. owner, 5, "MOVE", "root_missing", { owner = owner }, "WARN")
+		return false
+	end
 	local from = root.Position
 	local distance = (from - destination.Position).Magnitude
-	if distance <= 0.25 then return true end
-	if not emergency and infectedNear and infectedNear(destination.Position, TRAVEL.DangerRadius) then
-		debugLog("MOVE unsafe destination owner=" .. tostring(owner))
+	if distance < 0.25 then return true end
+	-- Routine movement refuses unsafe destinations. Emergency escapes remain immediate.
+	if not emergency and infectedNear and infectedNear(destination.Position, 15) then
+		increment("unsafeDestinations")
+		debugThrottled("unsafe_" .. owner, 3, "MOVE", "unsafe_destination",
+			{ owner = owner, position = tostring(destination.Position) }, "WARN")
 		return false
 	end
 	activeMotion = owner
@@ -69,17 +149,22 @@ local function teleportCharacter(destination, keepGoing, owner, mode)
 	end)
 	if activeMotion == owner then activeMotion = nil end
 	if not ok then
-		debugLog("ERROR MOVE teleport owner=" .. tostring(owner) .. " reason=" .. tostring(err))
+		increment("teleportFailures")
+		debugEvent("MOVE", "teleport_error", { owner = owner, error = err }, "ERROR")
 		return false
 	end
 	local drift = (root.Position - destination.Position).Magnitude
-	if drift > TRAVEL.ArrivalTolerance then
-		debugLog(string.format("MOVE failed owner=%s drift=%.1f", owner, drift))
+	if drift > 4 then
+		increment("teleportFailures")
+		debugThrottled("drift_" .. owner, 1, "MOVE", "arrival_mismatch",
+			{ owner = owner, drift = string.format("%.2f", drift), target = tostring(destination.Position) }, "WARN")
 		return false
 	end
-	debugLog(string.format("MOVE teleport owner=%s mode=%s dist=%.1f from=(%.1f,%.1f,%.1f) to=(%.1f,%.1f,%.1f)",
-		tostring(owner), emergency and "emergency" or "routine", distance,
-		from.X, from.Y, from.Z, destination.Position.X, destination.Position.Y, destination.Position.Z))
+	increment("teleports")
+	debugEvent("MOVE", "teleport", {
+		owner = owner, mode = emergency and "emergency" or "routine",
+		distance = string.format("%.1f", distance), to = tostring(destination.Position),
+	})
 	return true
 end
 
@@ -94,7 +179,8 @@ local function supervise(label, isActive, fn)
 			local ok, err = pcall(fn)
 			if ok then return end
 			warn("[TU - Rava Hub] " .. label .. " error: " .. tostring(err))
-			debugLog("ERROR " .. label .. ": " .. tostring(err))
+			increment("workerErrors")
+			debugEvent("WORKER", "crashed", { worker = label, error = tostring(err), retry = "0.5s" }, "ERROR")
 			task.wait(0.5)
 		end
 	end)
@@ -116,169 +202,212 @@ local function list(parent, padding, align)
 	}, parent)
 end
 
+-- UI / design tokens
+local UI = {
+	background = Color3.fromRGB(15, 18, 27), surface = Color3.fromRGB(23, 28, 39),
+	surface2 = Color3.fromRGB(32, 38, 52), soft = Color3.fromRGB(40, 48, 65),
+	accent = Color3.fromRGB(113, 124, 255), blue = Color3.fromRGB(80, 192, 255),
+	good = Color3.fromRGB(70, 207, 148), bad = Color3.fromRGB(230, 102, 118),
+	text = Color3.fromRGB(238, 241, 252), muted = Color3.fromRGB(147, 156, 180),
+}
+local function uiText(parent, value, size, bold, color, props)
+	local config = { BackgroundTransparency = 1, Text = value, TextColor3 = color or UI.text,
+		TextSize = size or 14, Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham,
+		TextXAlignment = Enum.TextXAlignment.Left, BorderSizePixel = 0 }
+	for k, v in pairs(props or {}) do config[k] = v end
+	return new("TextLabel", config, parent)
+end
+local function uiStroke(parent, color, thickness)
+	return new("UIStroke", { Color = color or UI.soft, Thickness = thickness or 1, Transparency = 0.3 }, parent)
+end
+
 local screenGui = new("ScreenGui", {
-	Name = "TURavaHubGUI",  ResetOnSpawn = false,  DisplayOrder = 2147483647,
-	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	Name = "TURavaHubGUI", ResetOnSpawn = false, DisplayOrder = 2147483647,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling, IgnoreGuiInset = false,
 }, playerGui)
-
 local main = new("Frame", {
-	Size = UDim2.fromOffset(420, 320),  Position = UDim2.new(0.5, -210, 0.5, -160),
-	BackgroundColor3 = Color3.fromRGB(28, 28, 34),  BorderSizePixel = 0,  Active = true,
+	Name = "HubWindow", Size = UDim2.fromOffset(650, 445), AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5), BackgroundColor3 = UI.background,
+	BorderSizePixel = 0, Active = true, ClipsDescendants = true,
 }, screenGui)
-corner(main, 10)
+corner(main, 16)
+uiStroke(main, UI.soft, 1)
+local mainScale = new("UIScale", { Scale = 1 }, main)
+local function fitToViewport()
+	local camera = workspace.CurrentCamera
+	local view = camera and camera.ViewportSize or Vector2.new(950, 700)
+	mainScale.Scale = math.clamp(math.min((view.X - 22) / 650, (view.Y - 36) / 445), 0.36, 1)
+end
+fitToViewport()
+-- Once-a-second fit check handles screen rotation without a per-frame UI listener.
+task.spawn(function()
+	while alive do
+		fitToViewport()
+		task.wait(1)
+	end
+end)
 
-local title = new("TextLabel", {
-	Size = UDim2.new(1, 0, 0, 40),  BackgroundColor3 = Color3.fromRGB(40, 40, 50),  BorderSizePixel = 0,
-	Text = "TU - Rava Hub",  TextColor3 = Color3.new(1, 1, 1),  TextSize = 20,
-	Font = Enum.Font.GothamBold,
-}, main)
-corner(title, 10)
-
-local content = new("ScrollingFrame", {
-	Size = UDim2.new(1, -20, 1, -110),  Position = UDim2.fromOffset(10, 50),  BackgroundTransparency = 1,
-	BorderSizePixel = 0,  ScrollBarThickness = 4,  CanvasSize = UDim2.new(),
-	AutomaticCanvasSize = Enum.AutomaticSize.Y,
-}, main)
-list(content, 6)
-
-local unloadButton = new("TextButton", {
-	Size = UDim2.new(1, -20, 0, 36),  Position = UDim2.new(0, 10, 1, -46),
-	BackgroundColor3 = Color3.fromRGB(190, 55, 55),  BorderSizePixel = 0,  Text = "UNLOAD",
-	TextColor3 = Color3.new(1, 1, 1),  TextSize = 18,  Font = Enum.Font.GothamBold,
-}, main)
+local top = new("Frame", { Size = UDim2.new(1, 0, 0, 64), BackgroundColor3 = UI.surface,
+	BorderSizePixel = 0, Active = true }, main)
+new("Frame", { Size = UDim2.new(1, 0, 0, 2), Position = UDim2.new(0, 0, 1, -2),
+	BackgroundColor3 = UI.accent, BorderSizePixel = 0 }, top)
+uiText(top, "RAVA", 22, true, UI.text, { Position = UDim2.fromOffset(22, 10), Size = UDim2.fromOffset(130, 27) })
+uiText(top, "TU   /   CONTROL HUB", 10, true, UI.muted,
+	{ Position = UDim2.fromOffset(23, 37), Size = UDim2.fromOffset(190, 15) })
+local headerStatus = uiText(top, "SYSTEM READY", 12, true, UI.good,
+	{ Position = UDim2.fromOffset(346, 20), Size = UDim2.fromOffset(192, 24), TextXAlignment = Enum.TextXAlignment.Right })
+local minimizeButton = new("TextButton", { Text = "—", Size = UDim2.fromOffset(32, 32),
+	Position = UDim2.new(1, -84, 0, 15), BackgroundColor3 = UI.surface2,
+	TextColor3 = UI.text, TextSize = 18, Font = Enum.Font.GothamBold, BorderSizePixel = 0 }, top)
+corner(minimizeButton, 8)
+local unloadButton = new("TextButton", { Text = "×", Size = UDim2.fromOffset(32, 32),
+	Position = UDim2.new(1, -45, 0, 15), BackgroundColor3 = Color3.fromRGB(92, 47, 62),
+	TextColor3 = UI.text, TextSize = 24, Font = Enum.Font.GothamBold, BorderSizePixel = 0 }, top)
 corner(unloadButton, 8)
 
+local sidebar = new("Frame", { Position = UDim2.fromOffset(0, 64), Size = UDim2.new(0, 158, 1, -94),
+	BackgroundColor3 = UI.surface, BorderSizePixel = 0 }, main)
+new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 7) }, sidebar)
+new("UIPadding", { PaddingTop = UDim.new(0, 15), PaddingLeft = UDim.new(0, 10),
+	PaddingRight = UDim.new(0, 10) }, sidebar)
+local mainArea = new("Frame", { Position = UDim2.fromOffset(158, 64),
+	Size = UDim2.new(1, -158, 1, -94), BackgroundTransparency = 1 }, main)
+local footer = new("Frame", { Position = UDim2.new(0, 0, 1, -30), Size = UDim2.new(1, 0, 0, 30),
+	BackgroundColor3 = UI.surface, BorderSizePixel = 0 }, main)
+local footerLabel = uiText(footer, "v2.1   •   TELEPORT MODE   •   LOGGING ACTIVE", 11, false, UI.muted,
+	{ Position = UDim2.fromOffset(17, 5), Size = UDim2.new(1, -30, 0, 21) })
+local pages, menuButtons, activeTab = {}, {}, "Autofarm"
+local TAB_ORDER = { "ESP", "Autofarm", "Machines", "Diagnostics" }
+local TAB_SYMBOL = { ESP = "◉", Autofarm = "◆", Machines = "▣", Diagnostics = "≡" }
+local function showTab(name)
+	activeTab = name
+	for key, page in pairs(pages) do page.Visible = key == name end
+	for key, button in pairs(menuButtons) do
+		button.BackgroundColor3 = key == name and UI.soft or UI.surface
+		button.TextColor3 = key == name and UI.text or UI.muted
+	end
+end
+for index, name in ipairs(TAB_ORDER) do
+	local button = new("TextButton", { Name = name .. "Tab", Size = UDim2.new(1, 0, 0, 45),
+		LayoutOrder = index, BackgroundColor3 = UI.surface, BorderSizePixel = 0,
+		Text = "  " .. TAB_SYMBOL[name] .. "    " .. name, Font = Enum.Font.GothamMedium,
+		TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = UI.muted }, sidebar)
+	corner(button, 9)
+	menuButtons[name] = button
+	track(button.MouseButton1Click:Connect(function()
+		showTab(name)
+		debugEvent("UI", "open_tab", { tab = name })
+	end))
+end
+local function createSection(name)
+	local page = new("ScrollingFrame", {
+		Name = name .. "Page", Position = UDim2.fromOffset(0, 0), Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 4,
+		ScrollBarImageColor3 = UI.accent, CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y, Visible = name == activeTab,
+	}, mainArea)
+	list(page, 9)
+	new("UIPadding", { PaddingTop = UDim.new(0, 15), PaddingLeft = UDim.new(0, 14),
+		PaddingRight = UDim.new(0, 14), PaddingBottom = UDim.new(0, 14) }, page)
+	pages[name] = page
+	uiText(page, name, 20, true, UI.text, {
+		Size = UDim2.new(1, -8, 0, 30), LayoutOrder = -2,
+	})
+	uiText(page, (name == "ESP" and "Visual overlays and objective markers")
+		or (name == "Autofarm" and "Pickup automation and inventory filters")
+		or (name == "Machines" and "Objective logic and protection")
+		or "Runtime telemetry and test reports", 12, false, UI.muted, {
+		Size = UDim2.new(1, -8, 0, 18), LayoutOrder = -1,
+	})
+	return page
+end
+local function createToggleRow(parent, name, order, feature)
+	local row = new("Frame", { Size = UDim2.new(1, -9, 0, 43),
+		BackgroundColor3 = UI.surface, BorderSizePixel = 0, LayoutOrder = order }, parent)
+	corner(row, 9)
+	uiStroke(row)
+	uiText(row, name, 14, false, UI.text, {
+		Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -97, 1, 0),
+	})
+	local button = new("TextButton", {
+		Size = UDim2.fromOffset(62, 28), Position = UDim2.new(1, -73, 0.5, -14),
+		BorderSizePixel = 0, TextSize = 12, Font = Enum.Font.GothamBold,
+		TextColor3 = UI.text,
+	}, row)
+	corner(button, 15)
+	local function refresh()
+		button.Text = feature.enabled and "ON" or "OFF"
+		button.BackgroundColor3 = feature.enabled and Color3.fromRGB(45, 133, 109) or UI.soft
+	end
+	refresh()
+	track(button.MouseButton1Click:Connect(function()
+		local enabled = not feature.enabled
+		local ok, err = pcall(function()
+			if enabled then feature.enable() else feature.disable() end
+		end)
+		if ok then
+			debugEvent("UI", "feature_changed", { name = name, enabled = feature.enabled })
+		else
+			increment("workerErrors")
+			debugEvent("UI", "toggle_error", { name = name, error = err }, "ERROR")
+		end
+		refresh()
+	end))
+end
+
+-- Window drag supports mouse and touch; buttons remain independently clickable.
 do
-	local dragging, dragStart, startPos
+	local dragging, origin, start
 	local function isPress(input)
 		return input.UserInputType == Enum.UserInputType.MouseButton1
 			or input.UserInputType == Enum.UserInputType.Touch
 	end
-	track(title.InputBegan:Connect(function(input)
-		if isPress(input) then dragging, dragStart, startPos = true, input.Position, main.Position end
+	track(top.InputBegan:Connect(function(input)
+		if isPress(input) then dragging, origin, start = true, input.Position, main.Position end
 	end))
 	track(UserInputService.InputChanged:Connect(function(input)
-		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-			or input.UserInputType == Enum.UserInputType.Touch) then
-			local d = input.Position - dragStart
-			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - origin
+			main.Position = UDim2.new(start.X.Scale, start.X.Offset + delta.X, start.Y.Scale, start.Y.Offset + delta.Y)
 		end
 	end))
 	track(UserInputService.InputEnded:Connect(function(input)
 		if isPress(input) then dragging = false end
 	end))
 end
-
+-- Small draggable launcher stays visible when the main window is hidden.
+local launcher = new("TextButton", { Name = "RavaLauncher", Size = UDim2.fromOffset(50, 50),
+	Position = UDim2.new(0, 14, 0.5, -25), BackgroundColor3 = UI.accent,
+	Text = "R", TextColor3 = Color3.new(1, 1, 1), Font = Enum.Font.GothamBold,
+	TextSize = 25, BorderSizePixel = 0, ZIndex = 10 }, screenGui)
+corner(launcher, 16)
+uiStroke(launcher, UI.text, 1)
 do
-	local function isPressInput(input)
-		return input.UserInputType == Enum.UserInputType.MouseButton1
-			or input.UserInputType == Enum.UserInputType.Touch
-	end
-	local iconColor = Color3.fromRGB(217, 119, 87)
-	local toggleButton = new("TextButton", {
-		Name = "TUToggleIcon",  Size = UDim2.fromOffset(44, 44),  Position = UDim2.new(0, 14, 0.5, -22),
-		BackgroundColor3 = Color3.new(0, 0, 0),  BorderSizePixel = 0,  AutoButtonColor = false,
-		Text = "",  ZIndex = 10,
-	}, screenGui)
-	corner(toggleButton, 22)
-	new("UIStroke", { Color = Color3.new(1, 1, 1), Thickness = 2 }, toggleButton)
-	for i = 0, 5 do
-		local bar = new("Frame", {
-			AnchorPoint = Vector2.new(0.5, 0.5),  Position = UDim2.fromScale(0.5, 0.5),  Size = UDim2.fromOffset(4, 26),
-			BackgroundColor3 = iconColor,  BorderSizePixel = 0,  Rotation = i * 30,
-			ZIndex = 11,
-		}, toggleButton)
-		corner(bar, 2)
-	end
-	local dragging, moved, dragStart, startPos
-	track(toggleButton.InputBegan:Connect(function(input)
-		if isPressInput(input) then
-			dragging, moved, dragStart, startPos = true, false, input.Position, toggleButton.Position
+	local dragging, moved, origin, start
+	track(launcher.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, moved, origin, start = true, false, input.Position, launcher.Position
 		end
 	end))
 	track(UserInputService.InputChanged:Connect(function(input)
-		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-			or input.UserInputType == Enum.UserInputType.Touch) then
-			local d = input.Position - dragStart
-			if d.Magnitude > 6 then moved = true end
-			if moved then
-				toggleButton.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
-			end
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - origin
+			if delta.Magnitude > 6 then moved = true end
+			if moved then launcher.Position = UDim2.new(start.X.Scale, start.X.Offset + delta.X,
+				start.Y.Scale, start.Y.Offset + delta.Y) end
 		end
 	end))
 	track(UserInputService.InputEnded:Connect(function(input)
-		if dragging and isPressInput(input) then
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
 			dragging = false
 			if not moved then main.Visible = not main.Visible end
 		end
 	end))
 end
-
-local function createSection(name, order)
-	local section = new("Frame", {
-		Size = UDim2.new(1, -8, 0, 0),  AutomaticSize = Enum.AutomaticSize.Y,
-		BackgroundColor3 = Color3.fromRGB(34, 34, 42),  BorderSizePixel = 0,  LayoutOrder = order,
-	}, content)
-	corner(section, 8)
-	list(section, 6)
-	local header = new("TextButton", {
-		Size = UDim2.new(1, 0, 0, 32),  BackgroundColor3 = Color3.fromRGB(55, 55, 70),  BorderSizePixel = 0,
-		TextColor3 = Color3.new(1, 1, 1),  TextSize = 16,  Font = Enum.Font.GothamBold,
-		TextXAlignment = Enum.TextXAlignment.Left,  LayoutOrder = 0,
-	}, section)
-	corner(header, 8)
-	new("UIPadding", { PaddingLeft = UDim.new(0, 12) }, header)
-	local body = new("Frame", {
-		Size = UDim2.new(1, 0, 0, 0),  AutomaticSize = Enum.AutomaticSize.Y,  BackgroundTransparency = 1,
-		LayoutOrder = 1,
-	}, section)
-	list(body, 6, Enum.HorizontalAlignment.Center)
-	new("UIPadding", {
-		PaddingBottom = UDim.new(0, 6),  PaddingLeft = UDim.new(0, 6),  PaddingRight = UDim.new(0, 6),
-	}, body)
-	local open = true
-	local function refresh()
-		body.Visible = open
-		header.Text = (open and "[-]  " or "[+]  ") .. name
-	end
-	refresh()
-	track(header.MouseButton1Click:Connect(function()
-		open = not open
-		refresh()
-	end))
-	return body
-end
-
-local function createToggleRow(parent, name, order, feature)
-	local row = new("Frame", {
-		Size = UDim2.new(1, 0, 0, 34),  BackgroundColor3 = Color3.fromRGB(44, 44, 56),  BorderSizePixel = 0,
-		LayoutOrder = order,
-	}, parent)
-	corner(row, 8)
-	new("TextLabel", {
-		BackgroundTransparency = 1,  Size = UDim2.new(1, -90, 1, 0),  Position = UDim2.fromOffset(12, 0),
-		Text = name,  TextColor3 = Color3.fromRGB(235, 235, 240),  TextSize = 16,
-		Font = Enum.Font.GothamMedium,  TextXAlignment = Enum.TextXAlignment.Left,
-	}, row)
-	local button = new("TextButton", {
-		Size = UDim2.fromOffset(64, 24),  Position = UDim2.new(1, -74, 0.5, -12),  BorderSizePixel = 0,
-		TextSize = 14,  Font = Enum.Font.GothamBold,  TextColor3 = Color3.new(1, 1, 1),
-	}, row)
-	corner(button, 6)
-	local function refresh()
-		button.Text = feature.enabled and "ON" or "OFF"
-		button.BackgroundColor3 = feature.enabled and Color3.fromRGB(50, 160, 80) or Color3.fromRGB(90, 90, 100)
-	end
-	refresh()
-	track(button.MouseButton1Click:Connect(function()
-		if feature.enabled then
-			feature.disable()
-		else
-			feature.enable()
-		end
-		refresh()
-	end))
-end
+track(minimizeButton.MouseButton1Click:Connect(function()
+	main.Visible = false
+end))
+showTab(activeTab)
 
 local ESP_REFRESH = 1
 
@@ -440,7 +569,12 @@ end
 local hasFirePrompt = typeof(fireproximityprompt) == "function"
 
 local function triggerPrompt(prompt)
-	if not prompt or not prompt:IsA("ProximityPrompt") or not prompt:IsDescendantOf(workspace) then return false end
+	increment("promptAttempts")
+	if not prompt or not prompt:IsA("ProximityPrompt") or not prompt:IsDescendantOf(workspace) then
+		increment("promptFailures")
+		debugThrottled("invalid_pickup_prompt", 3, "PROMPT", "invalid_target", nil, "WARN")
+		return false
+	end
 	if hasFirePrompt then
 		local ok = pcall(fireproximityprompt, prompt)
 		if ok then return true end
@@ -448,7 +582,12 @@ local function triggerPrompt(prompt)
 	local began = pcall(function()
 		prompt:InputHoldBegin()
 	end)
-	if not began then return false end
+	if not began then
+		increment("promptFailures")
+		debugThrottled("pickup_prompt_failed_" .. prompt.Name, 3, "PROMPT", "hold_begin_failed",
+			{ prompt = prompt.Name, owner = tostring(prompt.Parent) }, "WARN")
+		return false
+	end
 	task.wait(math.max(0, prompt.HoldDuration) + 0.05)
 	pcall(function()
 		prompt:InputHoldEnd()
@@ -460,7 +599,10 @@ local machinePromptHolds = setmetatable({}, { __mode = "k" })
 local modifiedMachinePrompts = setmetatable({}, { __mode = "k" })
 
 local function triggerMachinePrompt(prompt)
+	increment("promptAttempts")
 	if not prompt or not prompt:IsA("ProximityPrompt") or not prompt:IsDescendantOf(workspace) or not prompt.Enabled then
+		increment("promptFailures")
+		debugThrottled("machine_prompt_invalid", 3, "PROMPT", "machine_prompt_unavailable", nil, "WARN")
 		return false
 	end
 	if not modifiedMachinePrompts[prompt] then
@@ -476,7 +618,12 @@ local function triggerMachinePrompt(prompt)
 	local ok = pcall(function()
 		prompt:InputHoldBegin()
 	end)
-	if not ok then return false end
+	if not ok then
+		increment("promptFailures")
+		debugThrottled("machine_prompt_failed_" .. prompt.Name, 3, "PROMPT", "machine_hold_failed",
+			{ prompt = prompt.Name }, "WARN")
+		return false
+	end
 	machinePromptHolds[prompt] = true
 	local holdTime = math.max(0.12, prompt.HoldDuration)
 	task.delay(holdTime + 0.03, function()
@@ -661,6 +808,10 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 						local fresh = (not filter or filter(target)) and (not recent[target] or os.clock() - recent[target] >= FARM.Revisit)
 						local part = fresh and root and prompt and prompt.Enabled and getPromptPart(prompt, target)
 						local unsafe = part and infectedNear(part.Position, FARM.InfectedClear)
+						if unsafe then
+							debugThrottled("pickup_unsafe_" .. tostring(target), 5, "PICKUP", "skipped_enemy_nearby",
+								{ folder = folder.Name, name = target.Name }, "WARN")
+						end
 						if part and not unsafe and pickupCoordinator.owner == nil then
 							-- This claim has no yield, so other workers cannot claim this action.
 							pickupCoordinator.owner = farm
@@ -668,6 +819,10 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 							pickupCoordinator.home = pickupCoordinator.home or root.CFrame
 							didWork = true
 							farm.working = true
+							increment("pickupAttempts")
+							local beganAt = os.clock()
+							debugEvent("PICKUP", "attempt", { folder = folder.Name, name = target.Name,
+								held = heldCount(), prompt = prompt.Name, distance = string.format("%.1f", (root.Position - part.Position).Magnitude) })
 							-- Always release the claim, even if a Roblox instance is removed mid-pickup.
 							local ok, confirmed = pcall(function()
 								if not allowed() then return false end
@@ -694,10 +849,15 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 									(root.Position - part.Position).Magnitude, prompt.MaxActivationDistance, prompt.HoldDuration, tostring(confirmed)))
 							end
 							if confirmed then
+								increment("pickupConfirmed")
 								recent[target] = os.clock()
 							else
+								increment("pickupUnconfirmed")
 								recent[target] = os.clock() - FARM.Revisit + FARM.FailedRetry
 							end
+							debugEvent("PICKUP", "result", { folder = folder.Name, name = target.Name,
+								confirmed = confirmed, duration = string.format("%.2f", os.clock() - beganAt), held = heldCount() },
+								confirmed and "INFO" or "WARN")
 						end
 					end
 					if not allowed() then break end
@@ -802,7 +962,8 @@ local function findSlot(names)
 	return nil
 end
 
-local function pressSlot(slot)
+local function pressSlot(slot, purpose)
+	increment("itemUseAttempts")
 	local ok = pcall(function()
 		local vim = game:GetService("VirtualInputManager")
 		vim:SendKeyEvent(true, SLOT_KEYS[slot], false, game)
@@ -810,19 +971,27 @@ local function pressSlot(slot)
 		vim:SendKeyEvent(false, SLOT_KEYS[slot], false, game)
 	end)
 	if not ok and typeof(keypress) == "function" and typeof(keyrelease) == "function" then
-		pcall(function()
+		ok = pcall(function()
 			keypress(0x30 + slot)
 			task.wait(0.05)
 			keyrelease(0x30 + slot)
 		end)
 	end
+	if not ok then increment("itemUseFailures") end
+	debugEvent("ITEM", "slot_input", { slot = slot, purpose = purpose or "unknown", dispatched = ok },
+		ok and "INFO" or "WARN")
+	return ok
 end
 
 local function useForMachine(machine)
 	local names = (machine:FindFirstChild("OilValue") and USE_ITEMS.Oil)
 		or (machine:FindFirstChild("ComputerPercentage") and USE_ITEMS.Computer)
 	local slot = names and findSlot(names)
-	if slot then pressSlot(slot) end
+	if slot then
+		pressSlot(slot, "machine:" .. machine.Name)
+	else
+		debugThrottled("tool_missing_" .. machine.Name, 5, "ITEM", "tool_missing", { machine = machine.Name }, "WARN")
+	end
 end
 
 local autoUse = { enabled = false }
@@ -843,7 +1012,7 @@ function autoUse.enable()
 				local slot = findSlot(HEALTH_ITEMS)
 				if slot then
 					lastHeal = os.clock()
-					pressSlot(slot)
+					pressSlot(slot, "heal")
 				end
 			end
 			task.wait(AUTO_USE.Tick)
@@ -921,6 +1090,7 @@ local function newOption(options, key, onChange)
 	end
 	return option
 end
+
 local farmBody = createSection("Autofarm", 2)
 createToggleRow(farmBody, "Capsule Autofarm", 1, capsuleFarm)
 createToggleRow(farmBody, "Item Autofarm", 2, itemFarm)
@@ -1025,6 +1195,8 @@ task.spawn(function()
 		track(event.OnClientEvent:Connect(function(...)
 			for _, arg in ipairs({ ... }) do
 				if arg == "Started" and OPTIONS.AutoHide then
+					increment("chases")
+					debugEvent("DANGER", "chase_started", { autoHide = OPTIONS.AutoHide }, "WARN")
 					chase.pending = true
 					chase.holdUntil = math.max(chase.holdUntil, os.clock() + MACHINE.ChaseHold)
 					motionPauseUntil = math.max(motionPauseUntil, chase.holdUntil)
@@ -1280,8 +1452,9 @@ local function newMachineAutofarm()
 			if not active() then return end
 			local prompt = resolveWorkspacePath(path)
 			local part = prompt and prompt:IsA("ProximityPrompt") and getPromptPart(prompt, prompt.Parent)
-			debugLog("fusebox " .. path .. " found=" .. tostring(part ~= nil) .. " enabled=" .. tostring(part and prompt.Enabled))
+			debugEvent("FUSE", "located", { path = path, found = part ~= nil, enabled = part and prompt.Enabled or false })
 			if part and prompt.Enabled then
+				increment("fuseAttempts")
 				if not move(part.Position + Vector3.new(0, MACHINE.Height, 0), active) then return end
 				task.wait(MACHINE.Settle)
 				if OPTIONS.PromptDelay then task.wait(PROMPT_DELAY) end
@@ -1290,6 +1463,8 @@ local function newMachineAutofarm()
 					triggerPrompt(prompt)
 					task.wait(MACHINE.PromptRetry)
 				end
+				debugEvent("FUSE", "result", { path = path, promptEnabled = prompt.Enabled,
+					elapsed = string.format("%.2f", MACHINE.FuseDwell) })
 			end
 		end
 	end
@@ -1384,6 +1559,12 @@ local function newMachineAutofarm()
 					end
 				end
 				if target and (not target:IsDescendantOf(workspace) or isComplete(target)) then
+					if isComplete(target) then
+						increment("machineCompletions")
+						debugEvent("MACHINE", "completed", { name = target.Name, progress = tostring(getProgress(target)) })
+					else
+						debugEvent("MACHINE", "target_removed", { name = target.Name }, "WARN")
+					end
 					target, farm.placed = nil, false
 					lastFire = 0
 					lastPrompt = nil
@@ -1394,7 +1575,9 @@ local function newMachineAutofarm()
 				farm.target = target
 				if target ~= loggedTarget then
 					loggedTarget = target
-					debugLog("target " .. (target and target.Name or "none") .. " status=" .. status)
+					debugStatus.currentTarget = target and target.Name or "None"
+					increment("machineTargetChanges")
+					debugEvent("MACHINE", "target_changed", { name = target and target.Name or "none", status = status })
 				end
 				local prompt = target and getPrompt(target)
 				local part = prompt and getPromptPart(prompt, target)
@@ -1414,7 +1597,9 @@ local function newMachineAutofarm()
 						lastProgress = getProgress(target)
 						usedItem = false
 						if not hidden then
-							debugLog(string.format("danger: %s at %.1f studs near %s", tostring(dangerName), dangerDist or 0, target.Name))
+							increment("machineDangers")
+							debugEvent("DANGER", "machine_threat", { enemy = tostring(dangerName),
+								distance = string.format("%.1f", dangerDist or 0), machine = target.Name }, "WARN")
 							leaveObjective()
 							local alternative = safeAlternative(target)
 							if alternative then
@@ -1458,6 +1643,7 @@ local function newMachineAutofarm()
 							farm.placed = true
 							moved = true
 							placedAt = os.clock()
+							increment("machinePlacements")
 							logProgress = true
 							logFire = true
 							debugLog(string.format("place %s dist=%.1f max=%.1f hold=%.2f enabled=%s progress=%s", target.Name,
@@ -1490,6 +1676,9 @@ local function newMachineAutofarm()
 							if lockedOn then
 								activated, lockedOn = false, false
 							elseif activated and os.clock() - lastProgressAt > MACHINE.StallTimeout then
+								increment("machineStalls")
+								debugEvent("MACHINE", "progress_stalled", { name = target.Name,
+									progress = tostring(getProgress(target)), seconds = MACHINE.StallTimeout }, "WARN")
 								activated = false
 								lastProgressAt = os.clock()
 							end
@@ -1537,7 +1726,7 @@ local function newMachineAutofarm()
 					end
 					if not finished and not (collecting and os.clock() - collectStart < MACHINE.ItemWaitMax) then
 						finished = true
-						debugLog("all machines done")
+						debugEvent("MACHINE", "all_complete", { autoElevator = OPTIONS.AutoElevator, fuseboxes = OPTIONS.Fuseboxes })
 						if OPTIONS.Fuseboxes then checkFuseboxes(active) end
 						if OPTIONS.AutoElevator then
 							debugLog("emergency teleport to elevator")
@@ -1625,25 +1814,27 @@ local function newRangeView(machineFarm)
 end
 
 local function createInputRow(parent, name, order, apply)
-	local row = new("Frame", {
-		Size = UDim2.new(1, 0, 0, 34),  BackgroundColor3 = Color3.fromRGB(44, 44, 56),  BorderSizePixel = 0,
-		LayoutOrder = order,
-	}, parent)
-	corner(row, 8)
-	new("TextLabel", {
-		BackgroundTransparency = 1,  Size = UDim2.new(1, -90, 1, 0),  Position = UDim2.fromOffset(12, 0),
-		Text = name,  TextColor3 = Color3.fromRGB(235, 235, 240),  TextSize = 16,
-		Font = Enum.Font.GothamMedium,  TextXAlignment = Enum.TextXAlignment.Left,
-	}, row)
+	local row = new("Frame", { Size = UDim2.new(1, -9, 0, 43), BackgroundColor3 = UI.surface,
+		BorderSizePixel = 0, LayoutOrder = order }, parent)
+	corner(row, 9)
+	uiStroke(row)
+	uiText(row, name, 14, false, UI.text, {
+		Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -98, 1, 0),
+	})
 	local box = new("TextBox", {
-		Size = UDim2.fromOffset(64, 24),  Position = UDim2.new(1, -74, 0.5, -12),
-		BackgroundColor3 = Color3.fromRGB(70, 70, 85),  BorderSizePixel = 0,  Text = tostring(apply(nil)),
-		TextColor3 = Color3.new(1, 1, 1),  TextSize = 14,  Font = Enum.Font.GothamBold,
+		Size = UDim2.fromOffset(69, 28), Position = UDim2.new(1, -80, 0.5, -14),
+		BackgroundColor3 = UI.soft, BorderSizePixel = 0, Text = tostring(apply(nil)),
+		TextColor3 = UI.text, TextSize = 13, Font = Enum.Font.GothamBold,
 		ClearTextOnFocus = false,
 	}, row)
-	corner(box, 6)
+	corner(box, 7)
 	track(box.FocusLost:Connect(function()
-		box.Text = tostring(apply(tonumber(box.Text)))
+		local input = tonumber(box.Text)
+		local previous = tostring(apply(nil))
+		local ok, current = pcall(apply, input)
+		box.Text = ok and tostring(current) or previous
+		debugEvent("UI", "setting_changed", { name = name, requested = tostring(input), result = box.Text },
+			ok and "INFO" or "WARN")
 	end))
 end
 
@@ -1729,7 +1920,11 @@ local function newAutoSkillcheck()
 				local v7 = math.abs(((aim - zoneStart) + 180) % 360 - 180) / 60
 				if lastV7 and lastV7 < 0.44 and v7 >= 0.44 and canAutoClick() then
 					fired = true
-					pressGuiButton(hit)
+					increment("skillcheckInputs")
+					local sent = pressGuiButton(hit)
+					if not sent then increment("skillcheckInputFailures") end
+					debugEvent("SKILLCHECK", "dial_input", { dispatched = sent,
+						position = string.format("%.3f", v7) }, sent and "INFO" or "WARN")
 				end
 				lastV7 = v7
 			end)
@@ -1759,7 +1954,11 @@ local function newAutoSkillcheck()
 				local dist = markerCenter - objectiveCenter
 				if lastDist and lastDist < -2 and dist >= -2 and canAutoClick() then
 					fired = true
-					pressGuiButton(button)
+					increment("skillcheckInputs")
+					local sent = pressGuiButton(button)
+					if not sent then increment("skillcheckInputFailures") end
+					debugEvent("SKILLCHECK", "bar_input", { dispatched = sent,
+						distance = string.format("%.2f", dist) }, sent and "INFO" or "WARN")
 				end
 				lastDist = dist
 			end)
@@ -1814,41 +2013,144 @@ createInputRow(machinesBody, "Range (studs)", 9, function(value)
 	return MACHINE.Range
 end)
 
--- Debugging and teardown
+
+-- Diagnostics page: live counters, warning filter, and export on demand.
+local diagnosticsPage = createSection("Diagnostics")
+local summaryCard = new("Frame", { Size = UDim2.new(1, -9, 0, 106),
+	BackgroundColor3 = UI.surface, BorderSizePixel = 0, LayoutOrder = 1 }, diagnosticsPage)
+corner(summaryCard, 10)
+uiStroke(summaryCard)
+local stateLabel = uiText(summaryCard, "RUNNING", 12, true, UI.good, {
+	Position = UDim2.fromOffset(13, 10), Size = UDim2.new(1, -25, 0, 21),
+})
+local statsLabel = uiText(summaryCard, "Collecting diagnostic counters...", 12, false, UI.text, {
+	Position = UDim2.fromOffset(13, 35), Size = UDim2.new(1, -25, 0, 55),
+	TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true,
+})
+local toolsRow = new("Frame", { Size = UDim2.new(1, -9, 0, 42),
+	BackgroundTransparency = 1, LayoutOrder = 2 }, diagnosticsPage)
+local function actionButton(name, width, x, color)
+	local button = new("TextButton", { Text = name, Size = UDim2.fromOffset(width, 36),
+		Position = UDim2.fromOffset(x, 3), BackgroundColor3 = color,
+		TextColor3 = UI.text, TextSize = 12, Font = Enum.Font.GothamBold,
+		BorderSizePixel = 0 }, toolsRow)
+	corner(button, 8)
+	return button
+end
+local exportButton = actionButton("EXPORT LOG", 110, 0, UI.accent)
+local copyButton = actionButton("COPY LOG", 101, 119, UI.surface2)
+local warningButton = actionButton("WARNINGS: OFF", 130, 229, UI.surface2)
+local outputStatus = uiText(diagnosticsPage, "Logs are saved when you press Export or Unload.", 11, false, UI.muted,
+	{ Size = UDim2.new(1, -9, 0, 22), LayoutOrder = 3 })
+local logDisplay = new("TextBox", { Size = UDim2.new(1, -9, 0, 190),
+	BackgroundColor3 = Color3.fromRGB(11, 14, 21), BorderSizePixel = 0,
+	Text = "No events yet.", TextColor3 = Color3.fromRGB(194, 207, 232),
+	TextSize = 11, Font = Enum.Font.Code, TextXAlignment = Enum.TextXAlignment.Left,
+	TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true,
+	TextEditable = false, MultiLine = true, ClearTextOnFocus = false,
+	LayoutOrder = 4 }, diagnosticsPage)
+corner(logDisplay, 9)
+local warningsOnly = false
+track(warningButton.MouseButton1Click:Connect(function()
+	warningsOnly = not warningsOnly
+	warningButton.Text = "WARNINGS: " .. (warningsOnly and "ON" or "OFF")
+	debugEvent("UI", "diagnostic_filter", { warningsOnly = warningsOnly })
+end))
+
+local function debugReport()
+	local summary = {
+		"TU - Rava Hub | Diagnostic Report",
+		"Build=" .. BUILD,
+		"Exported=" .. os.date("%Y-%m-%d %H:%M:%S"),
+		string.format("SessionSeconds=%.2f PlaceId=%s JobId=%s",
+			os.clock() - debugStart, tostring(game.PlaceId), tostring(game.JobId)),
+		"Mode=teleport-only",
+		string.format("Client touch=%s promptFire=%s virtualInput=%s clipboard=%s writefile=%s",
+			tostring(UserInputService.TouchEnabled), tostring(hasFirePrompt),
+			tostring(pcall(function() return game:GetService("VirtualInputManager") end)),
+			tostring(typeof(setclipboard) == "function"), tostring(typeof(writefile) == "function")),
+		"Stats: " .. fieldString(debugStats),
+		"Status: " .. fieldString(debugStatus),
+		"Options: " .. fieldString(OPTIONS),
+		"FARM: " .. fieldString(FARM),
+		"MACHINE: " .. fieldString({ Range = MACHINE.Range, StallTimeout = MACHINE.StallTimeout,
+			UseTimeout = MACHINE.UseTimeout, ChaseHold = MACHINE.ChaseHold }),
+		"Enabled: " .. fieldString({ capsules = capsuleFarm.enabled, items = itemFarm.enabled,
+			candy = candyFarm.enabled, machine = machineFarm.enabled,
+			skillchecks = autoSkillcheck.enabled, autoUse = autoUse.enabled }),
+		string.format("LogEvents=%d Retained=%d Dropped=%d", debugIndex,
+			math.min(debugIndex, LOG_LIMIT), math.max(0, debugIndex - LOG_LIMIT)),
+		"---- EVENTS (chronological) ----",
+	}
+	for _, line in ipairs(allDebugLines()) do table.insert(summary, line) end
+	return table.concat(summary, "\n")
+end
 local function writeDebugFile()
 	if typeof(writefile) ~= "function" then
-		warn("[TU - Rava Hub] writefile is not available, no debug file written")
+		debugEvent("DEBUG", "export_failed", { reason = "writefile unavailable" }, "WARN")
+		outputStatus.Text = "Export unavailable. Try Copy Log instead."
+		return false
+	end
+	local filename = "TU_Rava_Hub_Debug_" .. os.time() .. ".txt"
+	local ok, err = pcall(writefile, filename, debugReport())
+	if ok then
+		outputStatus.Text = "Saved: " .. filename
+		debugEvent("DEBUG", "export_success", { filename = filename })
+		return true
+	end
+	outputStatus.Text = "Export failed: " .. tostring(err):sub(1, 70)
+	debugEvent("DEBUG", "export_failed", { error = err }, "ERROR")
+	return false
+end
+track(exportButton.MouseButton1Click:Connect(writeDebugFile))
+track(copyButton.MouseButton1Click:Connect(function()
+	if typeof(setclipboard) ~= "function" then
+		outputStatus.Text = "Clipboard unavailable in this executor."
+		debugEvent("DEBUG", "copy_unavailable", nil, "WARN")
 		return
 	end
-	local out = {
-		"TU - Rava Hub debug log",
-		os.date("%Y-%m-%d %H:%M:%S"),
-		string.format("PlaceId %s JobId %s", tostring(game.PlaceId), tostring(game.JobId)),
-		string.format("touch=%s fireproximityprompt=%s range=%s movement=teleport",
-			tostring(UserInputService.TouchEnabled), tostring(hasFirePrompt), tostring(MACHINE.Range)),
-	}
-	local keys = {}
-	for key in pairs(OPTIONS) do table.insert(keys, key) end
-	table.sort(keys)
-	local parts = {}
-	for _, key in ipairs(keys) do table.insert(parts, key .. "=" .. tostring(OPTIONS[key])) end
-	table.insert(out, "options: " .. table.concat(parts, " "))
-	keys, parts = {}, {}
-	for key in pairs(FARM) do table.insert(keys, key) end
-	table.sort(keys)
-	for _, key in ipairs(keys) do table.insert(parts, key .. "=" .. tostring(FARM[key])) end
-	table.insert(out, "farm: " .. table.concat(parts, " "))
-	table.insert(out, "lines: " .. #debugLines)
-	table.insert(out, "")
-	for _, line in ipairs(debugLines) do table.insert(out, line) end
-	local name = "TU_Rava_Hub_Debug_" .. os.time() .. ".txt"
-	local ok, err = pcall(writefile, name, table.concat(out, "\n"))
-	if ok then
-		warn("[TU - Rava Hub] debug file written: " .. name)
-	else
-		warn("[TU - Rava Hub] debug file failed: " .. tostring(err))
+	local ok, err = pcall(setclipboard, debugReport())
+	outputStatus.Text = ok and "Diagnostic report copied." or "Copy failed: " .. tostring(err):sub(1, 60)
+	debugEvent("DEBUG", ok and "copy_success" or "copy_failed", { error = not ok and err or "none" },
+		ok and "INFO" or "ERROR")
+end))
+supervise("diagnostic UI", function() return alive end, function()
+	while alive do
+		local working = (machineFarm.enabled and "MACHINE") or (pickupBusy() and "PICKUPS") or "IDLE"
+		headerStatus.Text = working .. "  •  TP MODE"
+		headerStatus.TextColor3 = working == "IDLE" and UI.muted or UI.good
+		footerLabel.Text = string.format("%s   •   %d teleports   •   %d events", BUILD, debugStats.teleports, debugIndex)
+		if activeTab == "Diagnostics" and main.Visible then
+			stateLabel.Text = "Current target: " .. debugStatus.currentTarget
+			statsLabel.Text = string.format("Teleports %d  |  TP failures %d  |  Unsafe destinations %d\nPickups %d/%d confirmed  |  Prompts failed %d\nMachines %d completed / %d placed  |  Stalls %d  |  Errors %d",
+				debugStats.teleports, debugStats.teleportFailures, debugStats.unsafeDestinations,
+				debugStats.pickupConfirmed, debugStats.pickupAttempts, debugStats.promptFailures,
+				debugStats.machineCompletions, debugStats.machinePlacements,
+				debugStats.machineStalls, debugStats.workerErrors)
+			local logs = recentDebugLines(11, warningsOnly)
+			logDisplay.Text = #logs > 0 and table.concat(logs, "\n") or "No matching events yet."
+		end
+		task.wait(0.7)
 	end
-end
+end)
+debugEvent("SYSTEM", "initialized", { build = BUILD, place = game.PlaceId, mode = "teleport" })
+-- World structure watcher reports renamed/missing objective folders without log spam.
+task.spawn(function()
+	local previous = {}
+	while alive do
+		for _, folderName in ipairs({ "Items", "Capsules", "Candies", "Computers", "OilMachines", "MonsterFolder" }) do
+			local folder = workspace:FindFirstChild(folderName)
+			local present = folder ~= nil
+			if previous[folderName] ~= present then
+				debugEvent("WORLD", present and "folder_found" or "folder_missing",
+					{ name = folderName, children = folder and #folder:GetChildren() or 0 },
+					present and "INFO" or "WARN")
+				previous[folderName] = present
+			end
+		end
+		task.wait(5)
+	end
+end)
 
 local unloaded = false
 local function unload()
@@ -1859,6 +2161,7 @@ local function unload()
 	_G.TURavaHubUnload = nil
 	for _, cleanup in ipairs(cleanups) do pcall(cleanup) end
 	table.clear(cleanups)
+	debugEvent("SYSTEM", "unload", { elapsed = string.format("%.2f", os.clock() - debugStart) })
 	writeDebugFile()
 	for _, connection in ipairs(connections) do connection:Disconnect() end
 	table.clear(connections)
