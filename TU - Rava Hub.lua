@@ -1,7 +1,6 @@
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
-local TweenService = game:GetService("TweenService")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 local alive = true
@@ -36,129 +35,52 @@ local function debugLog(message)
 	table.insert(debugLines, string.format("[%8.2f] %s", os.clock() - debugStart, message))
 end
 
--- Shared hybrid movement controller. Safe straight-line travel tweens; obstructed,
--- enemy-exposed or emergency travel teleports (only to a safe routine destination).
-local MOTION = {
-	Speed = 160, MinTime = 0.08, MaxTime = 8, Poll = 0.03,
-	DangerRadius = 15, SampleSpacing = 12, MaxSamples = 28, VerticalLimit = 14,
-}
+-- Shared, teleport-only travel controller. Emergency escapes override routine moves.
+local TRAVEL = { DangerRadius = 15, ArrivalTolerance = 4 }
 local activeMotion
-local infectedNear -- Defined below, once MonsterFolder helpers are available.
+local infectedNear
 local motionPauseUntil = 0
-
 local function cancelMotion(owner)
-	local motion = activeMotion
-	if motion and (not owner or motion.owner == owner) then
-		activeMotion = nil
-		if motion.tween then motion.tween:Cancel() end
-	end
+	if activeMotion and (not owner or owner == activeMotion) then activeMotion = nil end
 end
-
-local function routeRisk(from, destination, character)
-	local delta = destination - from
-	local distance = delta.Magnitude
-	if math.abs(delta.Y) > MOTION.VerticalLimit then return "vertical gap" end
-	if infectedNear then
-		local steps = math.clamp(math.ceil(distance / MOTION.SampleSpacing), 1, MOTION.MaxSamples)
-		for i = 0, steps do
-			if infectedNear(from:Lerp(destination, i / steps), MOTION.DangerRadius) then
-				return "infected along route"
-			end
-		end
-	end
-	-- The last few studs may intersect the target machine/model itself.
-	if distance > 6 then
-		local rayParams = RaycastParams.new()
-		rayParams.FilterType = Enum.RaycastFilterType.Exclude
-		rayParams.FilterDescendantsInstances = { character }
-		rayParams.RespectCanCollide = true
-		if workspace:Raycast(from, delta.Unit * (distance - 4), rayParams) then
-			return "obstructed path"
-		end
-	end
-	return nil
-end
-
-local function hybridCharacter(destination, keepGoing, owner, mode)
+local function teleportCharacter(destination, keepGoing, owner, mode)
 	local emergency = mode == "emergency"
 	if not alive or not keepGoing() then return false end
+	if activeMotion and not emergency then return false end
 	if emergency then
-		cancelMotion() -- Escape has priority over pickups, returns and machine travel.
+		cancelMotion()
 		motionPauseUntil = math.max(motionPauseUntil, os.clock() + 1.5)
-	elseif activeMotion then
-		return false
 	end
 	local character = player.Character
 	local root = character and character:FindFirstChild("HumanoidRootPart")
 	if not root or not root:IsDescendantOf(workspace) then return false end
-	local distance = (root.Position - destination.Position).Magnitude
+	local from = root.Position
+	local distance = (from - destination.Position).Magnitude
 	if distance <= 0.25 then return true end
-	-- Never automatically warp *into* an infected pickup/objective.
-	if not emergency and infectedNear and infectedNear(destination.Position, MOTION.DangerRadius) then
-		debugLog("movement skipped: unsafe destination (" .. owner .. ")")
+	if not emergency and infectedNear and infectedNear(destination.Position, TRAVEL.DangerRadius) then
+		debugLog("MOVE unsafe destination owner=" .. tostring(owner))
 		return false
 	end
-	local risk = not emergency and routeRisk(root.Position, destination.Position, character) or nil
-	local motion = { owner = owner }
-	activeMotion = motion
-	local function valid()
-		return activeMotion == motion and alive and player.Character == character
-			and root:IsDescendantOf(workspace) and keepGoing()
-	end
-	local function warp(reason)
-		if not valid() then return false end
-		if not emergency and infectedNear and infectedNear(destination.Position, MOTION.DangerRadius) then return false end
+	activeMotion = owner
+	local ok, err = pcall(function()
 		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
 		root.CFrame = destination
-		debugLog(string.format("TELEPORT %s %.1f studs (%s)", owner, distance, reason))
-		return (root.Position - destination.Position).Magnitude <= 4
-	end
-	if emergency or risk then
-		local arrived = warp(emergency and "emergency" or risk)
-		if activeMotion == motion then activeMotion = nil end
-		return arrived
-	end
-	local duration = math.clamp(distance / MOTION.Speed, MOTION.MinTime, MOTION.MaxTime)
-	local ok, tween = pcall(function()
-		return TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear), { CFrame = destination })
 	end)
+	if activeMotion == owner then activeMotion = nil end
 	if not ok then
-		debugLog("tween creation failed: " .. tostring(tween))
-		if activeMotion == motion then activeMotion = nil end
+		debugLog("ERROR MOVE teleport owner=" .. tostring(owner) .. " reason=" .. tostring(err))
 		return false
 	end
-	motion.tween = tween
-	root.AssemblyLinearVelocity = Vector3.zero
-	debugLog(string.format("TWEEN %s %.1f studs", owner, distance))
-	tween:Play()
-	local dangerAppeared, lastSafetyCheck = false, 0
-	while valid() and tween.PlaybackState == Enum.PlaybackState.Playing do
-		if infectedNear and os.clock() - lastSafetyCheck >= 0.15 then
-			lastSafetyCheck = os.clock()
-			if infectedNear(root.Position, MOTION.DangerRadius) then
-				dangerAppeared = true
-				break
-			end
-		end
-		task.wait(MOTION.Poll)
+	local drift = (root.Position - destination.Position).Magnitude
+	if drift > TRAVEL.ArrivalTolerance then
+		debugLog(string.format("MOVE failed owner=%s drift=%.1f", owner, drift))
+		return false
 	end
-	local completed = valid() and tween.PlaybackState == Enum.PlaybackState.Completed
-	if tween.PlaybackState == Enum.PlaybackState.Playing then tween:Cancel() end
-	local arrived = false
-	if completed then
-		root.AssemblyLinearVelocity = Vector3.zero
-		local drift = (root.Position - destination.Position).Magnitude
-		if drift <= 4 then
-			arrived = true
-		else
-			debugLog(string.format("tween drift %.1f studs (%s)", drift, owner))
-			arrived = warp("tween drift")
-		end
-	elseif dangerAppeared then
-		arrived = warp("new danger during tween")
-	end
-	if activeMotion == motion then activeMotion = nil end
-	return arrived
+	debugLog(string.format("MOVE teleport owner=%s mode=%s dist=%.1f from=(%.1f,%.1f,%.1f) to=(%.1f,%.1f,%.1f)",
+		tostring(owner), emergency and "emergency" or "routine", distance,
+		from.X, from.Y, from.Z, destination.Position.X, destination.Position.Y, destination.Position.Z))
+	return true
 end
 
 local function track(connection)
@@ -660,7 +582,7 @@ end
 
 local chase = { pending = false, holdUntil = 0 }
 
--- Only one pickup worker may tween / activate prompts at a time.
+-- Only one pickup worker may move / activate prompts at a time.
 -- Keep a shared home so switching workers cannot overwrite the return location.
 -- Coordinated pickup farming
 local pickupCoordinator = {
@@ -687,7 +609,7 @@ local function returnPickupHome(force, isBlocked)
 	if root then
 		local home = pickupCoordinator.home
 		pickupCoordinator.owner = "return"
-		local arrived = hybridCharacter(home, function()
+		local arrived = teleportCharacter(home, function()
 			return alive and pickupCoordinator.owner == "return" and not (isBlocked and isBlocked())
 		end, "return")
 		pickupCoordinator.owner = nil
@@ -753,7 +675,7 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 									return allowed() and pickupCoordinator.owner == farm
 										and part:IsDescendantOf(workspace) and prompt.Enabled
 								end
-								if not hybridCharacter(CFrame.new(part.Position + Vector3.new(0, FARM.Height, 0)),
+								if not teleportCharacter(CFrame.new(part.Position + Vector3.new(0, FARM.Height, 0)),
 									function() return stillPicking() and not infectedNear(part.Position, FARM.InfectedClear) end, "pickup") then
 									return false
 								end
@@ -1316,7 +1238,7 @@ local function newMachineAutofarm()
 	end
 	local function move(position, keepGoing, mode)
 		farm.moving = true
-		local arrived = hybridCharacter(CFrame.new(position), keepGoing, "machine", mode)
+		local arrived = teleportCharacter(CFrame.new(position), keepGoing, "machine", mode)
 		farm.moving = false
 		return arrived
 	end
@@ -1883,17 +1805,13 @@ createToggleRow(machinesBody, "Machine Autofarm", 1, machineFarm)
 createToggleRow(machinesBody, "Auto Skillcheck", 2, autoSkillcheck)
 createToggleRow(machinesBody, "Auto Hide", 3, newOption(OPTIONS, "AutoHide"))
 createToggleRow(machinesBody, "Line Of Sight", 4, newOption(OPTIONS, "LineOfSight"))
-createToggleRow(machinesBody, "Auto Elevator (Hybrid)", 5, newOption(OPTIONS, "AutoElevator"))
+createToggleRow(machinesBody, "Auto Elevator (Teleport)", 5, newOption(OPTIONS, "AutoElevator"))
 createToggleRow(machinesBody, "Fusebox Check", 6, newOption(OPTIONS, "Fuseboxes"))
 createToggleRow(machinesBody, "Items First", 7, newOption(OPTIONS, "ItemsFirst"))
 createToggleRow(machinesBody, "Prompt Delay (0.5s)", 8, newOption(OPTIONS, "PromptDelay"))
 createInputRow(machinesBody, "Range (studs)", 9, function(value)
 	if value and value > 0 and value < 2000 then MACHINE.Range = value end
 	return MACHINE.Range
-end)
-createInputRow(machinesBody, "Tween speed", 10, function(value)
-	if value and value >= 20 and value <= 500 then MOTION.Speed = value end
-	return MOTION.Speed
 end)
 
 -- Debugging and teardown
@@ -1906,8 +1824,8 @@ local function writeDebugFile()
 		"TU - Rava Hub debug log",
 		os.date("%Y-%m-%d %H:%M:%S"),
 		string.format("PlaceId %s JobId %s", tostring(game.PlaceId), tostring(game.JobId)),
-		string.format("touch=%s fireproximityprompt=%s range=%s tweenSpeed=%s hybrid=true",
-			tostring(UserInputService.TouchEnabled), tostring(hasFirePrompt), tostring(MACHINE.Range), tostring(MOTION.Speed)),
+		string.format("touch=%s fireproximityprompt=%s range=%s movement=teleport",
+			tostring(UserInputService.TouchEnabled), tostring(hasFirePrompt), tostring(MACHINE.Range)),
 	}
 	local keys = {}
 	for key in pairs(OPTIONS) do table.insert(keys, key) end
