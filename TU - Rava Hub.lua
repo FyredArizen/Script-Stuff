@@ -1,6 +1,7 @@
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 local alive = true
@@ -22,26 +23,43 @@ local connections = {}
 local cleanups = {}
 
 local OPTIONS = {
-	AutoHide = true,  LineOfSight = true,  AutoElevator = true,
-	Fuseboxes = true,  ItemsFirst = true,  PromptDelay = true,
-	FastPickups = true,  CollectLast = false,
+	AutoHide = true,  AutoElevator = true,
+	Fuseboxes = true,  ItemsFirst = true,
+	CollectLast = false,
 }
 
 -- Diagnostic log: capped circular buffer, timestamps, categories, and counters.
-local BUILD = "2.1 Teleport UI / Diagnostics"
+local BUILD = "2.5.5 Organized UI / HUD Ability + Samples"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
 local debugStats = {
 	teleports = 0, teleportFailures = 0, unsafeDestinations = 0,
+	pickupTweens = 0, pickupTweenAborts = 0, pickupTweenDetours = 0,
+	pickupPreemptions = 0,
+	pickupTweenUnsafe = 0, pickupTweenDistance = 0, pickupTravelMs = 0,
 	pickupAttempts = 0, pickupConfirmed = 0, pickupUnconfirmed = 0,
 	promptAttempts = 0, promptFailures = 0, machineTargetChanges = 0,
 	machineStalls = 0, skillcheckInputs = 0, skillcheckInputFailures = 0,
 	chases = 0, workerErrors = 0, machineCompletions = 0,
 	machinePlacements = 0, machineDangers = 0, fuseAttempts = 0,
-	itemUseAttempts = 0, itemUseFailures = 0,
+	itemUseAttempts = 0, itemUseFailures = 0, itemUseObserved = 0, itemUseUnverified = 0,
+	abilityDeferredMachine = 0, abilityResumedOffMachine = 0,
+	abilityMachineInterrupts = 0, abilityCooldownTransitions = 0, abilityCooldownUnknown = 0,
+	abilityCooldownRearms = 0, abilityCooldownAwait = 0,
+	abilityAttempts = 0, abilityRemoteFailures = 0, abilityRejected = 0, abilityDispatched = 0,
+	abilityWaffles = 0, abilityWaffleFailures = 0, skillcheckExitAttempts = 0, skillcheckExitFailures = 0,
+	deathExports = 0, deathExportFailures = 0,
+	skillcheckLeaveDeferred = 0, skillcheckMoveBlocked = 0,
+	hits = 0, totalDamage = 0, nearestEnemyMissing = 0,
+	espAdded = 0, espRemoved = 0, espUpdates = 0,
+	squidTentaclesRemoved = 0, squidTentacleErrors = 0,
+	targetCacheRefreshes = 0, targetCacheHits = 0,
+	handoffs = 0, handoffTotalMs = 0, handoffMaxMs = 0,
+	handoffLastMs = 0, firstObjectiveMs = 0, machineScans = 0, slowMachineScans = 0,
 }
-local debugStatus = { action = "Ready", lastWarning = "None", currentTarget = "None" }
+local debugStatus = { action = "Ready", lastWarning = "None", currentTarget = "None",
+	lastHit = "None", lastHandoff = "None", handoffPending = "None" }
 local function increment(metric, amount)
 	debugStats[metric] = (debugStats[metric] or 0) + (amount or 1)
 end
@@ -104,19 +122,45 @@ local function allDebugLines()
 	return lines
 end
 
--- All travel is instantaneous; no interpolation or route sampling.
+-- Hybrid navigation: pickups tween through verified clear corridors; objectives teleport.
+-- Moving enemies are rechecked during travel. If no safe route exists, SKIP the pickup.
 local activeMotion
+local skillcheckProtected -- Initialized after GUI visibility helpers are defined.
 local infectedNear -- Assigned after monster-folder helpers are defined.
+local pickupThreats -- Assigned after the machine/infected helpers are defined.
 local motionPauseUntil = 0
+local PICKUP_TRAVEL = {
+	Speed = 200, SafetyRadius = 18, CheckInterval = 0.08,
+	ArriveTolerance = 4.5,
+}
 local function cancelMotion(owner)
-	if activeMotion and (not owner or activeMotion == owner) then
-		debugEvent("MOVE", "cancel", { owner = activeMotion })
+	local motion = activeMotion
+	if motion and (not owner or motion.owner == owner) then
 		activeMotion = nil
+		motion.cancelled = true
+		if motion.tween then pcall(function() motion.tween:Cancel() end) end
+		debugEvent("MOVE", "cancel", { owner = motion.owner, phase = motion.phase or "unknown" })
 	end
 end
 local function teleportCharacter(destination, keepGoing, owner, mode)
 	local emergency = mode == "emergency"
 	if not alive or not keepGoing() then return false end
+	-- Never displace the player while a skillcheck is displayed, even during
+	-- a chase, an emergency escape, a pickup return, or objective handoff.
+	local protected, checkType = false, "not_ready"
+	if skillcheckProtected then protected, checkType = skillcheckProtected() end
+	if protected then
+		increment("skillcheckMoveBlocked")
+		debugThrottled("skillcheck_teleport_block_" .. tostring(owner), 1.5,
+			"SKILLCHECK", "teleport_deferred", { owner = owner, mode = mode or "routine", ui = checkType }, "INFO")
+		return false
+	end
+	-- An objective handoff always wins over pickup travel. This prevents the
+	-- machine and pickup workers from overwriting each other's positions.
+	if owner == "machine" and activeMotion and activeMotion.owner == "pickup" then
+		debugEvent("MOVE", "machine_preempts_pickup_tween", { phase = activeMotion.phase or "unknown" }, "WARN")
+		cancelMotion("pickup")
+	end
 	if activeMotion and not emergency then
 		debugThrottled("move_busy_" .. owner, 3, "MOVE", "occupied", { owner = owner }, "WARN")
 		return false
@@ -134,20 +178,18 @@ local function teleportCharacter(destination, keepGoing, owner, mode)
 	local from = root.Position
 	local distance = (from - destination.Position).Magnitude
 	if distance < 0.25 then return true end
-	-- Routine movement refuses unsafe destinations. Emergency escapes remain immediate.
+	-- Routine objective movements still reject unsafe destinations.
 	if not emergency and infectedNear and infectedNear(destination.Position, 15) then
 		increment("unsafeDestinations")
 		debugThrottled("unsafe_" .. owner, 3, "MOVE", "unsafe_destination",
 			{ owner = owner, position = tostring(destination.Position) }, "WARN")
 		return false
 	end
-	activeMotion = owner
 	local ok, err = pcall(function()
 		root.AssemblyLinearVelocity = Vector3.zero
 		root.AssemblyAngularVelocity = Vector3.zero
 		root.CFrame = destination
 	end)
-	if activeMotion == owner then activeMotion = nil end
 	if not ok then
 		increment("teleportFailures")
 		debugEvent("MOVE", "teleport_error", { owner = owner, error = err }, "ERROR")
@@ -168,6 +210,192 @@ local function teleportCharacter(destination, keepGoing, owner, mode)
 	return true
 end
 
+-- Check a whole segment, not just its destination. Vertical distances are respected
+-- so enemies on different floors do not always block horizontal movement.
+local function segmentThreat(a, b, threats, radius)
+	local diff = b - a
+	local lengthSquared = diff:Dot(diff)
+	for _, enemy in ipairs(threats) do
+		local t = lengthSquared > 0.001 and math.clamp((enemy.pos - a):Dot(diff) / lengthSquared, 0, 1) or 0
+		local nearest = a + diff * t
+		if (enemy.pos - nearest).Magnitude < radius then
+			return enemy, (enemy.pos - nearest).Magnitude
+		end
+	end
+	return nil
+end
+local function segmentObstacle(a, b, character, target)
+	local diff = b - a
+	if diff.Magnitude < 1 then return false end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local monsters = workspace:FindFirstChild("MonsterFolder")
+	local ignored = { character }
+	if monsters then table.insert(ignored, monsters) end
+	if target then table.insert(ignored, target) end
+	params.FilterDescendantsInstances = ignored
+	params.RespectCanCollide = true
+	-- Ignore the last stud so solid parts immediately below pickups do not
+	-- reject an otherwise clear approach to the prompt.
+	local hit = workspace:Raycast(a + Vector3.new(0, 0.6, 0),
+		diff.Unit * math.max(0.05, diff.Magnitude - 1), params)
+	return hit ~= nil, hit
+end
+local function planPickupRoute(from, destination, threats, character, target)
+	local radius = PICKUP_TRAVEL.SafetyRadius
+	if segmentThreat(destination, destination, threats, radius) then return nil, "unsafe_destination" end
+	if segmentThreat(from, from, threats, radius) then return nil, "unsafe_start" end
+	local function safeRoute(points)
+		local previous = from
+		for _, point in ipairs(points) do
+			if segmentThreat(previous, point, threats, radius) then return false end
+			if segmentObstacle(previous, point, character, target) then return false end
+			previous = point
+		end
+		return true
+	end
+	if safeRoute({ destination }) then return { destination }, "direct" end
+	local heading = destination - from
+	local planar = Vector3.new(heading.X, 0, heading.Z)
+	if planar.Magnitude < 1 then return nil, "vertical_route_blocked" end
+	local forward = planar.Unit
+	local side = Vector3.new(-forward.Z, 0, forward.X)
+	local length = planar.Magnitude
+	local candidates = {}
+	local function try(points)
+		if not safeRoute(points) then return end
+		local total, last = 0, from
+		for _, point in ipairs(points) do total += (point - last).Magnitude; last = point end
+		table.insert(candidates, { points = points, length = total })
+	end
+	-- Two-sided detours allow the player to travel around infected corridors.
+	for _, enemy in ipairs(threats) do
+		local t = math.clamp((enemy.pos - from):Dot(forward), 0, length)
+		local near = from + (destination - from) * (t / length)
+		if (enemy.pos - near).Magnitude < radius * 2 then
+			for _, sign in ipairs({ -1, 1 }) do
+				for _, scale in ipairs({ 1.6, 2.1 }) do
+					local lateral = side * (radius * scale * sign)
+					local before = near - forward * (radius * 1.35) + lateral
+					local after = near + forward * (radius * 1.35) + lateral
+					try({ before, after, destination })
+					try({ near + lateral, destination })
+				end
+			end
+		end
+	end
+	-- Simple geometry-only wall detours when no enemy-centered route is viable.
+	-- These are verified with raycasts and enemy distances before use.
+	if #candidates == 0 then
+		local midpoint = (from + destination) * 0.5
+		for _, offset in ipairs({ 12, 25, 45 }) do
+			for _, sign in ipairs({ -1, 1 }) do
+				local lateral = side * offset * sign
+				try({ midpoint + lateral, destination })
+				try({ from + lateral, destination + lateral, destination })
+			end
+		end
+	end
+	if #candidates == 0 then return nil, "no_safe_corridor" end
+	table.sort(candidates, function(a, b) return a.length < b.length end)
+	return candidates[1].points, "detour"
+end
+local function tweenPickup(destination, keepGoing, target)
+	if not alive or not keepGoing() then return false, "inactive" end
+	if skillcheckProtected and skillcheckProtected() then return false, "skillcheck_visible" end
+	if activeMotion then return false, "movement_busy" end
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not root or not root:IsDescendantOf(workspace) then return false, "missing_root" end
+	local from = root.Position
+	local threats = pickupThreats and pickupThreats() or {}
+	local points, routeMode = planPickupRoute(from, destination.Position, threats, character, target)
+	if not points then
+		increment("pickupTweenUnsafe")
+		debugThrottled("pickup_route_" .. routeMode, 2, "MOVE", "pickup_route_rejected",
+			{ reason = routeMode, distance = string.format("%.1f", (destination.Position - from).Magnitude) }, "WARN")
+		return false, routeMode
+	end
+	if routeMode == "detour" then increment("pickupTweenDetours") end
+	local motion = { owner = "pickup", phase = "route", cancelled = false }
+	activeMotion = motion
+	local started, traveled = os.clock(), 0
+	debugEvent("MOVE", "pickup_tween_start", { mode = routeMode, segments = #points,
+		distance = string.format("%.1f", (destination.Position - from).Magnitude) })
+	local function stop(reason, emergency)
+		if activeMotion == motion then activeMotion = nil end
+		motion.cancelled = true
+		if motion.tween then pcall(function() motion.tween:Cancel() end) end
+		increment("pickupTweenAborts")
+		debugEvent("MOVE", "pickup_tween_abort", { reason = reason,
+			elapsedMs = math.floor((os.clock() - started) * 1000),
+			position = tostring(root.Position) }, "WARN")
+		if emergency and alive and player.Character == character and infectedNear then
+			-- Emergency retreat is allowed, but never retreat to a threatened start.
+			if not infectedNear(from, PICKUP_TRAVEL.SafetyRadius) then
+				teleportCharacter(CFrame.new(from), function() return alive end, "pickup_escape", "emergency")
+			end
+		end
+		return false, reason
+	end
+	for index, point in ipairs(points) do
+		if not keepGoing() or motion.cancelled or activeMotion ~= motion then return stop("interrupted", false) end
+		local stepDistance = (point - root.Position).Magnitude
+		if stepDistance > 0.2 then
+			motion.phase = "segment_" .. index
+			local duration = math.max(0.035, stepDistance / PICKUP_TRAVEL.Speed)
+			local created, tween = pcall(function()
+				return TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear),
+					{ CFrame = CFrame.new(point) })
+			end)
+			if not created then
+				debugEvent("MOVE", "pickup_tween_create_failed", { error = tostring(tween) }, "ERROR")
+				return stop("tween_create_failed", false)
+			end
+			motion.tween = tween
+			local played, playError = pcall(function() tween:Play() end)
+			if not played then
+				debugEvent("MOVE", "pickup_tween_play_failed", { error = tostring(playError) }, "ERROR")
+				return stop("tween_play_failed", false)
+			end
+			local checkAt = 0
+			local deadline = os.clock() + duration + 0.4
+			while tween.PlaybackState == Enum.PlaybackState.Playing do
+				RunService.Heartbeat:Wait()
+				if skillcheckProtected and skillcheckProtected() then
+					return stop("skillcheck_visible", false)
+				end
+				if motion.cancelled or activeMotion ~= motion or player.Character ~= character then
+					return stop("interrupted", false)
+				end
+				local now = os.clock()
+				if now > deadline then return stop("tween_stalled", false) end
+				if now >= checkAt then
+					checkAt = now + PICKUP_TRAVEL.CheckInterval
+					local live = pickupThreats and pickupThreats() or {}
+					if segmentThreat(root.Position, point, live, PICKUP_TRAVEL.SafetyRadius) then
+						return stop("enemy_entered_path", true)
+					end
+				end
+				if not keepGoing() then return stop("interrupted", false) end
+			end
+			if (root.Position - point).Magnitude > PICKUP_TRAVEL.ArriveTolerance then
+				return stop("arrival_drift", false)
+			end
+			traveled += stepDistance
+		end
+	end
+	if activeMotion == motion then activeMotion = nil end
+	motion.tween = nil
+	increment("pickupTweens")
+	increment("pickupTweenDistance", math.floor(traveled))
+	local ms = math.floor((os.clock() - started) * 1000)
+	increment("pickupTravelMs", ms)
+	debugEvent("MOVE", "pickup_tween_arrived", { mode = routeMode, ms = ms,
+		distance = string.format("%.1f", traveled) })
+	return true, routeMode
+end
+
 local function track(connection)
 	table.insert(connections, connection)
 	return connection
@@ -185,6 +413,61 @@ local function supervise(label, isActive, fn)
 		end
 	end)
 end
+
+-- Remove only objects named Tentacle under the exact path
+-- workspace.MonsterFolder.TSquid, including nested descendants.
+-- Startup sweep handles existing instances; the event handler handles spawns;
+-- a lightweight watchdog catches renamed instances and recreated folders.
+local function findTSquid()
+	local monsterFolder = workspace:FindFirstChild("MonsterFolder")
+	return monsterFolder and monsterFolder:FindFirstChild("TSquid")
+end
+
+local function deleteSquidTentacle(inst, reason)
+	if not alive or not inst or inst.Name ~= "Tentacle" or not inst.Parent then return end
+	local squid = findTSquid()
+	if not squid or not inst:IsDescendantOf(squid) then return end
+	local className = inst.ClassName
+	local ok, err = pcall(function() inst:Destroy() end)
+	if ok then
+		increment("squidTentaclesRemoved")
+		debugEvent("TSQUID", "tentacle_removed", { source = reason, class = className })
+	else
+		increment("squidTentacleErrors")
+		debugThrottled("squid_delete_failed", 2, "TSQUID", "tentacle_remove_failed",
+			{ source = reason, error = err }, "ERROR")
+	end
+end
+
+local function sweepSquidTentacles(reason)
+	local squid = findTSquid()
+	if not squid then return end
+	for _, inst in ipairs(squid:GetDescendants()) do
+		if inst.Name == "Tentacle" then deleteSquidTentacle(inst, reason) end
+	end
+end
+
+track(workspace.DescendantAdded:Connect(function(inst)
+	if not alive then return end
+	if inst.Name == "Tentacle" then
+		-- Defer destruction until parenting/replication finishes this event.
+		task.defer(deleteSquidTentacle, inst, "spawn")
+	elseif (inst.Name == "MonsterFolder" and inst.Parent == workspace)
+		or (inst.Name == "TSquid" and inst.Parent and inst.Parent.Name == "MonsterFolder"
+			and inst.Parent.Parent == workspace) then
+		task.defer(function()
+			if alive then sweepSquidTentacles("folder_recreated") end
+		end)
+	end
+end))
+
+sweepSquidTentacles("startup")
+supervise("TSquid Tentacle watcher", function() return alive end, function()
+	while alive do
+		sweepSquidTentacles("watchdog")
+		task.wait(0.6)
+	end
+end)
 
 local function new(class, props, parent)
 	local inst = Instance.new(class)
@@ -251,8 +534,8 @@ local top = new("Frame", { Size = UDim2.new(1, 0, 0, 64), BackgroundColor3 = UI.
 	BorderSizePixel = 0, Active = true }, main)
 new("Frame", { Size = UDim2.new(1, 0, 0, 2), Position = UDim2.new(0, 0, 1, -2),
 	BackgroundColor3 = UI.accent, BorderSizePixel = 0 }, top)
-uiText(top, "RAVA", 22, true, UI.text, { Position = UDim2.fromOffset(22, 10), Size = UDim2.fromOffset(130, 27) })
-uiText(top, "TU   /   CONTROL HUB", 10, true, UI.muted,
+uiText(top, "RAVA HUB", 21, true, UI.text, { Position = UDim2.fromOffset(22, 10), Size = UDim2.fromOffset(166, 27) })
+uiText(top, "TU / v2.5.5 / ORGANIZED", 10, true, UI.muted,
 	{ Position = UDim2.fromOffset(23, 37), Size = UDim2.fromOffset(190, 15) })
 local headerStatus = uiText(top, "SYSTEM READY", 12, true, UI.good,
 	{ Position = UDim2.fromOffset(346, 20), Size = UDim2.fromOffset(192, 24), TextXAlignment = Enum.TextXAlignment.Right })
@@ -274,13 +557,15 @@ local mainArea = new("Frame", { Position = UDim2.fromOffset(158, 64),
 	Size = UDim2.new(1, -158, 1, -94), BackgroundTransparency = 1 }, main)
 local footer = new("Frame", { Position = UDim2.new(0, 0, 1, -30), Size = UDim2.new(1, 0, 0, 30),
 	BackgroundColor3 = UI.surface, BorderSizePixel = 0 }, main)
-local footerLabel = uiText(footer, "v2.1   •   TELEPORT MODE   •   LOGGING ACTIVE", 11, false, UI.muted,
+local footerLabel = uiText(footer, "v2.5.5   •   PICKUP TWEEN   •   OBJECTIVE TELEPORT", 11, false, UI.muted,
 	{ Position = UDim2.fromOffset(17, 5), Size = UDim2.new(1, -30, 0, 21) })
 local pages, menuButtons, activeTab = {}, {}, "Autofarm"
+local toggleRefreshers = {}
 local TAB_ORDER = { "ESP", "Autofarm", "Machines", "Diagnostics" }
 local TAB_SYMBOL = { ESP = "◉", Autofarm = "◆", Machines = "▣", Diagnostics = "≡" }
 local function showTab(name)
 	activeTab = name
+	for _, refresh in ipairs(toggleRefreshers) do refresh() end
 	for key, page in pairs(pages) do page.Visible = key == name end
 	for key, button in pairs(menuButtons) do
 		button.BackgroundColor3 = key == name and UI.soft or UI.surface
@@ -304,31 +589,91 @@ local function createSection(name)
 		Name = name .. "Page", Position = UDim2.fromOffset(0, 0), Size = UDim2.fromScale(1, 1),
 		BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 4,
 		ScrollBarImageColor3 = UI.accent, CanvasSize = UDim2.new(),
-		AutomaticCanvasSize = Enum.AutomaticSize.Y, Visible = name == activeTab,
+		AutomaticCanvasSize = Enum.AutomaticSize.None, Visible = name == activeTab,
 	}, mainArea)
-	list(page, 9)
+	local pageLayout = list(page, 9)
+	track(pageLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+		page.CanvasSize = UDim2.fromOffset(0, pageLayout.AbsoluteContentSize.Y + 34)
+	end))
 	new("UIPadding", { PaddingTop = UDim.new(0, 15), PaddingLeft = UDim.new(0, 14),
 		PaddingRight = UDim.new(0, 14), PaddingBottom = UDim.new(0, 14) }, page)
 	pages[name] = page
 	uiText(page, name, 20, true, UI.text, {
 		Size = UDim2.new(1, -8, 0, 30), LayoutOrder = -2,
 	})
-	uiText(page, (name == "ESP" and "Visual overlays and objective markers")
-		or (name == "Autofarm" and "Pickup automation and inventory filters")
-		or (name == "Machines" and "Objective logic and protection")
-		or "Runtime telemetry and test reports", 12, false, UI.muted, {
+	uiText(page, (name == "ESP" and "Event-driven markers, distance and objective progress")
+		or (name == "Autofarm" and "Ability use, pickup routes, filters and item helpers")
+		or (name == "Machines" and "Objective controls, danger responses, exits and priorities")
+		or "Damage, objective handoffs, and diagnostic exports", 12, false, UI.muted, {
 		Size = UDim2.new(1, -8, 0, 18), LayoutOrder = -1,
 	})
 	return page
 end
-local function createToggleRow(parent, name, order, feature)
-	local row = new("Frame", { Size = UDim2.new(1, -9, 0, 43),
+-- Each major tab contains collapsible cards. Their heights are measured from
+-- UIListLayout.AbsoluteContentSize to keep ScrollingFrame content accurate.
+local function createSubcategory(page, heading, order, subtitle, initiallyOpen)
+	local expanded = initiallyOpen ~= false
+	local card = new("Frame", {
+		Name = heading:gsub("[^%w]", "") .. "Group", Size = UDim2.new(1, -9, 0, 56),
+		BackgroundColor3 = UI.surface2, BorderSizePixel = 0, LayoutOrder = order,
+	}, page)
+	corner(card, 10)
+	uiStroke(card)
+	local header = new("TextButton", {
+		Name = "GroupHeader", Size = UDim2.new(1, 0, 0, 56),
+		BackgroundTransparency = 1, BorderSizePixel = 0, Text = "", AutoButtonColor = false,
+	}, card)
+	uiText(header, heading, 14, true, UI.text, {
+		Position = UDim2.fromOffset(12, 8), Size = UDim2.new(1, -55, 0, 20),
+	})
+	uiText(header, subtitle or "", 11, false, UI.muted, {
+		Position = UDim2.fromOffset(12, 30), Size = UDim2.new(1, -40, 0, 17),
+		TextTruncate = Enum.TextTruncate.AtEnd,
+	})
+	local caret = uiText(header, expanded and "−" or "+", 22, true, UI.accent, {
+		Position = UDim2.new(1, -36, 0, 15), Size = UDim2.fromOffset(26, 24),
+		TextXAlignment = Enum.TextXAlignment.Center,
+	})
+	local body = new("Frame", {
+		Name = "GroupContent", BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(0, 56), Size = UDim2.new(1, 0, 0, 0),
+		Visible = expanded, BorderSizePixel = 0,
+	}, card)
+	local contentLayout = list(body, 6, Enum.HorizontalAlignment.Center)
+	new("UIPadding", { PaddingTop = UDim.new(0, 3), PaddingBottom = UDim.new(0, 10),
+		PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, body)
+	local function reflow()
+		local height = expanded and (contentLayout.AbsoluteContentSize.Y + 15) or 0
+		body.Visible = expanded
+		body.Size = UDim2.new(1, 0, 0, height)
+		card.Size = UDim2.new(1, -9, 0, 56 + height)
+		caret.Text = expanded and "−" or "+"
+	end
+	track(contentLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(reflow))
+	track(header.MouseButton1Click:Connect(function()
+		expanded = not expanded
+		reflow()
+		debugEvent("UI", "subcategory", { group = heading, open = expanded })
+	end))
+	task.defer(reflow)
+	return body
+end
+
+local function createToggleRow(parent, name, order, feature, description)
+	local row = new("Frame", { Size = UDim2.new(1, -9, 0, description and 58 or 43),
 		BackgroundColor3 = UI.surface, BorderSizePixel = 0, LayoutOrder = order }, parent)
 	corner(row, 9)
 	uiStroke(row)
-	uiText(row, name, 14, false, UI.text, {
-		Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -97, 1, 0),
+	uiText(row, name, 14, description ~= nil, UI.text, {
+		Position = UDim2.fromOffset(12, description and 6 or 0),
+		Size = UDim2.new(1, -97, 0, description and 24 or 43),
 	})
+	if description then
+		uiText(row, description, 11, false, UI.muted, {
+			Position = UDim2.fromOffset(12, 30), Size = UDim2.new(1, -102, 0, 17),
+			TextTruncate = Enum.TextTruncate.AtEnd,
+		})
+	end
 	local button = new("TextButton", {
 		Size = UDim2.fromOffset(62, 28), Position = UDim2.new(1, -73, 0.5, -14),
 		BorderSizePixel = 0, TextSize = 12, Font = Enum.Font.GothamBold,
@@ -340,6 +685,7 @@ local function createToggleRow(parent, name, order, feature)
 		button.BackgroundColor3 = feature.enabled and Color3.fromRGB(45, 133, 109) or UI.soft
 	end
 	refresh()
+	table.insert(toggleRefreshers, refresh)
 	track(button.MouseButton1Click:Connect(function()
 		local enabled = not feature.enabled
 		local ok, err = pcall(function()
@@ -409,155 +755,240 @@ track(minimizeButton.MouseButton1Click:Connect(function()
 end))
 showTab(activeTab)
 
-local ESP_REFRESH = 1
-
+-- ESP subscribes to additions/removals; a slow fallback sweep repairs streaming misses.
 local function resolveWorkspacePath(path)
 	local current = workspace
 	for name in path:gmatch("[^%.]+") do current = current and current:FindFirstChild(name) end
 	return current
 end
 
--- ESP overlays
 local ESP_CONFIGS = {
-	{ Name = "Item ESP", Folders = { "Items", "Capsules", "Candies" }, Color = Color3.fromRGB(255, 220, 70), TopLevelOnly = true },
-	{ Name = "Objective ESP", Folders = { "Computers", "OilMachines" }, Color = Color3.fromRGB(90, 255, 120), TopLevelOnly = true, Extra = { "Map.SpecialFolder.BigMachine.Computer", "Map.SpecialFolder.BigMachine.Machine" } },
+	{ Name = "Item ESP", Folders = { "Items", "Capsules", "Candies", "Map.InfectedSamples" }, Color = Color3.fromRGB(255, 220, 70), TopLevelOnly = true },
+	{ Name = "Objective ESP", Folders = { "Computers", "OilMachines" }, Color = Color3.fromRGB(90, 255, 120), TopLevelOnly = true,
+		Extra = { "Map.SpecialFolder.BigMachine.Computer", "Map.SpecialFolder.BigMachine.Machine" } },
 	{ Name = "Infected ESP", Folders = { "MonsterFolder" }, Color = Color3.fromRGB(255, 60, 60) },
 }
-
 local function isTarget(config, root, inst)
 	if config.TopLevelOnly then
 		return inst.Parent == root and (inst:IsA("Model") or inst:IsA("BasePart") or inst:IsA("Folder"))
 	end
 	if not (inst:IsA("Model") or inst:IsA("BasePart")) then return false end
 	local parent = inst.Parent
-	return parent == root or (parent ~= nil and parent:IsA("Folder") and parent:IsDescendantOf(root))
+	return parent == root or (parent and parent:IsA("Folder") and parent:IsDescendantOf(root))
 end
-
 local function getAdorneePart(inst)
 	if inst:IsA("BasePart") then return inst end
 	if inst:IsA("Model") and inst.PrimaryPart then return inst.PrimaryPart end
 	return inst:FindFirstChildWhichIsA("BasePart", true)
 end
-
-local function createESPObject(config, inst)
-	local record = { conns = {} }
-	record.highlight = new("Highlight", {
-		Name = "TU_ESP_Highlight",  Adornee = inst,  DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
-		FillTransparency = 1,  OutlineTransparency = 0,  OutlineColor = config.Color,
-	}, inst)
-	local function buildLabel()
-		if record.billboard then return true end
-		local adornee = getAdorneePart(inst)
-		if not adornee then return false end
-		local height = inst:IsA("Model") and inst:GetExtentsSize().Y or adornee.Size.Y
-		record.billboard = new("BillboardGui", {
-			Adornee = adornee,  AlwaysOnTop = true,  Size = UDim2.fromOffset(180, 24),
-			StudsOffsetWorldSpace = Vector3.new(0, height / 2 + 1.5, 0),  MaxDistance = math.huge,  ResetOnSpawn = false,
-		}, screenGui)
-		local label = new("TextLabel", {
-			BackgroundTransparency = 1,  Size = UDim2.fromScale(1, 1),  Text = inst.Name,
-			TextColor3 = config.Color,  TextStrokeTransparency = 0,  TextSize = 16,
-			Font = Enum.Font.GothamBold,
-		}, record.billboard)
-		table.insert(record.conns, inst:GetPropertyChangedSignal("Name"):Connect(function()
-			label.Text = inst.Name
-		end))
-		return true
-	end
-	if not buildLabel() then
-		local conn
-		conn = inst.DescendantAdded:Connect(function()
-			if buildLabel() then conn:Disconnect() end
-		end)
-		table.insert(record.conns, conn)
-	end
-	return record
-end
-
-local function destroyESPObject(record)
-	for _, c in ipairs(record.conns) do c:Disconnect() end
-	record.highlight:Destroy()
-	if record.billboard then record.billboard:Destroy() end
-end
-
 local function newESP(config)
-	local state = { enabled = false, objects = {}, run = 0 }
+	local state = { enabled = false, objects = {}, roots = {}, run = 0 }
+	local function remove(inst)
+		local record = state.objects[inst]
+		if not record then return end
+		state.objects[inst] = nil
+		for _, conn in ipairs(record.conns) do conn:Disconnect() end
+		if record.highlight then record.highlight:Destroy() end
+		if record.billboard then record.billboard:Destroy() end
+		increment("espRemoved")
+	end
+	local function add(inst)
+		if state.objects[inst] or not inst:IsDescendantOf(workspace) then return end
+		local record = { conns = {}, name = inst.Name }
+		state.objects[inst] = record
+		local adornee = getAdorneePart(inst)
+		local highlightTarget = inst:IsA("Folder") and adornee or inst
+		if highlightTarget then
+			record.highlight = new("Highlight", { Name = "TU_ESP_Highlight", Adornee = highlightTarget,
+				DepthMode = Enum.HighlightDepthMode.AlwaysOnTop, FillTransparency = 0.93,
+				OutlineTransparency = 0, OutlineColor = config.Color }, inst)
+		end
+		local function createLabel()
+			if record.billboard or not state.enabled or not inst.Parent then return end
+			local part = getAdorneePart(inst)
+			if not part then return end
+			if not record.highlight then
+				record.highlight = new("Highlight", { Name = "TU_ESP_Highlight", Adornee = part,
+					DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+					FillTransparency = 0.93, OutlineTransparency = 0, OutlineColor = config.Color }, inst)
+			end
+			local height = part.Size.Y
+			if inst:IsA("Model") then
+				local ok, size = pcall(function() return inst:GetExtentsSize() end)
+				if ok then height = size.Y end
+			end
+			record.billboard = new("BillboardGui", { Adornee = part, AlwaysOnTop = true,
+				Size = UDim2.fromOffset(220, 29), StudsOffsetWorldSpace = Vector3.new(0, height / 2 + 1.4, 0),
+				MaxDistance = 700, ResetOnSpawn = false }, screenGui)
+			record.label = new("TextLabel", { BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1),
+				Text = inst.Name, TextColor3 = config.Color, TextStrokeTransparency = 0.12,
+				TextScaled = false, TextSize = 15, Font = Enum.Font.GothamBold }, record.billboard)
+		end
+		createLabel()
+		if not record.billboard then
+			local c
+			c = inst.DescendantAdded:Connect(function()
+				if not state.enabled then return end
+				createLabel()
+				if record.billboard and c then c:Disconnect() end
+			end)
+			table.insert(record.conns, c)
+		end
+		table.insert(record.conns, inst:GetPropertyChangedSignal("Name"):Connect(function() record.name = inst.Name end))
+		increment("espAdded")
+	end
+	local function clearRoots()
+		for root, conns in pairs(state.roots) do
+			for _, conn in ipairs(conns) do conn:Disconnect() end
+			state.roots[root] = nil
+		end
+	end
+	local function watchRoot(root)
+		if not root or state.roots[root] then return end
+		local conns = {}
+		state.roots[root] = conns
+		local function consider(obj)
+			if isTarget(config, root, obj) then add(obj) end
+		end
+		if config.TopLevelOnly then
+			for _, obj in ipairs(root:GetChildren()) do consider(obj) end
+			table.insert(conns, root.ChildAdded:Connect(consider))
+			table.insert(conns, root.ChildRemoved:Connect(remove))
+		else
+			for _, obj in ipairs(root:GetDescendants()) do consider(obj) end
+			table.insert(conns, root.DescendantAdded:Connect(consider))
+			table.insert(conns, root.DescendantRemoving:Connect(remove))
+		end
+	end
 	local function sync()
 		local wanted = {}
-		for _, name in ipairs(config.Folders) do
-			local root = resolveWorkspacePath(name)
+		for _, folderName in ipairs(config.Folders) do
+			local root = resolveWorkspacePath(folderName)
 			if root then
-				for _, d in ipairs(config.TopLevelOnly and root:GetChildren() or root:GetDescendants()) do
-					if isTarget(config, root, d) then wanted[d] = true end
+				watchRoot(root)
+				for _, obj in ipairs(config.TopLevelOnly and root:GetChildren() or root:GetDescendants()) do
+					if isTarget(config, root, obj) then wanted[obj] = true end
 				end
 			end
 		end
 		for _, path in ipairs(config.Extra or {}) do
-			local inst = resolveWorkspacePath(path)
-			if inst then wanted[inst] = true end
+			local obj = resolveWorkspacePath(path)
+			if obj then wanted[obj] = true end
 		end
-		for inst, record in pairs(state.objects) do
-			if not wanted[inst] or not record.highlight.Parent then
-				destroyESPObject(record)
-				state.objects[inst] = nil
+		for obj in pairs(state.objects) do
+			if not wanted[obj] then remove(obj) end
+		end
+		for obj in pairs(wanted) do add(obj) end
+		for root in pairs(state.roots) do
+			if not root:IsDescendantOf(workspace) then
+				for _, conn in ipairs(state.roots[root]) do conn:Disconnect() end
+				state.roots[root] = nil
 			end
 		end
-		for inst in pairs(wanted) do if not state.objects[inst] then state.objects[inst] = createESPObject(config, inst) end end
+	end
+	local function refreshLabels()
+		local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+		local playerPos = root and root.Position
+		for inst, record in pairs(state.objects) do
+			if not inst:IsDescendantOf(workspace) then
+				remove(inst)
+			else
+				if record.label then
+					local part = getAdorneePart(inst)
+					local distance = playerPos and part and math.floor((part.Position - playerPos).Magnitude + 0.5)
+					local caption = record.name
+					if distance then caption ..= "  •  " .. distance .. " studs" end
+					if config.Name == "Objective ESP" then
+						local value = inst:FindFirstChild("ComputerPercentage") or inst:FindFirstChild("OilValue")
+						if value and (value:IsA("IntValue") or value:IsA("NumberValue")) then
+							caption ..= "  [" .. math.floor(value.Value) .. "%]"
+						end
+					end
+					if caption ~= record.label.Text then record.label.Text = caption end
+					increment("espUpdates")
+				end
+			end
+		end
 	end
 	function state.enable()
 		if state.enabled then return end
 		state.enabled = true
 		state.run += 1
 		local myRun = state.run
-		supervise("esp", function()
-			return alive and state.enabled and state.run == myRun
-		end, function()
+		state.rootAdded = workspace.ChildAdded:Connect(function(child)
+			for _, folderName in ipairs(config.Folders) do
+				if child.Name == folderName then watchRoot(child) end
+			end
+		end)
+		supervise("esp " .. config.Name, function() return alive and state.enabled and state.run == myRun end, function()
 			while alive and state.enabled and state.run == myRun do
-				sync()
-				task.wait(ESP_REFRESH)
+				-- Event handlers provide immediate additions; a slow sweep handles workspace streaming.
+				if not state.lastSweep or os.clock() - state.lastSweep > 4 then
+					state.lastSweep = os.clock()
+					sync()
+				end
+				refreshLabels()
+				task.wait(0.38)
 			end
 		end)
 	end
 	function state.disable()
 		state.enabled = false
 		state.run += 1
-		for inst, record in pairs(state.objects) do
-			destroyESPObject(record)
-			state.objects[inst] = nil
-		end
+		if state.rootAdded then state.rootAdded:Disconnect(); state.rootAdded = nil end
+		clearRoots()
+		for obj in pairs(state.objects) do remove(obj) end
+		state.lastSweep = nil
 	end
 	table.insert(cleanups, state.disable)
 	return state
 end
 
+
 -- Pickup configuration and proximity prompts
 local FARM = {
-	Height = 3,  Settle = 0.12,  Dwell = 0.8,
-	Revisit = 5,  FailedRetry = 0.6,  Empty = 0.25,
-	Poll = 0.04,  IdleReturn = 2,  HeldLimit = 3,
-	SpamRate = 8,  InfectedClear = 15,
+	-- Give the character and server time to recognize a teleport before triggering pickups.
+	Height = 3, Settle = 0.1, Dwell = 1.25,
+	Revisit = 5, FailedRetry = 0.65, Empty = 0.12,
+	Poll = 0.04, IdleReturn = 0.55, HeldLimit = 3,
+	SpamRate = 16, BetweenPickups = 0.035, InfectedClear = 15,
 }
 
-local FARM_BASE = { Settle = 0.12, Dwell = 0.8, FailedRetry = 0.6, Empty = 0.25, Poll = 0.04, SpamRate = 8 }
-local FARM_FAST = { Settle = 0.03, Dwell = 0.5, FailedRetry = 0.3, Empty = 0.1, Poll = 0.02, SpamRate = 15 }
-
-for key, value in pairs(OPTIONS.FastPickups and FARM_FAST or FARM_BASE) do FARM[key] = value end
-
-local PROMPT_DELAY = 0.5
-
 local PROMPT_HOLDERS = { "Prompt", "PromptPart" }
-
+local originalPromptSight = setmetatable({}, { __mode = "k" })
+local function noPromptSight(prompt)
+	if prompt and prompt:IsA("ProximityPrompt") then
+		if originalPromptSight[prompt] == nil then
+			originalPromptSight[prompt] = prompt.RequiresLineOfSight and true or false
+		end
+		if prompt.RequiresLineOfSight then
+			local ok, err = pcall(function() prompt.RequiresLineOfSight = false end)
+			if not ok then
+				debugThrottled("sight_set_failed_" .. tostring(prompt), 10, "PROMPT", "disable_los_failed",
+					{ prompt = prompt.Name, error = tostring(err) }, "WARN")
+			end
+		end
+	end
+	return prompt
+end
 local function getPrompt(target)
 	for _, name in ipairs(PROMPT_HOLDERS) do
 		local holder = target:FindFirstChild(name)
 		if holder then
-			if holder:IsA("ProximityPrompt") then return holder end
+			if holder:IsA("ProximityPrompt") then return noPromptSight(holder) end
 			local direct = holder:FindFirstChildWhichIsA("ProximityPrompt", true)
-			if direct then return direct end
+			if direct then return noPromptSight(direct) end
 		end
 	end
-	return target:FindFirstChildWhichIsA("ProximityPrompt", true)
+	return noPromptSight(target:FindFirstChildWhichIsA("ProximityPrompt", true))
 end
+-- Apply the no-LOS setting to streamed prompts, not just prompts found by farms.
+for _, child in ipairs(workspace:GetDescendants()) do
+	if child:IsA("ProximityPrompt") then noPromptSight(child) end
+end
+track(workspace.DescendantAdded:Connect(function(child)
+	if child:IsA("ProximityPrompt") then noPromptSight(child) end
+end))
 
 local function getPromptPart(prompt, target)
 	local parent = prompt.Parent
@@ -566,16 +997,24 @@ local function getPromptPart(prompt, target)
 	return getAdorneePart(target)
 end
 
+local function getPromptPosition(prompt, fallbackPart)
+	local parent = prompt.Parent
+	if parent and parent:IsA("Attachment") then return parent.WorldPosition end
+	if parent and parent:IsA("BasePart") then return parent.Position end
+	return fallbackPart.Position
+end
+
 local hasFirePrompt = typeof(fireproximityprompt) == "function"
 
-local function triggerPrompt(prompt)
+local function triggerPrompt(prompt, forceHold)
 	increment("promptAttempts")
-	if not prompt or not prompt:IsA("ProximityPrompt") or not prompt:IsDescendantOf(workspace) then
+	noPromptSight(prompt)
+	if not prompt or not prompt:IsA("ProximityPrompt") or not prompt:IsDescendantOf(workspace) or not prompt.Enabled then
 		increment("promptFailures")
 		debugThrottled("invalid_pickup_prompt", 3, "PROMPT", "invalid_target", nil, "WARN")
 		return false
 	end
-	if hasFirePrompt then
+	if hasFirePrompt and not forceHold then
 		local ok = pcall(fireproximityprompt, prompt)
 		if ok then return true end
 	end
@@ -600,6 +1039,7 @@ local modifiedMachinePrompts = setmetatable({}, { __mode = "k" })
 
 local function triggerMachinePrompt(prompt)
 	increment("promptAttempts")
+	noPromptSight(prompt)
 	if not prompt or not prompt:IsA("ProximityPrompt") or not prompt:IsDescendantOf(workspace) or not prompt.Enabled then
 		increment("promptFailures")
 		debugThrottled("machine_prompt_invalid", 3, "PROMPT", "machine_prompt_unavailable", nil, "WARN")
@@ -653,7 +1093,7 @@ local function restoreMachinePrompts()
 		if prompt.Parent then
 			pcall(function()
 				prompt.HoldDuration = old.hold
-				prompt.RequiresLineOfSight = old.sight
+				prompt.RequiresLineOfSight = false
 			end)
 		end
 		modifiedMachinePrompts[prompt] = nil
@@ -677,50 +1117,129 @@ end
 
 local heldCount
 
-local function spamPrompt(prompt, target, keepGoing, confirmPickup)
-	local home = target.Parent
-	local startingHeld = heldCount()
-	local deadline = os.clock() + FARM.Dwell
-	local confirmed = false
-	while keepGoing() and os.clock() < deadline and target.Parent == home and prompt:IsDescendantOf(target) do
-		if not prompt.Enabled then
-			confirmed = true
-			break
-		end
-		if confirmPickup and heldCount() > startingHeld then
-			confirmed = true
-			break
-		end
-		local started = os.clock()
-		-- Only activate the intended target, not unrelated prompts nearby.
-		triggerPrompt(prompt)
-		task.wait(FARM.Poll)
-		if target.Parent ~= home or not prompt:IsDescendantOf(target) or not prompt.Enabled then
-			confirmed = true
-			break
-		end
-		if confirmPickup and heldCount() > startingHeld then
-			confirmed = true
-			break
-		end
-		local rest = 1 / FARM.SpamRate - (os.clock() - started)
-		if rest > 0 then task.wait(rest) end
+-- Count and confirm pickup effects before proceeding, instead of assuming a fired
+-- prompt means the server collected the object. Retry with a real input hold if
+-- executor fast-fire does not produce a pickup.
+local function pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
+	if target.Parent ~= initialParent or not prompt:IsDescendantOf(target) then
+		return true, "target_removed"
 	end
-	if target.Parent ~= home or not prompt:IsDescendantOf(target) or not prompt.Enabled then confirmed = true end
-	return confirmed
+	if confirmPickup and heldCount() > initialHeld then
+		return true, "inventory_increased"
+	end
+	-- For inventory items, an inactive prompt alone is not proof of pickup.
+	-- Capsules/candies can still use the prompt becoming disabled as evidence.
+	if not prompt.Enabled and not confirmPickup then return true, "prompt_disabled" end
+	return false
 end
 
-local function getTargets(folder)
-	local targets = {}
-	for _, child in ipairs(folder:GetChildren()) do
-		if child:IsA("Folder") then
-			for _, inner in ipairs(child:GetChildren()) do table.insert(targets, inner) end
-		else
-			table.insert(targets, child)
+local function spamPrompt(prompt, target, keepGoing, confirmPickup, initialHeld, initialParent)
+	local deadline = os.clock() + FARM.Dwell
+	local attempts = 0
+	local holding, fallbackStarted, spamActive = false, false, true
+	local beganAt = os.clock()
+	local function finish(success, reason, count)
+		spamActive = false
+		return success, reason, count
+	end
+	local function beginFallbackHold()
+		if holding or fallbackStarted or not hasFirePrompt or not prompt.Enabled then return end
+		holding, fallbackStarted = true, true
+		task.spawn(function()
+			local began = pcall(function() prompt:InputHoldBegin() end)
+			if began then
+				local untilTime = os.clock() + math.max(0, prompt.HoldDuration) + 0.03
+				while os.clock() < untilTime and spamActive and keepGoing() do task.wait(0.04) end
+				pcall(function() prompt:InputHoldEnd() end)
+			end
+			holding = false
+		end)
+	end
+	local function interruption()
+		if confirmPickup and not prompt.Enabled then
+			task.wait(0.14) -- brief replication grace period; do not linger near an enemy
+			local collected, reason = pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
+			if collected then return finish(true, reason, attempts) end
+			return finish(false, "prompt_disabled_without_inventory", attempts)
+		end
+		return finish(false, "interrupted", attempts)
+	end
+
+	while os.clock() < deadline do
+		local confirmed, reason = pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
+		if confirmed then return finish(true, reason, attempts) end
+		if not keepGoing() then return interruption() end
+
+		attempts += 1
+		if hasFirePrompt and attempts >= 8 and not holding and os.clock() - beganAt >= 0.5 then
+			beginFallbackHold()
+		end
+		local started = os.clock()
+		-- Keep the requested 16/s fast-fire loop; never block it on a long hold.
+		local fired = triggerPrompt(prompt, false)
+		if not fired then
+			debugThrottled("pickup_activation_" .. tostring(target), 2, "PICKUP",
+				"activation_failed", { target = target.Name, attempt = attempts }, "WARN")
+		end
+		-- Allow one prompt attempt time to replicate before retrying.
+		local nextAttempt = math.min(deadline, started + 1 / FARM.SpamRate)
+		while os.clock() < nextAttempt do
+			local done, why = pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
+			if done then return finish(true, why, attempts) end
+			if not keepGoing() then return interruption() end
+			task.wait(math.min(FARM.Poll, math.max(0.01, nextAttempt - os.clock())))
 		end
 	end
-	return targets
+	local collected, reason = pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
+	if collected then return finish(true, reason, attempts) end
+	return finish(false, "confirmation_timeout", attempts)
 end
+
+-- Cached shallow traversal. Watch only root children and one-level nested children,
+-- not changes to prompts deep inside each target.
+local targetCaches = setmetatable({}, { __mode = "k" })
+local function getTargets(folder)
+	local cache = targetCaches[folder]
+	if not cache then
+		cache = { dirty = true, conns = {}, last = 0, values = {} }
+		targetCaches[folder] = cache
+		local function invalidate(obj)
+			local parent = obj.Parent
+			if parent == folder or (parent and parent.Parent == folder) then cache.dirty = true end
+		end
+		for _, signal in ipairs({ folder.DescendantAdded, folder.DescendantRemoving }) do
+			table.insert(cache.conns, signal:Connect(invalidate))
+		end
+		table.insert(cache.conns, folder.AncestryChanged:Connect(function(_, parent)
+			if parent then return end
+			for _, conn in ipairs(cache.conns) do conn:Disconnect() end
+			targetCaches[folder] = nil
+		end))
+	end
+	if cache.dirty or os.clock() - cache.last >= 1.2 then
+		local values = {}
+		for _, child in ipairs(folder:GetChildren()) do
+			if child:IsA("Folder") then
+				for _, inner in ipairs(child:GetChildren()) do table.insert(values, inner) end
+			else
+				table.insert(values, child)
+			end
+		end
+		cache.values, cache.dirty, cache.last = values, false, os.clock()
+		increment("targetCacheRefreshes")
+	else
+		increment("targetCacheHits")
+	end
+	return cache.values
+end
+-- Disconnect every event listener on unload or a removed root; avoid cache leaks.
+table.insert(cleanups, function()
+	for folder, cache in pairs(targetCaches) do
+		for _, conn in ipairs(cache.conns) do conn:Disconnect() end
+		targetCaches[folder] = nil
+	end
+end)
+
 
 heldCount = function()
 	local folder = player:FindFirstChild("ItemsFolder")
@@ -790,11 +1309,11 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 			local folders = {}
 			if type(folderName) == "table" then
 				for _, name in ipairs(folderName) do
-					local folder = workspace:FindFirstChild(name)
+					local folder = resolveWorkspacePath(name)
 					if folder then table.insert(folders, folder) end
 				end
 			else
-				local folder = workspace:FindFirstChild(folderName)
+				local folder = resolveWorkspacePath(folderName)
 				if folder then table.insert(folders, folder) end
 			end
 			local didWork = false
@@ -824,40 +1343,87 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 							debugEvent("PICKUP", "attempt", { folder = folder.Name, name = target.Name,
 								held = heldCount(), prompt = prompt.Name, distance = string.format("%.1f", (root.Position - part.Position).Magnitude) })
 							-- Always release the claim, even if a Roblox instance is removed mid-pickup.
-							local ok, confirmed = pcall(function()
-								if not allowed() then return false end
-								local function stillPicking()
+							local initialHeld, initialParent = heldCount(), target.Parent
+							local ok, confirmed, reason, attempts = pcall(function()
+								if not allowed() then return false, "not_allowed", 0 end
+								local function stillPicking(traveling)
 									return allowed() and pickupCoordinator.owner == farm
 										and part:IsDescendantOf(workspace) and prompt.Enabled
+										and (traveling or not infectedNear(root.Position, FARM.InfectedClear))
 								end
-								if not teleportCharacter(CFrame.new(part.Position + Vector3.new(0, FARM.Height, 0)),
-									function() return stillPicking() and not infectedNear(part.Position, FARM.InfectedClear) end, "pickup") then
-									return false
+								local promptPosition = getPromptPosition(prompt, part)
+								local approachHeight = math.clamp(prompt.MaxActivationDistance - 1, 0.25, FARM.Height)
+								local destination = CFrame.new(promptPosition + Vector3.new(0, approachHeight, 0))
+								local arrived, travelReason = tweenPickup(destination, function()
+									return stillPicking(true) and not infectedNear(promptPosition, FARM.InfectedClear)
+								end, target)
+								if not arrived then
+									if isBlocked and isBlocked() then return false, "preempted_by_machine", 0 end
+									return false, "tween_" .. tostring(travelReason), 0
 								end
+								-- A short settle lets prompts replicate without leaving us exposed unnecessarily.
 								task.wait(FARM.Settle)
-								if OPTIONS.PromptDelay then task.wait(PROMPT_DELAY) end
-								if not stillPicking() then return false end
-								return spamPrompt(prompt, target, stillPicking, confirmPickup)
+								if isBlocked and isBlocked() then return false, "preempted_by_machine", 0 end
+								if infectedNear(root.Position, FARM.InfectedClear) then
+									return false, "enemy_after_arrival", 0
+								end
+								local actualRange = (root.Position - promptPosition).Magnitude
+								if actualRange > prompt.MaxActivationDistance then
+									debugEvent("PICKUP", "outside_prompt_range", {
+										name = target.Name, distance = string.format("%.2f", actualRange),
+										maximum = prompt.MaxActivationDistance }, "WARN")
+									return false, "outside_prompt_range", 0
+								end
+								local observed, why = pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
+								if observed then return true, why, 0 end
+								if not stillPicking() then
+									return false, (isBlocked and isBlocked()) and "preempted_by_machine" or "interrupted_after_arrival", 0
+								end
+								local success, why, fired = spamPrompt(prompt, target, stillPicking, confirmPickup, initialHeld, initialParent)
+								if not success and isBlocked and isBlocked() then return false, "preempted_by_machine", fired end
+								return success, why, fired
 							end)
+							-- Leave threatened pickup spots immediately, if the saved home is safe.
+							if active() and not (isBlocked and isBlocked()) and root.Parent
+								and infectedNear(root.Position, FARM.InfectedClear) then
+								local home = pickupCoordinator.home
+								if home and not infectedNear(home.Position, PICKUP_TRAVEL.SafetyRadius) then
+									debugEvent("DANGER", "pickup_escape", { pickup = target.Name, position = tostring(root.Position) }, "WARN")
+									teleportCharacter(home, function() return active() end, "pickup_escape", "emergency")
+								end
+							end
+							-- Release the claim first, then a tiny cooldown; no 250ms stationary wait.
 							releasePickup(farm)
+							if active() then task.wait(FARM.BetweenPickups) end
 							if not ok then
 								debugLog("ERROR pickup " .. tostring(target.Name) .. ": " .. tostring(confirmed))
 								warn("[TU - Rava Hub] pickup error: " .. tostring(confirmed))
-								confirmed = false
-							else
-								debugLog(string.format("pickup %s dist=%.1f max=%.1f hold=%.2f confirmed=%s", target.Name,
-									(root.Position - part.Position).Magnitude, prompt.MaxActivationDistance, prompt.HoldDuration, tostring(confirmed)))
+								confirmed, reason, attempts = false, "lua_error", 0
+							end
+							if reason == "preempted_by_machine" then
+								increment("pickupPreemptions")
+								debugEvent("PICKUP", "preempted_by_machine", {
+									folder = folder.Name, name = target.Name,
+									elapsedMs = math.floor((os.clock() - beganAt) * 1000 + 0.5),
+								}, "INFO")
 							end
 							if confirmed then
 								increment("pickupConfirmed")
 								recent[target] = os.clock()
+							elseif reason == "preempted_by_machine" then
+								-- Scheduling preemption is not a failed interaction. Retry after
+								-- the machine releases control, without distorting failure metrics.
+								recent[target] = os.clock() - FARM.Revisit + 0.15
 							else
 								increment("pickupUnconfirmed")
 								recent[target] = os.clock() - FARM.Revisit + FARM.FailedRetry
 							end
 							debugEvent("PICKUP", "result", { folder = folder.Name, name = target.Name,
-								confirmed = confirmed, duration = string.format("%.2f", os.clock() - beganAt), held = heldCount() },
-								confirmed and "INFO" or "WARN")
+								movement = "tween", confirmed = confirmed, reason = reason or "unknown", activations = attempts or 0,
+								maxDistance = prompt.MaxActivationDistance, holdDuration = prompt.HoldDuration,
+								requiresSight = prompt.RequiresLineOfSight,
+								duration = string.format("%.2f", os.clock() - beganAt), held = heldCount() },
+								(confirmed or reason == "preempted_by_machine") and "INFO" or "WARN")
 						end
 					end
 					if not allowed() then break end
@@ -866,7 +1432,9 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 			farm.hasWork = didWork
 			farm.working = false
 			if not didWork then
-				returnPickupHome(false, isBlocked)
+				local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+				local unsafeHere = root and infectedNear(root.Position, FARM.InfectedClear)
+				returnPickupHome(unsafeHere == true, isBlocked)
 				task.wait(FARM.Empty)
 			end
 		end
@@ -905,19 +1473,34 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 	return farm
 end
 
+do
 local espBody = createSection("ESP", 1)
-for i, config in ipairs(ESP_CONFIGS) do createToggleRow(espBody, config.Name, i, newESP(config)) end
+local espWorld = createSubcategory(espBody, "COLLECTIBLES & OBJECTIVES", 1,
+	"Items, samples, capsules, candies and active machines")
+local espThreats = createSubcategory(espBody, "INFECTED TRACKING", 2,
+	"Threat outlines and names", true)
+for i, config in ipairs(ESP_CONFIGS) do
+	local parent = (config.Name == "Infected ESP") and espThreats or espWorld
+	createToggleRow(parent, config.Name, i, newESP(config))
+end
 
--- Inventory and automatic item usage
+end
+
 local TRASH_ITEMS = { Coffee = true, Socks = true, Waffle = true, ["Pristine Boots"] = true }
 local HEALTH_ITEMS = { Bandaid = true, Medkit = true, ["Pristine Medkit"] = true }
-local ITEM_OPTIONS = { Trash = false, Health = false }
+local ITEM_OPTIONS = { Trash = false, Health = false, AutoTrashUse = true }
 
 local function getHealth()
 	local aliveFolder = workspace:FindFirstChild("Alive")
 	local character = aliveFolder and aliveFolder:FindFirstChild(player.Name)
 	local health = character and character:GetAttribute("Health")
-	return type(health) == "number" and health or nil
+	if type(health) == "number" then return health end
+	-- Use normalized Humanoid HP if Alive.Health is temporarily unavailable.
+	local humanoid = player.Character and player.Character:FindFirstChildWhichIsA("Humanoid")
+	if humanoid and humanoid.MaxHealth > 0 then
+		return 3 * humanoid.Health / humanoid.MaxHealth
+	end
+	return nil
 end
 
 local function itemAllowed(item)
@@ -939,60 +1522,332 @@ local USE_ITEMS = {
 local AUTO_USE = { Tick = 0.25, HealCooldown = 3, UseDelay = 0.2 }
 local SLOT_KEYS = { Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three }
 
+-- Item use notes: this build records whether a hotkey was sent and whether
+-- inventory/health changed. A successful input API call is NOT proof the game
+-- accepted the use. We will refine actual item and cooldown rules from logs.
 local function readItemIndex(item)
 	local index = item:GetAttribute("Index")
+	local source = "attribute:Index"
 	if index == nil then
-		local indexValue = item:FindFirstChild("Index")
-		if indexValue and indexValue:IsA("ValueBase") then index = indexValue.Value end
+		local value = item:FindFirstChild("Index")
+		if value and value:IsA("ValueBase") then index, source = value.Value, "child:Index" end
+	end
+	if index == nil then
+		local other = item:GetAttribute("Slot")
+		if other ~= nil then index, source = other, "attribute:Slot" end
 	end
 	if type(index) == "string" then index = tonumber(index) end
-	if type(index) == "number" and index % 1 == 0 and SLOT_KEYS[index] then return index end
-	return nil
+	if type(index) == "number" and index % 1 == 0 and SLOT_KEYS[index] then
+		return index, source
+	end
+	return nil, source
+end
+
+local function inventorySummary()
+	local folder = player:FindFirstChild("ItemsFolder")
+	if not folder then return "ItemsFolder_missing" end
+	local out = {}
+	for _, item in ipairs(folder:GetChildren()) do
+		local slot = readItemIndex(item)
+		table.insert(out, item.Name .. ":" .. tostring(slot or item:GetAttribute("Index") or "?"))
+	end
+	return table.concat(out, ",")
 end
 
 local function findSlot(names)
 	local folder = player:FindFirstChild("ItemsFolder")
-	if not folder then return nil end
+	if not folder then
+		debugThrottled("inventory_missing", 5, "ITEM", "inventory_missing", nil, "WARN")
+		return nil
+	end
 	for _, item in ipairs(folder:GetChildren()) do
 		if names[item.Name] then
-			local index = readItemIndex(item)
-			if index then return index end
+			local slot, source = readItemIndex(item)
+			if slot then return slot, item, source end
+			debugThrottled("invalid_slot_" .. item.Name, 5, "ITEM", "slot_unrecognized", {
+				item = item.Name, index = tostring(item:GetAttribute("Index")),
+				indexSource = source, inventory = inventorySummary(),
+			}, "WARN")
 		end
 	end
 	return nil
 end
 
-local function pressSlot(slot, purpose)
+local slotInputBusy = false
+local function pressSlot(slot, purpose, item, indexSource)
+	purpose = purpose or "unknown"
+	if not SLOT_KEYS[slot] then
+		increment("itemUseFailures")
+		debugEvent("ITEM", "invalid_slot", { slot = tostring(slot), purpose = purpose }, "WARN")
+		return false
+	end
+	if UserInputService:GetFocusedTextBox() then
+		debugThrottled("item_input_focused", 3, "ITEM", "input_deferred_focused_textbox", {
+			purpose = purpose, slot = slot,
+		}, "WARN")
+		return false
+	end
+	local timeout = os.clock() + 0.35
+	while slotInputBusy and os.clock() < timeout do task.wait(0.02) end
+	if slotInputBusy then
+		debugThrottled("item_input_busy", 2, "ITEM", "input_busy", { purpose = purpose }, "WARN")
+		return false
+	end
+	slotInputBusy = true
 	increment("itemUseAttempts")
-	local ok = pcall(function()
-		local vim = game:GetService("VirtualInputManager")
-		vim:SendKeyEvent(true, SLOT_KEYS[slot], false, game)
-		task.wait(0.05)
-		vim:SendKeyEvent(false, SLOT_KEYS[slot], false, game)
-	end)
-	if not ok and typeof(keypress) == "function" and typeof(keyrelease) == "function" then
-		ok = pcall(function()
+	local initialHealth = getHealth()
+	local folder = player:FindFirstChild("ItemsFolder")
+	local initialCount = folder and #folder:GetChildren() or -1
+	local driver, succeeded, err = "none", false, "unavailable"
+	-- Prefer executor key events for games that ignore VirtualInputManager.
+	if typeof(keypress) == "function" and typeof(keyrelease) == "function" then
+		driver = "executor_keypress"
+		succeeded, err = pcall(function()
 			keypress(0x30 + slot)
-			task.wait(0.05)
+			task.wait(0.08)
 			keyrelease(0x30 + slot)
 		end)
+		if not succeeded then pcall(keyrelease, 0x30 + slot) end
 	end
-	if not ok then increment("itemUseFailures") end
-	debugEvent("ITEM", "slot_input", { slot = slot, purpose = purpose or "unknown", dispatched = ok },
-		ok and "INFO" or "WARN")
-	return ok
+	if not succeeded then
+		driver = "VirtualInputManager"
+		succeeded, err = pcall(function()
+			local vim = game:GetService("VirtualInputManager")
+			vim:SendKeyEvent(true, SLOT_KEYS[slot], false, game)
+			task.wait(0.09)
+			vim:SendKeyEvent(false, SLOT_KEYS[slot], false, game)
+		end)
+		if not succeeded then
+			pcall(function()
+				game:GetService("VirtualInputManager"):SendKeyEvent(false, SLOT_KEYS[slot], false, game)
+			end)
+		end
+	end
+	slotInputBusy = false
+	if not succeeded then increment("itemUseFailures") end
+	debugEvent("ITEM", "hotkey_sent", {
+		purpose = purpose, item = item and item.Name or "unknown", slot = slot,
+		indexSource = indexSource or "unknown", method = driver, acceptedByInputAPI = succeeded,
+		error = succeeded and "none" or tostring(err),
+	}, succeeded and "INFO" or "ERROR")
+	if succeeded then
+		task.delay(0.6, function()
+			if not alive then return end
+			local current = player:FindFirstChild("ItemsFolder")
+			local newCount = current and #current:GetChildren() or -1
+			local itemRemoved = item ~= nil and (current == nil or not item:IsDescendantOf(current))
+			local healthNow = getHealth()
+			local healed = purpose == "heal" and initialHealth ~= nil
+				and healthNow ~= nil and healthNow > initialHealth
+			local countChanged = initialCount >= 0 and newCount >= 0 and newCount < initialCount
+			local observed = itemRemoved or healed or countChanged
+			increment(observed and "itemUseObserved" or "itemUseUnverified")
+			debugEvent("ITEM", observed and "effect_observed" or "effect_unverified", {
+				purpose = purpose, item = item and item.Name or "unknown",
+				method = driver, slot = slot, countBefore = initialCount, countAfter = newCount,
+				itemRemoved = itemRemoved, healed = healed, -- Reusable items may not produce observable changes.
+			}, observed and "INFO" or "WARN")
+		end)
+	end
+	return succeeded
 end
 
 local function useForMachine(machine)
 	local names = (machine:FindFirstChild("OilValue") and USE_ITEMS.Oil)
 		or (machine:FindFirstChild("ComputerPercentage") and USE_ITEMS.Computer)
-	local slot = names and findSlot(names)
-	if slot then
-		pressSlot(slot, "machine:" .. machine.Name)
-	else
-		debugThrottled("tool_missing_" .. machine.Name, 5, "ITEM", "tool_missing", { machine = machine.Name }, "WARN")
-	end
+	if not names then return false end
+	local slot, item, source = findSlot(names)
+	if slot then return pressSlot(slot, "machine:" .. machine.Name, item, source) end
+	debugThrottled("tool_missing_" .. machine.Name, 5, "ITEM", "tool_missing", {
+		machine = machine.Name, inventory = inventorySummary(),
+	}, "WARN")
+	return false
 end
+
+-- The HUD CoolDown.Time label is the source of truth for ability readiness.
+-- Do not guess an 8-second cooldown or spam a remote while its state is unknown.
+local ABILITY = { Poll = 0.12, ErrorRetry = 2, RejectedRetry = 1.2, ExitWait = 0.45, ExitSettle = 0.10 }
+local function readAbilityCooldown()
+	local hud = playerGui:FindFirstChild("HUD")
+	local items = hud and hud:FindFirstChild("ItemsHolder")
+	local main = items and items:FindFirstChild("MainFrame")
+	local ability = main and main:FindFirstChild("Ability")
+	local button = ability and ability:FindFirstChild("Button")
+	local cooldown = button and button:FindFirstChild("CoolDown")
+	local time = cooldown and cooldown:FindFirstChild("Time")
+	if not time then return nil, "HUD_missing", "", nil end
+	local text = (time:IsA("TextLabel") or time:IsA("TextButton") or time:IsA("TextBox"))
+		and time.Text or (time:IsA("StringValue") and time.Value or "")
+	text = tostring(text or "")
+	-- Some HUDs hide CoolDown entirely when the ability becomes available.
+	if cooldown:IsA("GuiObject") and not cooldown.Visible then
+		return true, "HUD_CoolDown_hidden", text, 0
+	end
+	local trimmed = text:match("^%s*(.-)%s*$") or ""
+	local lower = trimmed:lower()
+	if lower == "ready" or lower == "available" or lower == "use" then
+		return true, "HUD_ready_label", text, 0
+	end
+	-- Accept a standalone number (e.g. 6, 2.5, 0, 0.0, 2s).
+	local numeric = lower:match("^(%d+%.?%d*)%s*s?$")
+	local seconds = numeric and tonumber(numeric) or nil
+	if seconds == nil and lower:match("^%d+:%d%d:?%d?%d?$") then
+		seconds = 0
+		for part in lower:gmatch("%d+") do seconds = seconds * 60 + tonumber(part) end
+	end
+	if seconds ~= nil then return seconds <= 0, "HUD_CoolDown_Time", text, seconds end
+	return nil, "HUD_unrecognized_text", text, nil
+end
+
+-- These are assigned when the machine subsystem is created farther down.
+local machineFarm
+local machinesDone
+local leaveObjective
+local machineExitBlockedUntil = 0
+local abilityBusy = false
+local function abilityCanInterrupt()
+	if skillcheckProtected then
+		local protected, ui = skillcheckProtected()
+		if protected then return false, "skillcheck_" .. tostring(ui) end
+	end
+	if machineFarm and machineFarm.moving then return false, "machine_moving" end
+	if os.clock() < machineExitBlockedUntil then return false, "machine_exit_settling" end
+	return true, "available"
+end
+
+local autoAbility = { enabled = false, run = 0 }
+function autoAbility.enable()
+	if autoAbility.enabled then return end
+	autoAbility.enabled = true
+	autoAbility.run += 1
+	local token = autoAbility.run
+	debugEvent("ABILITY", "enabled", { cooldownSource = "PlayerGui.HUD.ItemsHolder.MainFrame.Ability.Button.CoolDown.Time" })
+	supervise("auto ability", function()
+		return alive and autoAbility.enabled and autoAbility.run == token
+	end, function()
+		local nextAttempt = 0
+		local waitForCooldown, cooldownObserved = false, false
+		local lastState = ""
+		while alive and autoAbility.enabled and autoAbility.run == token do
+			local ready, source, label, seconds = readAbilityCooldown()
+			local signature = source .. ":" .. tostring(ready)
+			if signature ~= lastState then
+				increment("abilityCooldownTransitions")
+				debugEvent("ABILITY", "cooldown_state", {
+					source = source, ready = tostring(ready), text = label,
+					seconds = tostring(seconds), waitingForCooldown = waitForCooldown,
+				})
+				lastState = signature
+			end
+			if ready == nil then
+				debugThrottled("ability_cooldown_unknown", 8, "ABILITY", "cooldown_unreadable", {
+					source = source, label = label,
+				}, "WARN")
+			elseif not ready then
+				if waitForCooldown then cooldownObserved = true end
+			elseif waitForCooldown and cooldownObserved then
+				waitForCooldown, cooldownObserved = false, false
+				increment("abilityCooldownRearms")
+				debugEvent("ABILITY", "cooldown_completed", { source = source })
+			end
+
+			local health = getHealth()
+			local humanoid = player.Character and player.Character:FindFirstChildWhichIsA("Humanoid")
+			local living = player.Character ~= nil and (health == nil or health > 0)
+				and (humanoid == nil or humanoid.Health > 0)
+			local mayInterrupt, blockReason = abilityCanInterrupt()
+			if ready and living and not waitForCooldown and os.clock() >= nextAttempt then
+				if not mayInterrupt then
+					debugThrottled("ability_wait_skillcheck", 3, "ABILITY", "waiting_to_interrupt", {
+						reason = blockReason, target = machineFarm and machineFarm.target and machineFarm.target.Name or "none",
+					}, "INFO")
+				else
+					abilityBusy = true  -- Pause machine farm before we send its leave remote.
+					local ok, err = pcall(function()
+						if machineFarm and machineFarm.enabled and machineFarm.placed then
+							increment("abilityMachineInterrupts")
+							debugEvent("ABILITY", "machine_interrupt_begin", {
+								target = machineFarm.target and machineFarm.target.Name or "none",
+							})
+							local left = leaveObjective and leaveObjective("ability_ready", false, ABILITY.ExitWait)
+							if not left then
+								nextAttempt = os.clock() + 0.7
+								debugEvent("ABILITY", "machine_exit_pending_or_failed", {
+									target = machineFarm.target and machineFarm.target.Name or "none",
+								}, "WARN")
+								return
+							end
+							local machinePrompt = machineFarm.target and getPrompt(machineFarm.target)
+							if machinePrompt then cancelMachinePromptHold(machinePrompt) end
+							machineFarm.placed = false
+							task.wait(ABILITY.ExitSettle)
+						end
+						if skillcheckProtected and skillcheckProtected() then
+							nextAttempt = os.clock() + 0.5
+							debugEvent("ABILITY", "cancelled_new_skillcheck", nil, "INFO")
+							return
+						end
+						if not alive or not autoAbility.enabled or autoAbility.run ~= token then return end
+						local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+						local remote = remotes and remotes:FindFirstChild("Ability")
+						if not remote or not remote:IsA("RemoteFunction") then
+							nextAttempt = os.clock() + ABILITY.ErrorRetry
+							debugThrottled("ability_missing", 8, "ABILITY", "remote_unavailable", nil, "WARN")
+							return
+						end
+						increment("abilityAttempts")
+						local started = os.clock()
+						local dispatched, response = pcall(function() return remote:InvokeServer(nil) end)
+						local latency = math.floor((os.clock() - started) * 1000 + 0.5)
+						if not dispatched then
+							increment("abilityRemoteFailures")
+							nextAttempt = os.clock() + ABILITY.ErrorRetry
+							debugEvent("ABILITY", "invoke_failed", { error = tostring(response), latencyMs = latency }, "ERROR")
+						elseif response == false then
+							increment("abilityRejected")
+							nextAttempt = os.clock() + ABILITY.RejectedRetry
+							debugEvent("ABILITY", "remote_rejected", { latencyMs = latency, label = label }, "WARN")
+						else
+							increment("abilityDispatched")
+							waitForCooldown, cooldownObserved = true, false
+							debugEvent("ABILITY", "used_waiting_for_cooldown", {
+								latencyMs = latency, label = label, source = source,
+								response = response == nil and "nil_unverified" or tostring(response),
+							})
+							if ITEM_OPTIONS.AutoTrashUse then
+								local waffleSlot, item, indexSource = findSlot({ Waffle = true })
+								if waffleSlot then
+									local waffleUsed = pressSlot(waffleSlot, "ability_waffle", item, indexSource)
+									increment(waffleUsed and "abilityWaffles" or "abilityWaffleFailures")
+									debugEvent("ABILITY", "waffle_after_ability", { slot = waffleSlot, dispatched = waffleUsed })
+								else
+									debugThrottled("ability_no_waffle", 6, "ITEM", "waffle_not_found", {
+										inventory = inventorySummary(),
+									}, "INFO")
+								end
+							end
+						end
+					end)
+					abilityBusy = false
+					if not ok then
+						increment("workerErrors")
+						nextAttempt = os.clock() + ABILITY.ErrorRetry
+						debugEvent("ABILITY", "worker_error", { error = tostring(err) }, "ERROR")
+					end
+				end
+			end
+			task.wait(ABILITY.Poll)
+		end
+	end)
+end
+function autoAbility.disable()
+	if not autoAbility.enabled then return end
+	autoAbility.enabled = false
+	autoAbility.run += 1
+	abilityBusy = false
+	debugEvent("ABILITY", "disabled")
+end
+table.insert(cleanups, autoAbility.disable)
 
 local autoUse = { enabled = false }
 local autoUseRun = 0
@@ -1008,11 +1863,11 @@ function autoUse.enable()
 		local lastHeal = 0
 		while alive and autoUse.enabled and autoUseRun == myRun do
 			local health = getHealth()
-			if health and health < 3 and os.clock() - lastHeal >= AUTO_USE.HealCooldown then
-				local slot = findSlot(HEALTH_ITEMS)
-				if slot then
+			if health and health < 3 and os.clock() - lastHeal >= AUTO_USE.HealCooldown
+				and not (skillcheckProtected and skillcheckProtected()) then
+				local slot, item, source = findSlot(HEALTH_ITEMS)
+				if slot and pressSlot(slot, "heal", item, source) then
 					lastHeal = os.clock()
-					pressSlot(slot, "heal")
 				end
 			end
 			task.wait(AUTO_USE.Tick)
@@ -1039,7 +1894,7 @@ end
 local function pickupsRemaining()
 	for _, entry in ipairs(PICKUPS) do
 		if entry.farm.enabled and (not entry.held or heldCount() < FARM.HeldLimit) then
-			local folder = workspace:FindFirstChild(entry.folder)
+			local folder = resolveWorkspacePath(entry.folder)
 			if folder then
 				for _, target in ipairs(getTargets(folder)) do
 					local prompt = getPrompt(target)
@@ -1051,16 +1906,18 @@ local function pickupsRemaining()
 	return false
 end
 
-local machineFarm
-local machinesDone
-
 local function collectOpen() return not OPTIONS.CollectLast or (machinesDone ~= nil and machinesDone()) end
 
 local function machineBusy()
-	return machineFarm ~= nil and (machineFarm.placed == true or machineFarm.moving == true)
+	-- The previous check only covered placed/moving. During a target change the
+	-- machine was temporarily neither, letting pickups steal the character.
+	-- Claim priority as soon as an objective is selected, including handoffs.
+	return machineFarm ~= nil and machineFarm.enabled == true and
+		(machineFarm.target ~= nil or machineFarm.placed == true or machineFarm.moving == true)
 end
 
-local capsuleFarm = newAutofarm("Capsules", collectOpen, nil, false, machineBusy)
+-- One Capsule Autofarm toggle handles both capsule sources.
+local capsuleFarm = newAutofarm({ "Capsules", "Map.InfectedSamples" }, collectOpen, nil, false, machineBusy)
 
 local itemFarm = newAutofarm("Items", function()
 	return heldCount() < FARM.HeldLimit and not capsuleFarm.working and collectOpen()
@@ -1072,6 +1929,7 @@ end, nil, false, machineBusy)
 
 PICKUPS = {
 	{ farm = capsuleFarm, folder = "Capsules" },
+	{ farm = capsuleFarm, folder = "Map.InfectedSamples" },
 	{ farm = itemFarm, folder = "Items", held = true, filter = itemAllowed },
 	{ farm = candyFarm, folder = "Candies" },
 }
@@ -1091,25 +1949,44 @@ local function newOption(options, key, onChange)
 	return option
 end
 
+do
 local farmBody = createSection("Autofarm", 2)
-createToggleRow(farmBody, "Capsule Autofarm", 1, capsuleFarm)
-createToggleRow(farmBody, "Item Autofarm", 2, itemFarm)
-createToggleRow(farmBody, "Candy Autofarm", 3, candyFarm)
-createToggleRow(farmBody, "Pick Up Trash Items", 4, newOption(ITEM_OPTIONS, "Trash"))
-createToggleRow(farmBody, "Pick Up Health Items", 5, newOption(ITEM_OPTIONS, "Health"))
-createToggleRow(farmBody, "Auto Use Items", 6, autoUse)
-createToggleRow(farmBody, "Fast Pickups", 7, newOption(OPTIONS, "FastPickups", function(on)
-	for key, value in pairs(on and FARM_FAST or FARM_BASE) do FARM[key] = value end
-end))
-createToggleRow(farmBody, "Collect After Machines", 8, newOption(OPTIONS, "CollectLast"))
+local farmActions = createSubcategory(farmBody, "AUTOMATIC ACTIONS", 1,
+	"NEW: HUD cooldown ability, tool and Waffle use", true)
+createToggleRow(farmActions, "Auto Use Ability", 1, autoAbility,
+	"HUD cooldown → leave machine → activate → resume")
+createToggleRow(farmActions, "Auto Use Items", 2, autoUse,
+	"Heal when injured and use matching machine tools")
+createToggleRow(farmActions, "Auto Use Trash Items (Waffle)", 3,
+	newOption(ITEM_OPTIONS, "AutoTrashUse"), "Uses Waffle after ability activation")
+
+local farmPickups = createSubcategory(farmBody, "PICKUP ROUTES", 2,
+	"Safe tween pickup movement; machines teleport", true)
+createToggleRow(farmPickups, "Capsule Autofarm", 1, capsuleFarm,
+	"Includes workspace.Map.InfectedSamples")
+createToggleRow(farmPickups, "Item Autofarm", 2, itemFarm)
+createToggleRow(farmPickups, "Candy Autofarm", 3, candyFarm)
+
+local farmFilters = createSubcategory(farmBody, "COLLECTION FILTERS", 3,
+	"What to collect and when", true)
+createToggleRow(farmFilters, "Pick Up Trash Items", 1, newOption(ITEM_OPTIONS, "Trash"))
+createToggleRow(farmFilters, "Pick Up Health Items", 2, newOption(ITEM_OPTIONS, "Health"))
+createToggleRow(farmFilters, "Collect After Machines", 3, newOption(OPTIONS, "CollectLast"))
+
+-- Enable the default helpers after the UI exists, then synchronize button states.
+autoUse.enable()
+autoAbility.enable()
+for _, refresh in ipairs(toggleRefreshers) do refresh() end
+
+end
 
 -- Machine objectives and danger detection
 local MACHINE = {
 	Folders = { "OilMachines", "Computers" },  Range = 50,  Height = 3,
 	Elevator = "Map.SpecialFolder.ExitElevator",  ElevatorFallback = "Elevator",  ElevatorHeight = -20,
-	Tick = 0.02,  Settle = 0.04,  PromptRetry = 0.05,
-	RescanInterval = 0.5,  StallTimeout = 4,  UseTimeout = 12,
-	ClearHold = 1.5,  ItemWaitMax = 30,  ItemIdle = 3,
+	Tick = 0.03, Settle = 0.025, PromptRetry = 0.08,
+	RescanInterval = 0.12, StallTimeout = 3, UseTimeout = 8,
+	ClearHold = 1.0, ItemWaitMax = 1.25, CollectWaitMax = 20, ItemIdle = 0.2,
 	EyeHeight = 3,  SkillcheckPause = 3,  SkillcheckStale = 6,
 	ChaseHold = 3,  DoneValue = 100,  FuseDwell = 1,
 	Fuseboxes = {
@@ -1117,7 +1994,6 @@ local MACHINE = {
 		"Map.SpecialFolder.ExitFusebox.Handle.ProximityPrompt",
 	},
 	Allowed = { TSelena = true, TSquid = true, TPhantasia = true, TFizzle = true, TSnakes = true },
-	CircleSink = 1,
 }
 
 local function targetPosition(inst)
@@ -1125,15 +2001,6 @@ local function targetPosition(inst)
 	if inst:IsA("Model") then return inst:GetPivot().Position end
 	local part = getAdorneePart(inst)
 	return part and part.Position
-end
-
-local function targetFloor(inst)
-	if inst:IsA("Model") then
-		local cf, size = inst:GetBoundingBox()
-		return cf.Position.Y - size.Y / 2
-	end
-	local pos = targetPosition(inst)
-	return pos and pos.Y - (inst:IsA("BasePart") and inst.Size.Y / 2 or 0)
 end
 
 local function getMachines()
@@ -1149,10 +2016,6 @@ local function getMachines()
 	return list
 end
 
-local sightParams = RaycastParams.new()
-sightParams.FilterType = Enum.RaycastFilterType.Exclude
-sightParams.RespectCanCollide = true
-
 infectedNear = function(position, radius)
 	local folder = workspace:FindFirstChild("MonsterFolder")
 	if not folder then return false end
@@ -1165,26 +2028,155 @@ infectedNear = function(position, radius)
 	return false
 end
 
+pickupThreats = function()
+	local folder = workspace:FindFirstChild("MonsterFolder")
+	local list = {}
+	if not folder then return list end
+	for _, enemy in ipairs(getTargets(folder)) do
+		if not isInsideMachineExcludedFolder(enemy) and not MACHINE.Allowed[enemy.Name] then
+			local pos = targetPosition(enemy)
+			if pos then table.insert(list, { name = enemy.Name, pos = pos }) end
+		end
+	end
+	return list
+end
+
 local function twistedNear(position)
 	if not OPTIONS.AutoHide then return false end
 	local folder = workspace:FindFirstChild("MonsterFolder")
 	if not folder then return false end
-	local ignore = { folder }
-	if player.Character then table.insert(ignore, player.Character) end
-	sightParams.FilterDescendantsInstances = ignore
-	local eye = position + Vector3.new(0, MACHINE.EyeHeight, 0)
 	for _, twisted in ipairs(getTargets(folder)) do
-		local excludedFolderEntity = isInsideMachineExcludedFolder(twisted)
-		local pos = (not excludedFolderEntity and not MACHINE.Allowed[twisted.Name]) and targetPosition(twisted)
-		local flat = pos and Vector3.new(pos.X - position.X, 0, pos.Z - position.Z).Magnitude
-		if flat and flat <= MACHINE.Range then
-			if not OPTIONS.LineOfSight or not workspace:Raycast(eye, pos - eye, sightParams) then
-				return true, twisted.Name, flat
+		if not isInsideMachineExcludedFolder(twisted) and not MACHINE.Allowed[twisted.Name] then
+			local pos = targetPosition(twisted)
+			if pos then
+				local delta = pos - position
+				local flat = Vector3.new(delta.X, 0, delta.Z).Magnitude
+				if flat <= MACHINE.Range then return true, twisted.Name, flat end
 			end
 		end
 	end
 	return false
 end
+
+-- Damage telemetry: the nearest infected is context, not a verified attacker.
+local function nearestInfected(position)
+	local folder = workspace:FindFirstChild("MonsterFolder")
+	if not folder then return nil end
+	local nearestName, nearestDistance, nearestPosition
+	for _, enemy in ipairs(getTargets(folder)) do
+		if enemy:IsA("Model") or enemy:IsA("BasePart") then
+			local pos = targetPosition(enemy)
+			if pos then
+				local dist = (position - pos).Magnitude
+				if not nearestDistance or dist < nearestDistance then
+					nearestName, nearestDistance, nearestPosition = enemy.Name, dist, pos
+				end
+			end
+		end
+	end
+	return nearestName, nearestDistance, nearestPosition
+end
+local writeDebugFile -- assigned by Diagnostics after the GUI is created
+local deathExport = { handled = false, life = 0, character = nil }
+local function exportOnDeath(reason, hp)
+	if deathExport.handled or not alive then return end
+	deathExport.handled = true
+	increment("deathExports")
+	debugEvent("HITS", "health_zero", { trigger = reason, health = hp, life = deathExport.life }, "ERROR")
+	task.defer(function()
+		if not alive then return end
+		if writeDebugFile then
+			if not writeDebugFile("death") then increment("deathExportFailures") end
+		else
+			task.delay(0.3, function()
+				if writeDebugFile and alive then
+					if not writeDebugFile("death") then increment("deathExportFailures") end
+				else
+					increment("deathExportFailures")
+					debugEvent("DEBUG", "death_export_unavailable", { reason = "exporter_not_ready" }, "ERROR")
+				end
+			end)
+		end
+	end)
+end
+local healthMonitor = { source = nil, conn = nil, old = nil, diedConn = nil }
+local function bindHealthSource()
+	local aliveFolder = workspace:FindFirstChild("Alive")
+	local actor = aliveFolder and aliveFolder:FindFirstChild(player.Name)
+	local attributeValue = actor and actor:GetAttribute("Health")
+	local source, mode
+	if type(attributeValue) == "number" then
+		source, mode = actor, "Alive.Health"
+	else
+		local character = player.Character
+		local humanoid = character and character:FindFirstChildWhichIsA("Humanoid")
+		if humanoid then source, mode = humanoid, "Humanoid.Health" end
+	end
+	if deathExport.character ~= player.Character then
+		deathExport.character = player.Character
+		deathExport.handled = false
+		deathExport.life += 1
+	end
+	if source == healthMonitor.source and mode == healthMonitor.mode then return end
+	if healthMonitor.conn then healthMonitor.conn:Disconnect(); healthMonitor.conn = nil end
+	if healthMonitor.diedConn then healthMonitor.diedConn:Disconnect(); healthMonitor.diedConn = nil end
+	healthMonitor.source, healthMonitor.mode = source, mode
+	local currentHumanoid = player.Character and player.Character:FindFirstChildWhichIsA("Humanoid")
+	if currentHumanoid then
+		healthMonitor.diedConn = currentHumanoid.Died:Connect(function()
+			-- Backstop for games that remove the Alive actor before its Health attribute reaches zero.
+			if currentHumanoid.Health <= 0 then exportOnDeath("Humanoid.Died", currentHumanoid.Health) end
+		end)
+	end
+	local function observe(newValue)
+		if type(newValue) ~= "number" or not alive then return end
+		local previous = healthMonitor.old
+		healthMonitor.old = newValue
+		if newValue > 0 and previous ~= nil and previous <= 0 then
+			deathExport.handled = false
+			deathExport.life += 1
+		end
+		if previous ~= nil and newValue < previous then
+			local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+			local playerPos = root and root.Position
+			local name, distance
+			if playerPos then name, distance = nearestInfected(playerPos) end
+			increment("hits")
+			increment("totalDamage", previous - newValue)
+			if not name then increment("nearestEnemyMissing") end
+			debugStatus.lastHit = string.format("%.1f -> %.1f | %s (%.1f studs)",
+				previous, newValue, name or "none", distance or -1)
+			debugEvent("HITS", "health_decreased", {
+				source = mode, from = previous, to = newValue, damage = previous - newValue,
+				nearestInfected = name or "none", nearestDistance = distance and string.format("%.1f", distance) or "unknown",
+				position = playerPos and tostring(playerPos) or "unknown",
+				machineTarget = debugStatus.currentTarget,
+				attribution = "proximity_only",
+			}, "WARN")
+		end
+		if newValue <= 0 then exportOnDeath(mode or "unknown", newValue) end
+	end
+	healthMonitor.old = mode == "Alive.Health" and source:GetAttribute("Health") or (source and source.Health)
+	if healthMonitor.old and healthMonitor.old <= 0 then exportOnDeath("initial_zero", healthMonitor.old) end
+	if source and mode == "Alive.Health" then
+		healthMonitor.conn = source:GetAttributeChangedSignal("Health"):Connect(function()
+			observe(source:GetAttribute("Health"))
+		end)
+	elseif source then
+		healthMonitor.conn = source.HealthChanged:Connect(observe)
+	end
+	debugEvent("HITS", "monitor_bound", { source = mode or "none", initial = healthMonitor.old or "unknown" })
+end
+table.insert(cleanups, function()
+	if healthMonitor.conn then healthMonitor.conn:Disconnect() end
+	if healthMonitor.diedConn then healthMonitor.diedConn:Disconnect() end
+end)
+supervise("health monitor", function() return alive end, function()
+	while alive do
+		bindHealthSource()
+		task.wait(0.2)
+	end
+end)
 
 -- Chase state shared with pickup workers.
 
@@ -1250,15 +2242,26 @@ local function nearestIncomplete(list)
 end
 
 local function pickMachine()
+	local scanStarted = os.clock()
+	increment("machineScans")
+	local function report(target, status)
+		local elapsed = (os.clock() - scanStarted) * 1000
+		if elapsed > 30 then
+			increment("slowMachineScans")
+			debugThrottled("slow_machine_scan", 3, "PERF", "slow_machine_scan",
+				{ ms = string.format("%.1f", elapsed), status = status }, "WARN")
+		end
+		return target, status
+	end
 	local normals = getMachines()
 	local best, anyIncomplete = nearestIncomplete(normals)
-	if best then return best, "work" end
-	if anyIncomplete then return nil, "wait" end
+	if best then return report(best, "work") end
+	if anyIncomplete then return report(nil, "wait") end
 	local bigs = getBigMachines()
 	best, anyIncomplete = nearestIncomplete(bigs)
-	if best then return best, "work" end
-	if anyIncomplete then return nil, "wait" end
-	return nil, (#normals + #bigs > 0) and "done" or "none"
+	if best then return report(best, "work") end
+	if anyIncomplete then return report(nil, "wait") end
+	return report(nil, (#normals + #bigs > 0) and "done" or "none")
 end
 
 local function isLiveMachineObjective(target)
@@ -1279,6 +2282,48 @@ local function effectivelyVisible(obj)
 		current = current.Parent
 	end
 	return current == playerGui
+end
+
+-- Detect actual on-screen skillcheck UI, independent of whether its marker is
+-- currently animating.  The older movement-based test can miss a paused frame.
+-- IMPORTANT: Keep this scoped to the two known skillcheck widgets so ordinary
+-- HUD elements do not block travel.
+local function skillcheckWidgetOnScreen(gui)
+	if not gui or not gui:IsA("GuiObject") or not effectivelyVisible(gui) then return false end
+	local size = gui.AbsoluteSize
+	if size.X <= 0 or size.Y <= 0 then return false end
+	local camera = workspace.CurrentCamera
+	if camera then
+		local view = camera.ViewportSize
+		local pos = gui.AbsolutePosition
+		if pos.X >= view.X or pos.Y >= view.Y or pos.X + size.X <= 0 or pos.Y + size.Y <= 0 then
+			return false
+		end
+	end
+	return true
+end
+
+local lastSkillcheckOnScreenAt = -math.huge
+skillcheckProtected = function()
+	local round = playerGui:FindFirstChild("RoundSkillcheck")
+	local container = round and round:FindFirstChild("Container")
+	local normal = container and container:FindFirstChild("Normal")
+	if skillcheckWidgetOnScreen(normal) then
+		lastSkillcheckOnScreenAt = os.clock()
+		return true, "round"
+	end
+	local lock = playerGui:FindFirstChild("LockUI")
+	local hud = lock and lock:FindFirstChild("HUD")
+	local skill = hud and hud:FindFirstChild("Skillcheck")
+	local main = skill and skill:FindFirstChild("Main")
+	local marker = main and main:FindFirstChild("Marker")
+	if skillcheckWidgetOnScreen(marker) then
+		lastSkillcheckOnScreenAt = os.clock()
+		return true, "bar"
+	end
+	-- Brief grace period protects transitions between UI frames.
+	if os.clock() - lastSkillcheckOnScreenAt < 0.18 then return true, "ui_transition" end
+	return false, "none"
 end
 
 local autoSkillcheck
@@ -1333,32 +2378,55 @@ end, function()
 end)
 
 local function skillcheckActive()
-	return skillcheckSince ~= nil and os.clock() - skillcheckSince < MACHINE.SkillcheckStale
+	return skillcheckProtected()
 end
 
-local function leaveObjective()
-	if skillcheckActive() then
-		warn("[TU - Rava Hub] leave skipped: skillcheck active")
-		debugLog("leave skipped: skillcheck active")
-		return
+leaveObjective = function(reason, force, waitSeconds)
+	reason = reason or "manual"
+	local protected, checkType = skillcheckProtected()
+	if protected then
+		increment("skillcheckLeaveDeferred")
+		debugThrottled("skillcheck_leave_" .. tostring(reason), 1,
+			"MACHINE", "leave_deferred_skillcheck", { reason = reason,
+				ui = checkType, forceRequested = force == true }, "INFO")
+		return false
 	end
-	debugLog("leave invoked")
-	local done = false
+	increment("skillcheckExitAttempts")
+	machineExitBlockedUntil = math.max(machineExitBlockedUntil, os.clock() + 0.75)
+	local finished, successful = false, false
+	local begin = os.clock()
 	task.spawn(function()
-		local ok, err = pcall(function()
-			local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
-			local event = remotes and remotes:FindFirstChild("SkillCheck")
-			if not event then error("SkillCheck remote not found") end
-			event:InvokeServer("Leave")
-		end)
-		if not ok then
-			warn("[TU - Rava Hub] leave failed: " .. tostring(err))
-			debugLog("leave failed: " .. tostring(err))
+		-- Recheck inside the task in case the UI appeared after scheduling.
+		local reprotected, uiType = skillcheckProtected()
+		if reprotected then
+			finished, successful = true, false
+			increment("skillcheckLeaveDeferred")
+			debugEvent("MACHINE", "leave_cancelled_ui_appeared", { reason = reason, ui = uiType }, "INFO")
+			return
 		end
-		done = true
+		local ok, response = pcall(function()
+			local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+			local remote = remotes and remotes:FindFirstChild("SkillCheck")
+			if not remote or not remote:IsA("RemoteFunction") then error("SkillCheck RemoteFunction unavailable") end
+			-- Captured request: SkillCheck:InvokeServer() with zero arguments.
+			return remote:InvokeServer()
+		end)
+		finished, successful = true, ok and response ~= false
+		if not ok or response == false then increment("skillcheckExitFailures") end
+		debugEvent("MACHINE",
+			(not ok and "leave_remote_failed") or (response == false and "leave_remote_rejected" or "leave_remote_complete"),
+			{ reason = reason, returned = tostring(response),
+				responseVerified = response == true, requestCompleted = ok,
+				elapsedMs = math.floor((os.clock() - begin) * 1000 + 0.5) },
+			(not ok and "ERROR") or (response == false and "WARN" or "INFO"))
 	end)
-	local deadline = os.clock() + 0.12
-	while not done and os.clock() < deadline do task.wait() end
+	local deadline = os.clock() + (waitSeconds or (force and 0.08 or 0.12))
+	while not finished and os.clock() < deadline do task.wait() end
+	if not finished then
+		debugThrottled("leave_remote_pending", 2, "MACHINE", "leave_remote_pending",
+			{ reason = reason, escapeContinues = force }, "WARN")
+	end
+	return successful or (force and not finished)
 end
 
 local doneAt, doneValue = 0, false
@@ -1414,6 +2482,8 @@ local function newMachineAutofarm()
 		farm.moving = false
 		return arrived
 	end
+	-- TODO (later): detect elevator activation / ready state from actual events,
+	-- rather than the current path existence and timed fallback checks.
 	local function goElevator(advancePreference, keepGoing)
 		keepGoing = keepGoing or function() return alive and farm.enabled end
 		local paths = elevatorPreference == 1
@@ -1447,6 +2517,8 @@ local function newMachineAutofarm()
 			if exitSpot then move(exitSpot + Vector3.new(0, MACHINE.ElevatorHeight, 0), active, "emergency") end
 		end
 	end
+	-- TODO (later): detect fusebox enable/completion events directly so the
+	-- machine farm doesn't rely solely on current prompt.Enabled state.
 	local function checkFuseboxes(active)
 		for _, path in ipairs(MACHINE.Fuseboxes) do
 			if not active() then return end
@@ -1457,7 +2529,6 @@ local function newMachineAutofarm()
 				increment("fuseAttempts")
 				if not move(part.Position + Vector3.new(0, MACHINE.Height, 0), active) then return end
 				task.wait(MACHINE.Settle)
-				if OPTIONS.PromptDelay then task.wait(PROMPT_DELAY) end
 				local deadline = os.clock() + MACHINE.FuseDwell
 				while active() and os.clock() < deadline and prompt.Parent and prompt.Enabled do
 					triggerPrompt(prompt)
@@ -1478,6 +2549,7 @@ local function newMachineAutofarm()
 		local logFire = false
 		local loggedTarget = nil
 		local usedItem = false
+		local toolTryAt = setmetatable({}, { __mode = "k" })
 		local lastPrompt = nil
 		local lastProgress = nil
 		local lastMachineRescan = 0
@@ -1489,11 +2561,42 @@ local function newMachineAutofarm()
 		local waitStart = nil
 		local lastBusyAt = os.clock()
 		local collectStart = nil
+		local startupPickupsDone = false
 		local emergencyNextMove = false
+		local handoffStartedAt, handoffFrom, handoffReason = nil, nil, nil
+		local function beginHandoff(reason, from)
+			if handoffStartedAt then return end
+			handoffStartedAt = os.clock()
+			handoffFrom = from and from.Name or "none"
+			handoffReason = reason
+			debugStatus.handoffPending = reason .. " from " .. handoffFrom
+			debugEvent("PERF", "handoff_begin", { from = handoffFrom, reason = reason })
+		end
 		farm.placed = false
+		beginHandoff("start", nil)
 		while active() do
 			local root = getPlayerRoot()
 			local moved = false
+			-- Do not cancel the machine interaction, change targets, fire the exit
+			-- remote, or relocate while a skillcheck remains on screen. Chase
+			-- events stay pending and are handled once the UI disappears.
+			local protected, checkType = skillcheckProtected()
+			if protected then
+				if activeMotion and activeMotion.owner == "pickup" then cancelMotion("pickup") end
+				debugThrottled("machine_skillcheck_hold", 2, "SKILLCHECK", "holding_objective", {
+					ui = checkType, target = farm.target and farm.target.Name or "none",
+					chasePending = chase.pending,
+				}, "INFO")
+				task.wait(MACHINE.Tick)
+				continue
+			end
+			if abilityBusy then
+				debugThrottled("machine_ability_pause", 2.5, "ABILITY", "machine_paused_for_ability", {
+					target = farm.target and farm.target.Name or "none",
+				}, "INFO")
+				task.wait(MACHINE.Tick)
+				continue
+			end
 			if chase.pending then
 				chase.pending = false
 				chase.holdUntil = os.clock() + MACHINE.ChaseHold
@@ -1506,7 +2609,7 @@ local function newMachineAutofarm()
 				lastProgress = nil
 				usedItem = false
 				if root then
-					leaveObjective()
+					leaveObjective("chase_escape", true)
 					hidden = goElevator(false, active)
 				else
 					hidden = false
@@ -1515,7 +2618,7 @@ local function newMachineAutofarm()
 			local busy = pickupBusy()
 			if busy then lastBusyAt = os.clock() end
 			local waitingPickups = busy or (cachedPickups() and os.clock() - lastBusyAt < MACHINE.ItemIdle)
-			local pending = OPTIONS.ItemsFirst and not OPTIONS.CollectLast and waitingPickups
+			local pending = OPTIONS.ItemsFirst and not startupPickupsDone and not OPTIONS.CollectLast and waitingPickups
 			if pending and not farm.placed then
 				if not waitStart then
 					waitStart = os.clock()
@@ -1546,6 +2649,14 @@ local function newMachineAutofarm()
 						and (currentPrompt.Enabled
 							or (farm.placed and now - lastProgressAt <= MACHINE.UseTimeout))
 					if not currentUsable then
+						if target and scannedTarget ~= target then
+							local completed = isComplete(target)
+							beginHandoff(completed and "completed" or "unavailable", target)
+							if completed then
+								increment("machineCompletions")
+								debugEvent("MACHINE", "completed", { name = target.Name, progress = tostring(getProgress(target)) })
+							end
+						end
 						target = scannedTarget
 						farm.placed = false
 						lastFire = 0
@@ -1559,6 +2670,7 @@ local function newMachineAutofarm()
 					end
 				end
 				if target and (not target:IsDescendantOf(workspace) or isComplete(target)) then
+					beginHandoff("completed_or_removed", target)
 					if isComplete(target) then
 						increment("machineCompletions")
 						debugEvent("MACHINE", "completed", { name = target.Name, progress = tostring(getProgress(target)) })
@@ -1600,9 +2712,10 @@ local function newMachineAutofarm()
 							increment("machineDangers")
 							debugEvent("DANGER", "machine_threat", { enemy = tostring(dangerName),
 								distance = string.format("%.1f", dangerDist or 0), machine = target.Name }, "WARN")
-							leaveObjective()
+							leaveObjective("infected_near_machine", true)
 							local alternative = safeAlternative(target)
 							if alternative then
+								beginHandoff("danger_reroute", target)
 								debugLog("switching to " .. alternative.Name)
 								farm.target = alternative
 								emergencyNextMove = true
@@ -1627,6 +2740,7 @@ local function newMachineAutofarm()
 							farm.placed = false
 						end
 						if not farm.placed then
+							local teleportAt = os.clock()
 							local arrived = move(part.Position + Vector3.new(0, MACHINE.Height, 0), function()
 								return active() and not chase.pending and target:IsDescendantOf(workspace)
 									and prompt:IsDescendantOf(workspace) and not isComplete(target)
@@ -1637,20 +2751,45 @@ local function newMachineAutofarm()
 								task.wait(MACHINE.Tick)
 								continue
 							end
-							if not OPTIONS.PromptDelay then triggerMachinePrompt(prompt) end
+							-- Fire as soon as the teleport settles; avoid an artificial 500ms delay.
 							task.wait(MACHINE.Settle)
-							fireAfter = OPTIONS.PromptDelay and os.clock() + PROMPT_DELAY or 0
+							local initialFireAt = os.clock()
+							local initialFired = triggerMachinePrompt(prompt)
+							debugEvent("PERF", "prompt_after_teleport", {
+								machine = target.Name, dispatched = initialFired,
+								arrivalToPromptMs = math.floor((initialFireAt - teleportAt) * 1000 + 0.5),
+							})
+							if handoffStartedAt then
+								local ms = math.floor((os.clock() - handoffStartedAt) * 1000 + 0.5)
+								if handoffReason == "start" then
+									debugStats.firstObjectiveMs = ms
+								else
+									increment("handoffs")
+									increment("handoffTotalMs", ms)
+									debugStats.handoffMaxMs = math.max(debugStats.handoffMaxMs, ms)
+									debugStats.handoffLastMs = ms
+									debugStatus.lastHandoff = tostring(ms) .. "ms " .. handoffFrom .. " -> " .. target.Name
+								end
+								debugStatus.handoffPending = "None"
+								debugEvent("PERF", handoffReason == "start" and "first_objective" or "handoff_complete", {
+									from = handoffFrom, to = target.Name, ms = ms,
+									reason = handoffReason, dispatched = initialFired,
+								})
+								handoffStartedAt, handoffFrom, handoffReason = nil, nil, nil
+							end
+							lastFire = initialFireAt
+							fireAfter = 0
 							farm.placed = true
+							startupPickupsDone = true
 							moved = true
 							placedAt = os.clock()
 							increment("machinePlacements")
 							logProgress = true
-							logFire = true
+							logFire = not initialFired
 							debugLog(string.format("place %s dist=%.1f max=%.1f hold=%.2f enabled=%s progress=%s", target.Name,
 								(root.Position - part.Position).Magnitude, prompt.MaxActivationDistance, prompt.HoldDuration, tostring(prompt.Enabled), tostring(getProgress(target))))
-							lastFire = 0
 							usedItem = false
-							lastPrompt = nil
+							lastPrompt = prompt
 							lastProgress = getProgress(target)
 							activated, lockedOn = false, false
 							lastProgressAt = os.clock()
@@ -1701,20 +2840,27 @@ local function newMachineAutofarm()
 							end
 							triggerMachinePrompt(prompt)
 						end
-						if progressAdvanced and not usedItem then
-							usedItem = true
-							if autoUse.enabled then
-								task.delay(AUTO_USE.UseDelay, function()
-									if active() and autoUse.enabled and farm.target == target
-										and farm.placed and not isComplete(target)
-										and os.clock() >= chase.holdUntil then
-										useForMachine(target)
-									end
-								end)
-							end
+						-- A missing or temporarily unslotted item must not consume the
+						-- one-use opportunity. Retry at a controlled interval until a
+						-- hotkey is actually sent, rather than silently giving up.
+						if autoUse.enabled and activated and not usedItem and farm.placed
+							and not checking and not (skillcheckProtected and skillcheckProtected())
+							and not isComplete(target)
+							and os.clock() >= chase.holdUntil
+							and os.clock() - (toolTryAt[target] or -math.huge) >= 0.8 then
+							toolTryAt[target] = os.clock()
+							usedItem = useForMachine(target)
 						end
 					end
 				elseif status == "done" then
+					if handoffStartedAt then
+						debugEvent("PERF", "handoff_no_next_objective", {
+								from = handoffFrom, reason = handoffReason,
+								ms = math.floor((os.clock() - handoffStartedAt) * 1000 + 0.5),
+							})
+						handoffStartedAt, handoffFrom, handoffReason = nil, nil, nil
+						debugStatus.handoffPending = "None"
+					end
 					local collecting = OPTIONS.CollectLast and waitingPickups
 					if collecting then
 						if not collectStart then
@@ -1724,7 +2870,7 @@ local function newMachineAutofarm()
 					else
 						collectStart = nil
 					end
-					if not finished and not (collecting and os.clock() - collectStart < MACHINE.ItemWaitMax) then
+					if not finished and not (collecting and os.clock() - collectStart < MACHINE.CollectWaitMax) then
 						finished = true
 						debugEvent("MACHINE", "all_complete", { autoElevator = OPTIONS.AutoElevator, fuseboxes = OPTIONS.Fuseboxes })
 						if OPTIONS.Fuseboxes then checkFuseboxes(active) end
@@ -1734,6 +2880,11 @@ local function newMachineAutofarm()
 						end
 					end
 					task.wait(0.5)
+				elseif not part and (status == "wait" or status == "none") then
+					debugThrottled("machine_wait_" .. status, 5, "MACHINE", "waiting_for_objective", {
+						status = status, pending = debugStatus.handoffPending,
+					}, "WARN")
+					task.wait(0.15)
 				end
 			end
 			task.wait(moved and 0 or MACHINE.Tick)
@@ -1759,58 +2910,19 @@ local function newMachineAutofarm()
 		cancelMotion("machine")
 		restoreMachinePrompts()
 		if wasEnabled and alive then
-			leaveObjective()
-			if OPTIONS.AutoElevator then
-				goElevator(true, function() return alive and not farm.enabled end)
+			local protected, checkType = skillcheckProtected()
+			if protected then
+				debugEvent("MACHINE", "disable_exit_deferred_skillcheck", { ui = checkType }, "INFO")
+			else
+				leaveObjective("machine_autofarm_disabled", true)
+				if OPTIONS.AutoElevator then
+					goElevator(true, function() return alive and not farm.enabled end)
+				end
 			end
 		end
 	end
 	table.insert(cleanups, farm.disable)
 	return farm
-end
-
-local function newRangeView(machineFarm)
-	local view = {}
-	local circle
-	local function clear()
-		if circle then
-			circle:Destroy()
-			circle = nil
-		end
-	end
-	supervise("range view", function()
-		return alive
-	end, function()
-		while alive do
-			local target = machineFarm.enabled and machineFarm.target
-			local prompt = target and target:IsDescendantOf(workspace) and getPrompt(target)
-			local part = prompt and getPromptPart(prompt, target)
-			if part then
-				if not circle then
-					circle = new("Part", {
-						Name = "TU_RangeCircle",  Shape = Enum.PartType.Cylinder,  Anchored = true,
-						CanCollide = false,  CanQuery = false,  CanTouch = false,
-						Material = Enum.Material.Neon,  Color = Color3.fromRGB(255, 60, 60),  Transparency = 0.75,
-					}, workspace)
-					new("Highlight", {
-						Name = "TU_ESP_Highlight",  Adornee = circle,  DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
-						FillColor = Color3.fromRGB(255, 60, 60),  FillTransparency = 0.88,  OutlineTransparency = 0.05,
-						OutlineColor = Color3.fromRGB(255, 60, 60),
-					}, circle)
-				end
-				local diameter = MACHINE.Range * 2
-				circle.Size = Vector3.new(0.2, diameter, diameter)
-				local floorY = (targetFloor(target) or part.Position.Y) - MACHINE.CircleSink
-				circle.CFrame = CFrame.new(part.Position.X, floorY, part.Position.Z)
-					* CFrame.Angles(0, 0, math.rad(90))
-			else
-				clear()
-			end
-			task.wait(0.2)
-		end
-	end)
-	table.insert(cleanups, clear)
-	return view
 end
 
 local function createInputRow(parent, name, order, apply)
@@ -1997,38 +3109,52 @@ autoSkillcheck = newAutoSkillcheck()
 autoSkillcheck.enable()
 
 machineFarm = newMachineAutofarm()
-newRangeView(machineFarm)
 
+do
 local machinesBody = createSection("Machines", 3)
-createToggleRow(machinesBody, "Machine Autofarm", 1, machineFarm)
-createToggleRow(machinesBody, "Auto Skillcheck", 2, autoSkillcheck)
-createToggleRow(machinesBody, "Auto Hide", 3, newOption(OPTIONS, "AutoHide"))
-createToggleRow(machinesBody, "Line Of Sight", 4, newOption(OPTIONS, "LineOfSight"))
-createToggleRow(machinesBody, "Auto Elevator (Teleport)", 5, newOption(OPTIONS, "AutoElevator"))
-createToggleRow(machinesBody, "Fusebox Check", 6, newOption(OPTIONS, "Fuseboxes"))
-createToggleRow(machinesBody, "Items First", 7, newOption(OPTIONS, "ItemsFirst"))
-createToggleRow(machinesBody, "Prompt Delay (0.5s)", 8, newOption(OPTIONS, "PromptDelay"))
-createInputRow(machinesBody, "Range (studs)", 9, function(value)
+local machineCore = createSubcategory(machinesBody, "OBJECTIVE AUTOMATION", 1,
+	"Fast targeting, auto-interaction and skillchecks", true)
+createToggleRow(machineCore, "Machine Autofarm", 1, machineFarm)
+createToggleRow(machineCore, "Auto Skillcheck", 2, autoSkillcheck,
+	"Active skillchecks block escape and ability interrupts")
+
+local machineSafety = createSubcategory(machinesBody, "SAFETY & THREATS", 2,
+	"React to nearby infected; postpone exits in skillchecks", true)
+createToggleRow(machineSafety, "Auto Hide", 1, newOption(OPTIONS, "AutoHide"))
+createInputRow(machineSafety, "Danger range (studs)", 2, function(value)
 	if value and value > 0 and value < 2000 then MACHINE.Range = value end
 	return MACHINE.Range
 end)
 
+local machineFlow = createSubcategory(machinesBody, "EXIT & PRIORITIES", 3,
+	"Elevator and fusebox event detection to improve later", true)
+createToggleRow(machineFlow, "Auto Elevator (Teleport)", 1, newOption(OPTIONS, "AutoElevator"))
+createToggleRow(machineFlow, "Fusebox Check", 2, newOption(OPTIONS, "Fuseboxes"))
+createToggleRow(machineFlow, "Items First", 3, newOption(OPTIONS, "ItemsFirst"))
+
+end
 
 -- Diagnostics page: live counters, warning filter, and export on demand.
 local diagnosticsPage = createSection("Diagnostics")
-local summaryCard = new("Frame", { Size = UDim2.new(1, -9, 0, 106),
-	BackgroundColor3 = UI.surface, BorderSizePixel = 0, LayoutOrder = 1 }, diagnosticsPage)
+local diagnosticsOverview = createSubcategory(diagnosticsPage, "SESSION OVERVIEW", 1,
+	"Live counters, movement, damage and ability activity", true)
+local diagnosticsTools = createSubcategory(diagnosticsPage, "EXPORT & FILTER", 2,
+	"Save, copy or filter your diagnostic report", true)
+local diagnosticsEvents = createSubcategory(diagnosticsPage, "RECENT EVENTS", 3,
+	"Shows the latest recorded activity and warnings", true)
+local summaryCard = new("Frame", { Size = UDim2.new(1, -9, 0, 130),
+	BackgroundColor3 = UI.surface, BorderSizePixel = 0, LayoutOrder = 1 }, diagnosticsOverview)
 corner(summaryCard, 10)
 uiStroke(summaryCard)
 local stateLabel = uiText(summaryCard, "RUNNING", 12, true, UI.good, {
 	Position = UDim2.fromOffset(13, 10), Size = UDim2.new(1, -25, 0, 21),
 })
 local statsLabel = uiText(summaryCard, "Collecting diagnostic counters...", 12, false, UI.text, {
-	Position = UDim2.fromOffset(13, 35), Size = UDim2.new(1, -25, 0, 55),
+	Position = UDim2.fromOffset(13, 35), Size = UDim2.new(1, -25, 0, 82),
 	TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true,
 })
 local toolsRow = new("Frame", { Size = UDim2.new(1, -9, 0, 42),
-	BackgroundTransparency = 1, LayoutOrder = 2 }, diagnosticsPage)
+	BackgroundTransparency = 1, LayoutOrder = 2 }, diagnosticsTools)
 local function actionButton(name, width, x, color)
 	local button = new("TextButton", { Text = name, Size = UDim2.fromOffset(width, 36),
 		Position = UDim2.fromOffset(x, 3), BackgroundColor3 = color,
@@ -2040,7 +3166,7 @@ end
 local exportButton = actionButton("EXPORT LOG", 110, 0, UI.accent)
 local copyButton = actionButton("COPY LOG", 101, 119, UI.surface2)
 local warningButton = actionButton("WARNINGS: OFF", 130, 229, UI.surface2)
-local outputStatus = uiText(diagnosticsPage, "Logs are saved when you press Export or Unload.", 11, false, UI.muted,
+local outputStatus = uiText(diagnosticsTools, "Logs export manually, on unload, and automatically at 0 HP.", 11, false, UI.muted,
 	{ Size = UDim2.new(1, -9, 0, 22), LayoutOrder = 3 })
 local logDisplay = new("TextBox", { Size = UDim2.new(1, -9, 0, 190),
 	BackgroundColor3 = Color3.fromRGB(11, 14, 21), BorderSizePixel = 0,
@@ -2048,7 +3174,7 @@ local logDisplay = new("TextBox", { Size = UDim2.new(1, -9, 0, 190),
 	TextSize = 11, Font = Enum.Font.Code, TextXAlignment = Enum.TextXAlignment.Left,
 	TextYAlignment = Enum.TextYAlignment.Top, TextWrapped = true,
 	TextEditable = false, MultiLine = true, ClearTextOnFocus = false,
-	LayoutOrder = 4 }, diagnosticsPage)
+	LayoutOrder = 4 }, diagnosticsEvents)
 corner(logDisplay, 9)
 local warningsOnly = false
 track(warningButton.MouseButton1Click:Connect(function()
@@ -2064,20 +3190,49 @@ local function debugReport()
 		"Exported=" .. os.date("%Y-%m-%d %H:%M:%S"),
 		string.format("SessionSeconds=%.2f PlaceId=%s JobId=%s",
 			os.clock() - debugStart, tostring(game.PlaceId), tostring(game.JobId)),
-		"Mode=teleport-only",
+		"Mode=pickup-tween/objective-teleport",
+		"Pickup route policy=clear straight corridors or verified enemy detour; block unsafe or obstructed routes",
+		"Movement priority=active machine objectives preempt pickup travel; prompt spam stays at 16/s",
+		"LOS=disabled for prompts and infected detection (client-side; server checks may differ)",
+		"Hit attribution=nearest infected only (not confirmed attacker)",
+		"Machine exit=SkillCheck:InvokeServer() with no arguments; ALL exits deferred while skillcheck UI is visible",
+		"Skillcheck protection=defer remote exits, teleports, pickup tweens, and danger/chase reroutes until UI disappears",
+		"TODO (later)=improve elevator and fusebox event / completion detection",
+		"Ability=HUD CoolDown.Time readiness; pauses active machines, leaves when no skillcheck, then uses ability and resumes farm",
+		"Ability=Ability:InvokeServer(nil), once per observed HUD cooldown cycle; nil response unverified",
+		"Item hotkeys=executor keypress preferred, VIM fallback; input success does not prove item effect",
+		"AbilityConfig: " .. fieldString(ABILITY),
+		"Death export=automatic when observed health <= 0 (once per life)",
+		"Handoff timing=objective completion/unavailable to first prompt dispatch at next target",
 		string.format("Client touch=%s promptFire=%s virtualInput=%s clipboard=%s writefile=%s",
 			tostring(UserInputService.TouchEnabled), tostring(hasFirePrompt),
 			tostring(pcall(function() return game:GetService("VirtualInputManager") end)),
 			tostring(typeof(setclipboard) == "function"), tostring(typeof(writefile) == "function")),
 		"Stats: " .. fieldString(debugStats),
 		"Status: " .. fieldString(debugStatus),
+		string.format("Performance: firstObjectiveMs=%d handoffs=%d averageMs=%.1f maxMs=%d lastMs=%d slowScans=%d cacheRefreshes=%d cacheHits=%d",
+			debugStats.firstObjectiveMs, debugStats.handoffs,
+			debugStats.handoffs > 0 and debugStats.handoffTotalMs / debugStats.handoffs or 0,
+			debugStats.handoffMaxMs, debugStats.handoffLastMs, debugStats.slowMachineScans,
+			debugStats.targetCacheRefreshes, debugStats.targetCacheHits),
+		"PickupMovement: " .. fieldString(PICKUP_TRAVEL),
+		"CapsuleSources=workspace.Capsules; workspace.Map.InfectedSamples",
+		string.format("PickupTween: arrived=%d aborted=%d rerouted=%d rejected=%d totalDistance=%d avgTravelMs=%.1f",
+			debugStats.pickupTweens, debugStats.pickupTweenAborts, debugStats.pickupTweenDetours,
+			debugStats.pickupTweenUnsafe, debugStats.pickupTweenDistance,
+			debugStats.pickupTweens > 0 and debugStats.pickupTravelMs / debugStats.pickupTweens or 0),
 		"Options: " .. fieldString(OPTIONS),
 		"FARM: " .. fieldString(FARM),
 		"MACHINE: " .. fieldString({ Range = MACHINE.Range, StallTimeout = MACHINE.StallTimeout,
-			UseTimeout = MACHINE.UseTimeout, ChaseHold = MACHINE.ChaseHold }),
+			UseTimeout = MACHINE.UseTimeout, ChaseHold = MACHINE.ChaseHold,
+			ItemWaitMax = MACHINE.ItemWaitMax, CollectWaitMax = MACHINE.CollectWaitMax, RescanInterval = MACHINE.RescanInterval }),
+		"ItemInput: " .. fieldString({ executorKeypress = typeof(keypress) == "function",
+			executorKeyrelease = typeof(keyrelease) == "function", virtualInput = pcall(function()
+				return game:GetService("VirtualInputManager") end) }),
 		"Enabled: " .. fieldString({ capsules = capsuleFarm.enabled, items = itemFarm.enabled,
 			candy = candyFarm.enabled, machine = machineFarm.enabled,
-			skillchecks = autoSkillcheck.enabled, autoUse = autoUse.enabled }),
+			skillchecks = autoSkillcheck.enabled, autoUse = autoUse.enabled,
+			autoAbility = autoAbility.enabled, autoTrashUse = ITEM_OPTIONS.AutoTrashUse }),
 		string.format("LogEvents=%d Retained=%d Dropped=%d", debugIndex,
 			math.min(debugIndex, LOG_LIMIT), math.max(0, debugIndex - LOG_LIMIT)),
 		"---- EVENTS (chronological) ----",
@@ -2085,24 +3240,27 @@ local function debugReport()
 	for _, line in ipairs(allDebugLines()) do table.insert(summary, line) end
 	return table.concat(summary, "\n")
 end
-local function writeDebugFile()
+writeDebugFile = function(reason)
+	reason = reason or "manual"
+	debugEvent("DEBUG", "export_requested", { reason = reason })
 	if typeof(writefile) ~= "function" then
 		debugEvent("DEBUG", "export_failed", { reason = "writefile unavailable" }, "WARN")
 		outputStatus.Text = "Export unavailable. Try Copy Log instead."
 		return false
 	end
-	local filename = "TU_Rava_Hub_Debug_" .. os.time() .. ".txt"
+	local prefix = reason == "death" and "TU_Rava_Hub_DEATH_Debug_" or "TU_Rava_Hub_Debug_"
+	local filename = prefix .. os.time() .. "_" .. math.floor((os.clock() % 1) * 100000) .. ".txt"
 	local ok, err = pcall(writefile, filename, debugReport())
 	if ok then
 		outputStatus.Text = "Saved: " .. filename
-		debugEvent("DEBUG", "export_success", { filename = filename })
+		debugEvent("DEBUG", "export_success", { filename = filename, reason = reason })
 		return true
 	end
 	outputStatus.Text = "Export failed: " .. tostring(err):sub(1, 70)
-	debugEvent("DEBUG", "export_failed", { error = err }, "ERROR")
+	debugEvent("DEBUG", "export_failed", { error = err, reason = reason }, "ERROR")
 	return false
 end
-track(exportButton.MouseButton1Click:Connect(writeDebugFile))
+track(exportButton.MouseButton1Click:Connect(function() writeDebugFile("manual") end))
 track(copyButton.MouseButton1Click:Connect(function()
 	if typeof(setclipboard) ~= "function" then
 		outputStatus.Text = "Clipboard unavailable in this executor."
@@ -2116,30 +3274,36 @@ track(copyButton.MouseButton1Click:Connect(function()
 end))
 supervise("diagnostic UI", function() return alive end, function()
 	while alive do
+		if main.Visible then for _, refresh in ipairs(toggleRefreshers) do refresh() end end
 		local working = (machineFarm.enabled and "MACHINE") or (pickupBusy() and "PICKUPS") or "IDLE"
-		headerStatus.Text = working .. "  •  TP MODE"
+		headerStatus.Text = working .. "  •  v2.5.5"
 		headerStatus.TextColor3 = working == "IDLE" and UI.muted or UI.good
-		footerLabel.Text = string.format("%s   •   %d teleports   •   %d events", BUILD, debugStats.teleports, debugIndex)
+		footerLabel.Text = string.format("%s   •   %d pickup tweens   •   %d objective TPs", BUILD, debugStats.pickupTweens, debugStats.teleports)
 		if activeTab == "Diagnostics" and main.Visible then
-			stateLabel.Text = "Current target: " .. debugStatus.currentTarget
-			statsLabel.Text = string.format("Teleports %d  |  TP failures %d  |  Unsafe destinations %d\nPickups %d/%d confirmed  |  Prompts failed %d\nMachines %d completed / %d placed  |  Stalls %d  |  Errors %d",
-				debugStats.teleports, debugStats.teleportFailures, debugStats.unsafeDestinations,
-				debugStats.pickupConfirmed, debugStats.pickupAttempts, debugStats.promptFailures,
-				debugStats.machineCompletions, debugStats.machinePlacements,
-				debugStats.machineStalls, debugStats.workerErrors)
+			stateLabel.Text = "Target: " .. debugStatus.currentTarget .. "  |  Last handoff: " .. tostring(debugStats.handoffLastMs) .. "ms"
+			statsLabel.Text = string.format("Hits %d  |  Damage %.1f  |  Handoffs %d (avg %.0fms)\nTeleports %d  |  Pickups %d/%d  |  ESP %d active\nMachines %d done  |  Stalls %d  |  Errors %d\nAbilities %d  |  Waffles %d  |  Death logs %d",
+				debugStats.hits, debugStats.totalDamage, debugStats.handoffs,
+				debugStats.handoffs > 0 and debugStats.handoffTotalMs / debugStats.handoffs or 0,
+				debugStats.teleports, debugStats.pickupConfirmed, debugStats.pickupAttempts,
+				math.max(0, debugStats.espAdded - debugStats.espRemoved),
+				debugStats.machineCompletions, debugStats.machineStalls, debugStats.workerErrors,
+				debugStats.abilityDispatched, debugStats.abilityWaffles, debugStats.deathExports)
 			local logs = recentDebugLines(11, warningsOnly)
 			logDisplay.Text = #logs > 0 and table.concat(logs, "\n") or "No matching events yet."
 		end
 		task.wait(0.7)
 	end
 end)
-debugEvent("SYSTEM", "initialized", { build = BUILD, place = game.PlaceId, mode = "teleport" })
+debugEvent("SYSTEM", "initialized", { build = BUILD, place = game.PlaceId, ui = "collapsible_subcategories",
+	mode = "tween_pickups_teleport_objectives", lineOfSight = "disabled", abilityAuto = true, abilityCooldown = "HUD.CoolDown.Time", sampleFarm = true, pickupSpeed = PICKUP_TRAVEL.Speed,
+	enemyClearance = PICKUP_TRAVEL.SafetyRadius, pickupSettle = FARM.Settle,
+	pickupDwell = FARM.Dwell, pickupRate = FARM.SpamRate, itemWaitMax = MACHINE.ItemWaitMax })
 -- World structure watcher reports renamed/missing objective folders without log spam.
 task.spawn(function()
 	local previous = {}
 	while alive do
-		for _, folderName in ipairs({ "Items", "Capsules", "Candies", "Computers", "OilMachines", "MonsterFolder" }) do
-			local folder = workspace:FindFirstChild(folderName)
+		for _, folderName in ipairs({ "Items", "Capsules", "Map.InfectedSamples", "Candies", "Computers", "OilMachines", "MonsterFolder" }) do
+			local folder = resolveWorkspacePath(folderName)
 			local present = folder ~= nil
 			if previous[folderName] ~= present then
 				debugEvent("WORLD", present and "folder_found" or "folder_missing",
@@ -2162,7 +3326,11 @@ local function unload()
 	for _, cleanup in ipairs(cleanups) do pcall(cleanup) end
 	table.clear(cleanups)
 	debugEvent("SYSTEM", "unload", { elapsed = string.format("%.2f", os.clock() - debugStart) })
-	writeDebugFile()
+	writeDebugFile("unload")
+	-- Restore the original prompt LOS settings only when the hub is fully unloaded.
+	for prompt, wasRequired in pairs(originalPromptSight) do
+		if prompt.Parent then pcall(function() prompt.RequiresLineOfSight = wasRequired end) end
+	end
 	for _, connection in ipairs(connections) do connection:Disconnect() end
 	table.clear(connections)
 	screenGui:Destroy()
