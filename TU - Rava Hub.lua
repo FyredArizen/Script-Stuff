@@ -28,7 +28,7 @@ local OPTIONS = {
 }
 
 -- Diagnostic log: capped circular buffer, timestamps, categories, and counters.
-local BUILD = "2.2 Fast Objectives / ESP / Hit Telemetry"
+local BUILD = "2.3.1 Fast Prompt Spam / Pickup Reliability"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -607,10 +607,11 @@ end
 
 -- Pickup configuration and proximity prompts
 local FARM = {
-	Height = 3, Settle = 0.02, Dwell = 0.42,
-	Revisit = 4, FailedRetry = 0.25, Empty = 0.12,
-	Poll = 0.025, IdleReturn = 1, HeldLimit = 3,
-	SpamRate = 16, InfectedClear = 15,
+	-- Give the character and server time to recognize a teleport before triggering pickups.
+	Height = 3, Settle = 0.4, Dwell = 2.0,
+	Revisit = 5, FailedRetry = 1.0, Empty = 0.18,
+	Poll = 0.08, IdleReturn = 1.5, HeldLimit = 3,
+	SpamRate = 16, BetweenPickups = 0.25, InfectedClear = 15,
 }
 
 local PROMPT_HOLDERS = { "Prompt", "PromptPart" }
@@ -634,16 +635,23 @@ local function getPromptPart(prompt, target)
 	return getAdorneePart(target)
 end
 
+local function getPromptPosition(prompt, fallbackPart)
+	local parent = prompt.Parent
+	if parent and parent:IsA("Attachment") then return parent.WorldPosition end
+	if parent and parent:IsA("BasePart") then return parent.Position end
+	return fallbackPart.Position
+end
+
 local hasFirePrompt = typeof(fireproximityprompt) == "function"
 
-local function triggerPrompt(prompt)
+local function triggerPrompt(prompt, forceHold)
 	increment("promptAttempts")
-	if not prompt or not prompt:IsA("ProximityPrompt") or not prompt:IsDescendantOf(workspace) then
+	if not prompt or not prompt:IsA("ProximityPrompt") or not prompt:IsDescendantOf(workspace) or not prompt.Enabled then
 		increment("promptFailures")
 		debugThrottled("invalid_pickup_prompt", 3, "PROMPT", "invalid_target", nil, "WARN")
 		return false
 	end
-	if hasFirePrompt then
+	if hasFirePrompt and not forceHold then
 		local ok = pcall(fireproximityprompt, prompt)
 		if ok then return true end
 	end
@@ -745,37 +753,62 @@ end
 
 local heldCount
 
-local function spamPrompt(prompt, target, keepGoing, confirmPickup)
-	local home = target.Parent
-	local startingHeld = heldCount()
-	local deadline = os.clock() + FARM.Dwell
-	local confirmed = false
-	while keepGoing() and os.clock() < deadline and target.Parent == home and prompt:IsDescendantOf(target) do
-		if not prompt.Enabled then
-			confirmed = true
-			break
-		end
-		if confirmPickup and heldCount() > startingHeld then
-			confirmed = true
-			break
-		end
-		local started = os.clock()
-		-- Only activate the intended target, not unrelated prompts nearby.
-		triggerPrompt(prompt)
-		task.wait(FARM.Poll)
-		if target.Parent ~= home or not prompt:IsDescendantOf(target) or not prompt.Enabled then
-			confirmed = true
-			break
-		end
-		if confirmPickup and heldCount() > startingHeld then
-			confirmed = true
-			break
-		end
-		local rest = 1 / FARM.SpamRate - (os.clock() - started)
-		if rest > 0 then task.wait(rest) end
+-- Count and confirm pickup effects before proceeding, instead of assuming a fired
+-- prompt means the server collected the object. Retry with a real input hold if
+-- executor fast-fire does not produce a pickup.
+local function pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
+	if target.Parent ~= initialParent or not prompt:IsDescendantOf(target) then
+		return true, "target_removed"
 	end
-	if target.Parent ~= home or not prompt:IsDescendantOf(target) or not prompt.Enabled then confirmed = true end
-	return confirmed
+	if confirmPickup and heldCount() > initialHeld then
+		return true, "inventory_increased"
+	end
+	-- For inventory items, an inactive prompt alone is not proof of pickup.
+	-- Capsules/candies can still use the prompt becoming disabled as evidence.
+	if not prompt.Enabled and not confirmPickup then return true, "prompt_disabled" end
+	return false
+end
+
+local function spamPrompt(prompt, target, keepGoing, confirmPickup, initialHeld, initialParent)
+	local deadline = os.clock() + FARM.Dwell
+	local attempts = 0
+	local function interruption()
+		if confirmPickup and not prompt.Enabled then
+			task.wait(0.35) -- permit the inventory attribute to replicate
+			local collected, reason = pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
+			if collected then return true, reason, attempts end
+			return false, "prompt_disabled_without_inventory", attempts
+		end
+		return false, "interrupted", attempts
+	end
+
+	while os.clock() < deadline do
+		local confirmed, reason = pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
+		if confirmed then return true, reason, attempts end
+		if not keepGoing() then return interruption() end
+
+		attempts += 1
+		local started = os.clock()
+		-- Keep firing at full speed. Periodically try a real input hold as a
+		-- fallback if an executor reports success without collecting the item.
+		local forceHold = hasFirePrompt and attempts % 8 == 0
+		local fired = triggerPrompt(prompt, forceHold)
+		if not fired then
+			debugThrottled("pickup_activation_" .. tostring(target), 2, "PICKUP",
+				"activation_failed", { target = target.Name, attempt = attempts }, "WARN")
+		end
+		-- Allow one prompt attempt time to replicate before retrying.
+		local nextAttempt = math.min(deadline, started + 1 / FARM.SpamRate)
+		while os.clock() < nextAttempt do
+			local done, why = pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
+			if done then return true, why, attempts end
+			if not keepGoing() then return interruption() end
+			task.wait(math.min(FARM.Poll, math.max(0.01, nextAttempt - os.clock())))
+		end
+	end
+	local collected, reason = pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
+	if collected then return true, reason, attempts end
+	return false, "confirmation_timeout", attempts
 end
 
 -- Cached shallow traversal. Watch only root children and one-level nested children,
@@ -926,28 +959,42 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 							debugEvent("PICKUP", "attempt", { folder = folder.Name, name = target.Name,
 								held = heldCount(), prompt = prompt.Name, distance = string.format("%.1f", (root.Position - part.Position).Magnitude) })
 							-- Always release the claim, even if a Roblox instance is removed mid-pickup.
-							local ok, confirmed = pcall(function()
-								if not allowed() then return false end
+							local initialHeld, initialParent = heldCount(), target.Parent
+							local ok, confirmed, reason, attempts = pcall(function()
+								if not allowed() then return false, "not_allowed", 0 end
 								local function stillPicking()
 									return allowed() and pickupCoordinator.owner == farm
 										and part:IsDescendantOf(workspace) and prompt.Enabled
 								end
-								if not teleportCharacter(CFrame.new(part.Position + Vector3.new(0, FARM.Height, 0)),
-									function() return stillPicking() and not infectedNear(part.Position, FARM.InfectedClear) end, "pickup") then
-									return false
+								local promptPosition = getPromptPosition(prompt, part)
+								local approachHeight = math.clamp(prompt.MaxActivationDistance - 1, 0.25, FARM.Height)
+								local destination = CFrame.new(promptPosition + Vector3.new(0, approachHeight, 0))
+								if not teleportCharacter(destination,
+									function() return stillPicking() and not infectedNear(promptPosition, FARM.InfectedClear) end, "pickup") then
+									return false, "teleport_failed", 0
 								end
+								-- The old 0.02-second pause was often too short for prompts to register.
 								task.wait(FARM.Settle)
-								if not stillPicking() then return false end
-								return spamPrompt(prompt, target, stillPicking, confirmPickup)
+								local actualRange = (root.Position - promptPosition).Magnitude
+								if actualRange > prompt.MaxActivationDistance then
+									debugEvent("PICKUP", "outside_prompt_range", {
+										name = target.Name, distance = string.format("%.2f", actualRange),
+										maximum = prompt.MaxActivationDistance }, "WARN")
+									return false, "outside_prompt_range", 0
+								end
+								local observed, why = pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
+								if observed then return true, why, 0 end
+								if not stillPicking() then return false, "interrupted_after_arrival", 0 end
+								return spamPrompt(prompt, target, stillPicking, confirmPickup, initialHeld, initialParent)
 							end)
+							-- Hold the coordinator during the cooldown; avoid immediately racing
+							-- a second pickup worker to the next object.
+							if active() then task.wait(FARM.BetweenPickups) end
 							releasePickup(farm)
 							if not ok then
 								debugLog("ERROR pickup " .. tostring(target.Name) .. ": " .. tostring(confirmed))
 								warn("[TU - Rava Hub] pickup error: " .. tostring(confirmed))
-								confirmed = false
-							else
-								debugLog(string.format("pickup %s dist=%.1f max=%.1f hold=%.2f confirmed=%s", target.Name,
-									(root.Position - part.Position).Magnitude, prompt.MaxActivationDistance, prompt.HoldDuration, tostring(confirmed)))
+								confirmed, reason, attempts = false, "lua_error", 0
 							end
 							if confirmed then
 								increment("pickupConfirmed")
@@ -957,7 +1004,10 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 								recent[target] = os.clock() - FARM.Revisit + FARM.FailedRetry
 							end
 							debugEvent("PICKUP", "result", { folder = folder.Name, name = target.Name,
-								confirmed = confirmed, duration = string.format("%.2f", os.clock() - beganAt), held = heldCount() },
+								confirmed = confirmed, reason = reason or "unknown", activations = attempts or 0,
+								maxDistance = prompt.MaxActivationDistance, holdDuration = prompt.HoldDuration,
+								requiresSight = prompt.RequiresLineOfSight,
+								duration = string.format("%.2f", os.clock() - beganAt), held = heldCount() },
 								confirmed and "INFO" or "WARN")
 						end
 					end
@@ -1215,7 +1265,6 @@ local MACHINE = {
 		"Map.SpecialFolder.ExitFusebox.Handle.ProximityPrompt",
 	},
 	Allowed = { TSelena = true, TSquid = true, TPhantasia = true, TFizzle = true, TSnakes = true },
-	CircleSink = 1,
 }
 
 local function targetPosition(inst)
@@ -1223,15 +1272,6 @@ local function targetPosition(inst)
 	if inst:IsA("Model") then return inst:GetPivot().Position end
 	local part = getAdorneePart(inst)
 	return part and part.Position
-end
-
-local function targetFloor(inst)
-	if inst:IsA("Model") then
-		local cf, size = inst:GetBoundingBox()
-		return cf.Position.Y - size.Y / 2
-	end
-	local pos = targetPosition(inst)
-	return pos and pos.Y - (inst:IsA("BasePart") and inst.Size.Y / 2 or 0)
 end
 
 local function getMachines()
@@ -2013,50 +2053,6 @@ local function newMachineAutofarm()
 	return farm
 end
 
-local function newRangeView(machineFarm)
-	local view = {}
-	local circle
-	local function clear()
-		if circle then
-			circle:Destroy()
-			circle = nil
-		end
-	end
-	supervise("range view", function()
-		return alive
-	end, function()
-		while alive do
-			local target = machineFarm.enabled and machineFarm.target
-			local prompt = target and target:IsDescendantOf(workspace) and getPrompt(target)
-			local part = prompt and getPromptPart(prompt, target)
-			if part then
-				if not circle then
-					circle = new("Part", {
-						Name = "TU_RangeCircle",  Shape = Enum.PartType.Cylinder,  Anchored = true,
-						CanCollide = false,  CanQuery = false,  CanTouch = false,
-						Material = Enum.Material.Neon,  Color = Color3.fromRGB(255, 60, 60),  Transparency = 0.75,
-					}, workspace)
-					new("Highlight", {
-						Name = "TU_ESP_Highlight",  Adornee = circle,  DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
-						FillColor = Color3.fromRGB(255, 60, 60),  FillTransparency = 0.88,  OutlineTransparency = 0.05,
-						OutlineColor = Color3.fromRGB(255, 60, 60),
-					}, circle)
-				end
-				local diameter = MACHINE.Range * 2
-				circle.Size = Vector3.new(0.2, diameter, diameter)
-				local floorY = (targetFloor(target) or part.Position.Y) - MACHINE.CircleSink
-				circle.CFrame = CFrame.new(part.Position.X, floorY, part.Position.Z)
-					* CFrame.Angles(0, 0, math.rad(90))
-			else
-				clear()
-			end
-			task.wait(0.2)
-		end
-	end)
-	table.insert(cleanups, clear)
-	return view
-end
-
 local function createInputRow(parent, name, order, apply)
 	local row = new("Frame", { Size = UDim2.new(1, -9, 0, 43), BackgroundColor3 = UI.surface,
 		BorderSizePixel = 0, LayoutOrder = order }, parent)
@@ -2241,7 +2237,6 @@ autoSkillcheck = newAutoSkillcheck()
 autoSkillcheck.enable()
 
 machineFarm = newMachineAutofarm()
-newRangeView(machineFarm)
 
 local machinesBody = createSection("Machines", 3)
 createToggleRow(machinesBody, "Machine Autofarm", 1, machineFarm)
@@ -2385,7 +2380,7 @@ supervise("diagnostic UI", function() return alive end, function()
 		task.wait(0.7)
 	end
 end)
-debugEvent("SYSTEM", "initialized", { build = BUILD, place = game.PlaceId, mode = "teleport", promptDelay = 0, itemWaitMax = MACHINE.ItemWaitMax })
+debugEvent("SYSTEM", "initialized", { build = BUILD, place = game.PlaceId, mode = "teleport", pickupSettle = FARM.Settle, pickupDwell = FARM.Dwell, pickupRate = FARM.SpamRate, itemWaitMax = MACHINE.ItemWaitMax })
 -- World structure watcher reports renamed/missing objective folders without log spam.
 task.spawn(function()
 	local previous = {}
