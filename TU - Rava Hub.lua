@@ -1,6 +1,7 @@
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 local alive = true
@@ -28,12 +29,15 @@ local OPTIONS = {
 }
 
 -- Diagnostic log: capped circular buffer, timestamps, categories, and counters.
-local BUILD = "2.3.1 Fast Prompt Spam / Pickup Reliability"
+local BUILD = "2.4.1 Safe Pickup Tweens / Movement Priority"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
 local debugStats = {
 	teleports = 0, teleportFailures = 0, unsafeDestinations = 0,
+	pickupTweens = 0, pickupTweenAborts = 0, pickupTweenDetours = 0,
+	pickupPreemptions = 0,
+	pickupTweenUnsafe = 0, pickupTweenDistance = 0, pickupTravelMs = 0,
 	pickupAttempts = 0, pickupConfirmed = 0, pickupUnconfirmed = 0,
 	promptAttempts = 0, promptFailures = 0, machineTargetChanges = 0,
 	machineStalls = 0, skillcheckInputs = 0, skillcheckInputFailures = 0,
@@ -110,19 +114,34 @@ local function allDebugLines()
 	return lines
 end
 
--- All travel is instantaneous; no interpolation or route sampling.
+-- Hybrid navigation: pickups tween through verified clear corridors; objectives teleport.
+-- Moving enemies are rechecked during travel. If no safe route exists, SKIP the pickup.
 local activeMotion
 local infectedNear -- Assigned after monster-folder helpers are defined.
+local pickupThreats -- Assigned after the machine/infected helpers are defined.
 local motionPauseUntil = 0
+local PICKUP_TRAVEL = {
+	Speed = 200, SafetyRadius = 18, CheckInterval = 0.08,
+	ArriveTolerance = 4.5,
+}
 local function cancelMotion(owner)
-	if activeMotion and (not owner or activeMotion == owner) then
-		debugEvent("MOVE", "cancel", { owner = activeMotion })
+	local motion = activeMotion
+	if motion and (not owner or motion.owner == owner) then
 		activeMotion = nil
+		motion.cancelled = true
+		if motion.tween then pcall(function() motion.tween:Cancel() end) end
+		debugEvent("MOVE", "cancel", { owner = motion.owner, phase = motion.phase or "unknown" })
 	end
 end
 local function teleportCharacter(destination, keepGoing, owner, mode)
 	local emergency = mode == "emergency"
 	if not alive or not keepGoing() then return false end
+	-- An objective handoff always wins over pickup travel. This prevents the
+	-- machine and pickup workers from overwriting each other's positions.
+	if owner == "machine" and activeMotion and activeMotion.owner == "pickup" then
+		debugEvent("MOVE", "machine_preempts_pickup_tween", { phase = activeMotion.phase or "unknown" }, "WARN")
+		cancelMotion("pickup")
+	end
 	if activeMotion and not emergency then
 		debugThrottled("move_busy_" .. owner, 3, "MOVE", "occupied", { owner = owner }, "WARN")
 		return false
@@ -140,20 +159,18 @@ local function teleportCharacter(destination, keepGoing, owner, mode)
 	local from = root.Position
 	local distance = (from - destination.Position).Magnitude
 	if distance < 0.25 then return true end
-	-- Routine movement refuses unsafe destinations. Emergency escapes remain immediate.
+	-- Routine objective movements still reject unsafe destinations.
 	if not emergency and infectedNear and infectedNear(destination.Position, 15) then
 		increment("unsafeDestinations")
 		debugThrottled("unsafe_" .. owner, 3, "MOVE", "unsafe_destination",
 			{ owner = owner, position = tostring(destination.Position) }, "WARN")
 		return false
 	end
-	activeMotion = owner
 	local ok, err = pcall(function()
 		root.AssemblyLinearVelocity = Vector3.zero
 		root.AssemblyAngularVelocity = Vector3.zero
 		root.CFrame = destination
 	end)
-	if activeMotion == owner then activeMotion = nil end
 	if not ok then
 		increment("teleportFailures")
 		debugEvent("MOVE", "teleport_error", { owner = owner, error = err }, "ERROR")
@@ -172,6 +189,188 @@ local function teleportCharacter(destination, keepGoing, owner, mode)
 		distance = string.format("%.1f", distance), to = tostring(destination.Position),
 	})
 	return true
+end
+
+-- Check a whole segment, not just its destination. Vertical distances are respected
+-- so enemies on different floors do not always block horizontal movement.
+local function segmentThreat(a, b, threats, radius)
+	local diff = b - a
+	local lengthSquared = diff:Dot(diff)
+	for _, enemy in ipairs(threats) do
+		local t = lengthSquared > 0.001 and math.clamp((enemy.pos - a):Dot(diff) / lengthSquared, 0, 1) or 0
+		local nearest = a + diff * t
+		if (enemy.pos - nearest).Magnitude < radius then
+			return enemy, (enemy.pos - nearest).Magnitude
+		end
+	end
+	return nil
+end
+local function segmentObstacle(a, b, character, target)
+	local diff = b - a
+	if diff.Magnitude < 1 then return false end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local monsters = workspace:FindFirstChild("MonsterFolder")
+	local ignored = { character }
+	if monsters then table.insert(ignored, monsters) end
+	if target then table.insert(ignored, target) end
+	params.FilterDescendantsInstances = ignored
+	params.RespectCanCollide = true
+	-- Ignore the last stud so solid parts immediately below pickups do not
+	-- reject an otherwise clear approach to the prompt.
+	local hit = workspace:Raycast(a + Vector3.new(0, 0.6, 0),
+		diff.Unit * math.max(0.05, diff.Magnitude - 1), params)
+	return hit ~= nil, hit
+end
+local function planPickupRoute(from, destination, threats, character, target)
+	local radius = PICKUP_TRAVEL.SafetyRadius
+	if segmentThreat(destination, destination, threats, radius) then return nil, "unsafe_destination" end
+	if segmentThreat(from, from, threats, radius) then return nil, "unsafe_start" end
+	local function safeRoute(points)
+		local previous = from
+		for _, point in ipairs(points) do
+			if segmentThreat(previous, point, threats, radius) then return false end
+			if segmentObstacle(previous, point, character, target) then return false end
+			previous = point
+		end
+		return true
+	end
+	if safeRoute({ destination }) then return { destination }, "direct" end
+	local heading = destination - from
+	local planar = Vector3.new(heading.X, 0, heading.Z)
+	if planar.Magnitude < 1 then return nil, "vertical_route_blocked" end
+	local forward = planar.Unit
+	local side = Vector3.new(-forward.Z, 0, forward.X)
+	local length = planar.Magnitude
+	local candidates = {}
+	local function try(points)
+		if not safeRoute(points) then return end
+		local total, last = 0, from
+		for _, point in ipairs(points) do total += (point - last).Magnitude; last = point end
+		table.insert(candidates, { points = points, length = total })
+	end
+	-- Two-sided detours allow the player to travel around infected corridors.
+	for _, enemy in ipairs(threats) do
+		local t = math.clamp((enemy.pos - from):Dot(forward), 0, length)
+		local near = from + (destination - from) * (t / length)
+		if (enemy.pos - near).Magnitude < radius * 2 then
+			for _, sign in ipairs({ -1, 1 }) do
+				for _, scale in ipairs({ 1.6, 2.1 }) do
+					local lateral = side * (radius * scale * sign)
+					local before = near - forward * (radius * 1.35) + lateral
+					local after = near + forward * (radius * 1.35) + lateral
+					try({ before, after, destination })
+					try({ near + lateral, destination })
+				end
+			end
+		end
+	end
+	-- Simple geometry-only wall detours when no enemy-centered route is viable.
+	-- These are verified with raycasts and enemy distances before use.
+	if #candidates == 0 then
+		local midpoint = (from + destination) * 0.5
+		for _, offset in ipairs({ 12, 25, 45 }) do
+			for _, sign in ipairs({ -1, 1 }) do
+				local lateral = side * offset * sign
+				try({ midpoint + lateral, destination })
+				try({ from + lateral, destination + lateral, destination })
+			end
+		end
+	end
+	if #candidates == 0 then return nil, "no_safe_corridor" end
+	table.sort(candidates, function(a, b) return a.length < b.length end)
+	return candidates[1].points, "detour"
+end
+local function tweenPickup(destination, keepGoing, target)
+	if not alive or not keepGoing() then return false, "inactive" end
+	if activeMotion then return false, "movement_busy" end
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not root or not root:IsDescendantOf(workspace) then return false, "missing_root" end
+	local from = root.Position
+	local threats = pickupThreats and pickupThreats() or {}
+	local points, routeMode = planPickupRoute(from, destination.Position, threats, character, target)
+	if not points then
+		increment("pickupTweenUnsafe")
+		debugThrottled("pickup_route_" .. routeMode, 2, "MOVE", "pickup_route_rejected",
+			{ reason = routeMode, distance = string.format("%.1f", (destination.Position - from).Magnitude) }, "WARN")
+		return false, routeMode
+	end
+	if routeMode == "detour" then increment("pickupTweenDetours") end
+	local motion = { owner = "pickup", phase = "route", cancelled = false }
+	activeMotion = motion
+	local started, traveled = os.clock(), 0
+	debugEvent("MOVE", "pickup_tween_start", { mode = routeMode, segments = #points,
+		distance = string.format("%.1f", (destination.Position - from).Magnitude) })
+	local function stop(reason, emergency)
+		if activeMotion == motion then activeMotion = nil end
+		motion.cancelled = true
+		if motion.tween then pcall(function() motion.tween:Cancel() end) end
+		increment("pickupTweenAborts")
+		debugEvent("MOVE", "pickup_tween_abort", { reason = reason,
+			elapsedMs = math.floor((os.clock() - started) * 1000),
+			position = tostring(root.Position) }, "WARN")
+		if emergency and alive and player.Character == character and infectedNear then
+			-- Emergency retreat is allowed, but never retreat to a threatened start.
+			if not infectedNear(from, PICKUP_TRAVEL.SafetyRadius) then
+				teleportCharacter(CFrame.new(from), function() return alive end, "pickup_escape", "emergency")
+			end
+		end
+		return false, reason
+	end
+	for index, point in ipairs(points) do
+		if not keepGoing() or motion.cancelled or activeMotion ~= motion then return stop("interrupted", false) end
+		local stepDistance = (point - root.Position).Magnitude
+		if stepDistance > 0.2 then
+			motion.phase = "segment_" .. index
+			local duration = math.max(0.035, stepDistance / PICKUP_TRAVEL.Speed)
+			local created, tween = pcall(function()
+				return TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear),
+					{ CFrame = CFrame.new(point) })
+			end)
+			if not created then
+				debugEvent("MOVE", "pickup_tween_create_failed", { error = tostring(tween) }, "ERROR")
+				return stop("tween_create_failed", false)
+			end
+			motion.tween = tween
+			local played, playError = pcall(function() tween:Play() end)
+			if not played then
+				debugEvent("MOVE", "pickup_tween_play_failed", { error = tostring(playError) }, "ERROR")
+				return stop("tween_play_failed", false)
+			end
+			local checkAt = 0
+			local deadline = os.clock() + duration + 0.4
+			while tween.PlaybackState == Enum.PlaybackState.Playing do
+				RunService.Heartbeat:Wait()
+				if motion.cancelled or activeMotion ~= motion or player.Character ~= character then
+					return stop("interrupted", false)
+				end
+				local now = os.clock()
+				if now > deadline then return stop("tween_stalled", false) end
+				if now >= checkAt then
+					checkAt = now + PICKUP_TRAVEL.CheckInterval
+					local live = pickupThreats and pickupThreats() or {}
+					if segmentThreat(root.Position, point, live, PICKUP_TRAVEL.SafetyRadius) then
+						return stop("enemy_entered_path", true)
+					end
+				end
+				if not keepGoing() then return stop("interrupted", false) end
+			end
+			if (root.Position - point).Magnitude > PICKUP_TRAVEL.ArriveTolerance then
+				return stop("arrival_drift", false)
+			end
+			traveled += stepDistance
+		end
+	end
+	if activeMotion == motion then activeMotion = nil end
+	motion.tween = nil
+	increment("pickupTweens")
+	increment("pickupTweenDistance", math.floor(traveled))
+	local ms = math.floor((os.clock() - started) * 1000)
+	increment("pickupTravelMs", ms)
+	debugEvent("MOVE", "pickup_tween_arrived", { mode = routeMode, ms = ms,
+		distance = string.format("%.1f", traveled) })
+	return true, routeMode
 end
 
 local function track(connection)
@@ -608,10 +807,10 @@ end
 -- Pickup configuration and proximity prompts
 local FARM = {
 	-- Give the character and server time to recognize a teleport before triggering pickups.
-	Height = 3, Settle = 0.4, Dwell = 2.0,
-	Revisit = 5, FailedRetry = 1.0, Empty = 0.18,
-	Poll = 0.08, IdleReturn = 1.5, HeldLimit = 3,
-	SpamRate = 16, BetweenPickups = 0.25, InfectedClear = 15,
+	Height = 3, Settle = 0.1, Dwell = 1.25,
+	Revisit = 5, FailedRetry = 0.65, Empty = 0.12,
+	Poll = 0.04, IdleReturn = 0.55, HeldLimit = 3,
+	SpamRate = 16, BetweenPickups = 0.035, InfectedClear = 15,
 }
 
 local PROMPT_HOLDERS = { "Prompt", "PromptPart" }
@@ -772,27 +971,47 @@ end
 local function spamPrompt(prompt, target, keepGoing, confirmPickup, initialHeld, initialParent)
 	local deadline = os.clock() + FARM.Dwell
 	local attempts = 0
+	local holding, fallbackStarted, spamActive = false, false, true
+	local beganAt = os.clock()
+	local function finish(success, reason, count)
+		spamActive = false
+		return success, reason, count
+	end
+	local function beginFallbackHold()
+		if holding or fallbackStarted or not hasFirePrompt or not prompt.Enabled then return end
+		holding, fallbackStarted = true, true
+		task.spawn(function()
+			local began = pcall(function() prompt:InputHoldBegin() end)
+			if began then
+				local untilTime = os.clock() + math.max(0, prompt.HoldDuration) + 0.03
+				while os.clock() < untilTime and spamActive and keepGoing() do task.wait(0.04) end
+				pcall(function() prompt:InputHoldEnd() end)
+			end
+			holding = false
+		end)
+	end
 	local function interruption()
 		if confirmPickup and not prompt.Enabled then
-			task.wait(0.35) -- permit the inventory attribute to replicate
+			task.wait(0.14) -- brief replication grace period; do not linger near an enemy
 			local collected, reason = pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
-			if collected then return true, reason, attempts end
-			return false, "prompt_disabled_without_inventory", attempts
+			if collected then return finish(true, reason, attempts) end
+			return finish(false, "prompt_disabled_without_inventory", attempts)
 		end
-		return false, "interrupted", attempts
+		return finish(false, "interrupted", attempts)
 	end
 
 	while os.clock() < deadline do
 		local confirmed, reason = pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
-		if confirmed then return true, reason, attempts end
+		if confirmed then return finish(true, reason, attempts) end
 		if not keepGoing() then return interruption() end
 
 		attempts += 1
+		if hasFirePrompt and attempts >= 8 and not holding and os.clock() - beganAt >= 0.5 then
+			beginFallbackHold()
+		end
 		local started = os.clock()
-		-- Keep firing at full speed. Periodically try a real input hold as a
-		-- fallback if an executor reports success without collecting the item.
-		local forceHold = hasFirePrompt and attempts % 8 == 0
-		local fired = triggerPrompt(prompt, forceHold)
+		-- Keep the requested 16/s fast-fire loop; never block it on a long hold.
+		local fired = triggerPrompt(prompt, false)
 		if not fired then
 			debugThrottled("pickup_activation_" .. tostring(target), 2, "PICKUP",
 				"activation_failed", { target = target.Name, attempt = attempts }, "WARN")
@@ -801,14 +1020,14 @@ local function spamPrompt(prompt, target, keepGoing, confirmPickup, initialHeld,
 		local nextAttempt = math.min(deadline, started + 1 / FARM.SpamRate)
 		while os.clock() < nextAttempt do
 			local done, why = pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
-			if done then return true, why, attempts end
+			if done then return finish(true, why, attempts) end
 			if not keepGoing() then return interruption() end
 			task.wait(math.min(FARM.Poll, math.max(0.01, nextAttempt - os.clock())))
 		end
 	end
 	local collected, reason = pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
-	if collected then return true, reason, attempts end
-	return false, "confirmation_timeout", attempts
+	if collected then return finish(true, reason, attempts) end
+	return finish(false, "confirmation_timeout", attempts)
 end
 
 -- Cached shallow traversal. Watch only root children and one-level nested children,
@@ -962,19 +1181,27 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 							local initialHeld, initialParent = heldCount(), target.Parent
 							local ok, confirmed, reason, attempts = pcall(function()
 								if not allowed() then return false, "not_allowed", 0 end
-								local function stillPicking()
+								local function stillPicking(traveling)
 									return allowed() and pickupCoordinator.owner == farm
 										and part:IsDescendantOf(workspace) and prompt.Enabled
+										and (traveling or not infectedNear(root.Position, FARM.InfectedClear))
 								end
 								local promptPosition = getPromptPosition(prompt, part)
 								local approachHeight = math.clamp(prompt.MaxActivationDistance - 1, 0.25, FARM.Height)
 								local destination = CFrame.new(promptPosition + Vector3.new(0, approachHeight, 0))
-								if not teleportCharacter(destination,
-									function() return stillPicking() and not infectedNear(promptPosition, FARM.InfectedClear) end, "pickup") then
-									return false, "teleport_failed", 0
+								local arrived, travelReason = tweenPickup(destination, function()
+									return stillPicking(true) and not infectedNear(promptPosition, FARM.InfectedClear)
+								end, target)
+								if not arrived then
+									if isBlocked and isBlocked() then return false, "preempted_by_machine", 0 end
+									return false, "tween_" .. tostring(travelReason), 0
 								end
-								-- The old 0.02-second pause was often too short for prompts to register.
+								-- A short settle lets prompts replicate without leaving us exposed unnecessarily.
 								task.wait(FARM.Settle)
+								if isBlocked and isBlocked() then return false, "preempted_by_machine", 0 end
+								if infectedNear(root.Position, FARM.InfectedClear) then
+									return false, "enemy_after_arrival", 0
+								end
 								local actualRange = (root.Position - promptPosition).Magnitude
 								if actualRange > prompt.MaxActivationDistance then
 									debugEvent("PICKUP", "outside_prompt_range", {
@@ -984,31 +1211,54 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 								end
 								local observed, why = pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
 								if observed then return true, why, 0 end
-								if not stillPicking() then return false, "interrupted_after_arrival", 0 end
-								return spamPrompt(prompt, target, stillPicking, confirmPickup, initialHeld, initialParent)
+								if not stillPicking() then
+									return false, (isBlocked and isBlocked()) and "preempted_by_machine" or "interrupted_after_arrival", 0
+								end
+								local success, why, fired = spamPrompt(prompt, target, stillPicking, confirmPickup, initialHeld, initialParent)
+								if not success and isBlocked and isBlocked() then return false, "preempted_by_machine", fired end
+								return success, why, fired
 							end)
-							-- Hold the coordinator during the cooldown; avoid immediately racing
-							-- a second pickup worker to the next object.
-							if active() then task.wait(FARM.BetweenPickups) end
+							-- Leave threatened pickup spots immediately, if the saved home is safe.
+							if active() and not (isBlocked and isBlocked()) and root.Parent
+								and infectedNear(root.Position, FARM.InfectedClear) then
+								local home = pickupCoordinator.home
+								if home and not infectedNear(home.Position, PICKUP_TRAVEL.SafetyRadius) then
+									debugEvent("DANGER", "pickup_escape", { pickup = target.Name, position = tostring(root.Position) }, "WARN")
+									teleportCharacter(home, function() return active() end, "pickup_escape", "emergency")
+								end
+							end
+							-- Release the claim first, then a tiny cooldown; no 250ms stationary wait.
 							releasePickup(farm)
+							if active() then task.wait(FARM.BetweenPickups) end
 							if not ok then
 								debugLog("ERROR pickup " .. tostring(target.Name) .. ": " .. tostring(confirmed))
 								warn("[TU - Rava Hub] pickup error: " .. tostring(confirmed))
 								confirmed, reason, attempts = false, "lua_error", 0
 							end
+							if reason == "preempted_by_machine" then
+								increment("pickupPreemptions")
+								debugEvent("PICKUP", "preempted_by_machine", {
+									folder = folder.Name, name = target.Name,
+									elapsedMs = math.floor((os.clock() - beganAt) * 1000 + 0.5),
+								}, "INFO")
+							end
 							if confirmed then
 								increment("pickupConfirmed")
 								recent[target] = os.clock()
+							elseif reason == "preempted_by_machine" then
+								-- Scheduling preemption is not a failed interaction. Retry after
+								-- the machine releases control, without distorting failure metrics.
+								recent[target] = os.clock() - FARM.Revisit + 0.15
 							else
 								increment("pickupUnconfirmed")
 								recent[target] = os.clock() - FARM.Revisit + FARM.FailedRetry
 							end
 							debugEvent("PICKUP", "result", { folder = folder.Name, name = target.Name,
-								confirmed = confirmed, reason = reason or "unknown", activations = attempts or 0,
+								movement = "tween", confirmed = confirmed, reason = reason or "unknown", activations = attempts or 0,
 								maxDistance = prompt.MaxActivationDistance, holdDuration = prompt.HoldDuration,
 								requiresSight = prompt.RequiresLineOfSight,
 								duration = string.format("%.2f", os.clock() - beganAt), held = heldCount() },
-								confirmed and "INFO" or "WARN")
+								(confirmed or reason == "preempted_by_machine") and "INFO" or "WARN")
 						end
 					end
 					if not allowed() then break end
@@ -1017,7 +1267,9 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 			farm.hasWork = didWork
 			farm.working = false
 			if not didWork then
-				returnPickupHome(false, isBlocked)
+				local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+				local unsafeHere = root and infectedNear(root.Position, FARM.InfectedClear)
+				returnPickupHome(unsafeHere == true, isBlocked)
 				task.wait(FARM.Empty)
 			end
 		end
@@ -1208,7 +1460,11 @@ local machinesDone
 local function collectOpen() return not OPTIONS.CollectLast or (machinesDone ~= nil and machinesDone()) end
 
 local function machineBusy()
-	return machineFarm ~= nil and (machineFarm.placed == true or machineFarm.moving == true)
+	-- The previous check only covered placed/moving. During a target change the
+	-- machine was temporarily neither, letting pickups steal the character.
+	-- Claim priority as soon as an objective is selected, including handoffs.
+	return machineFarm ~= nil and machineFarm.enabled == true and
+		(machineFarm.target ~= nil or machineFarm.placed == true or machineFarm.moving == true)
 end
 
 local capsuleFarm = newAutofarm("Capsules", collectOpen, nil, false, machineBusy)
@@ -1301,6 +1557,19 @@ infectedNear = function(position, radius)
 		end
 	end
 	return false
+end
+
+pickupThreats = function()
+	local folder = workspace:FindFirstChild("MonsterFolder")
+	local list = {}
+	if not folder then return list end
+	for _, enemy in ipairs(getTargets(folder)) do
+		if not isInsideMachineExcludedFolder(enemy) and not MACHINE.Allowed[enemy.Name] then
+			local pos = targetPosition(enemy)
+			if pos then table.insert(list, { name = enemy.Name, pos = pos }) end
+		end
+	end
+	return list
 end
 
 local function twistedNear(position)
@@ -2302,7 +2571,9 @@ local function debugReport()
 		"Exported=" .. os.date("%Y-%m-%d %H:%M:%S"),
 		string.format("SessionSeconds=%.2f PlaceId=%s JobId=%s",
 			os.clock() - debugStart, tostring(game.PlaceId), tostring(game.JobId)),
-		"Mode=teleport-only",
+		"Mode=pickup-tween/objective-teleport",
+		"Pickup route policy=clear straight corridors or verified enemy detour; block unsafe or obstructed routes",
+		"Movement priority=active machine objectives preempt pickup travel; prompt spam stays at 16/s",
 		"Hit attribution=nearest infected only (not confirmed attacker)",
 		"Handoff timing=objective completion/unavailable to first prompt dispatch at next target",
 		string.format("Client touch=%s promptFire=%s virtualInput=%s clipboard=%s writefile=%s",
@@ -2316,6 +2587,11 @@ local function debugReport()
 			debugStats.handoffs > 0 and debugStats.handoffTotalMs / debugStats.handoffs or 0,
 			debugStats.handoffMaxMs, debugStats.handoffLastMs, debugStats.slowMachineScans,
 			debugStats.targetCacheRefreshes, debugStats.targetCacheHits),
+		"PickupMovement: " .. fieldString(PICKUP_TRAVEL),
+		string.format("PickupTween: arrived=%d aborted=%d rerouted=%d rejected=%d totalDistance=%d avgTravelMs=%.1f",
+			debugStats.pickupTweens, debugStats.pickupTweenAborts, debugStats.pickupTweenDetours,
+			debugStats.pickupTweenUnsafe, debugStats.pickupTweenDistance,
+			debugStats.pickupTweens > 0 and debugStats.pickupTravelMs / debugStats.pickupTweens or 0),
 		"Options: " .. fieldString(OPTIONS),
 		"FARM: " .. fieldString(FARM),
 		"MACHINE: " .. fieldString({ Range = MACHINE.Range, StallTimeout = MACHINE.StallTimeout,
@@ -2363,9 +2639,9 @@ end))
 supervise("diagnostic UI", function() return alive end, function()
 	while alive do
 		local working = (machineFarm.enabled and "MACHINE") or (pickupBusy() and "PICKUPS") or "IDLE"
-		headerStatus.Text = working .. "  •  TP MODE"
+		headerStatus.Text = working .. "  •  HYBRID"
 		headerStatus.TextColor3 = working == "IDLE" and UI.muted or UI.good
-		footerLabel.Text = string.format("%s   •   %d teleports   •   %d events", BUILD, debugStats.teleports, debugIndex)
+		footerLabel.Text = string.format("%s   •   %d pickup tweens   •   %d objective TPs", BUILD, debugStats.pickupTweens, debugStats.teleports)
 		if activeTab == "Diagnostics" and main.Visible then
 			stateLabel.Text = "Target: " .. debugStatus.currentTarget .. "  |  Last handoff: " .. tostring(debugStats.handoffLastMs) .. "ms"
 			statsLabel.Text = string.format("Hits %d  |  Damage %.1f  |  Handoffs %d (avg %.0fms)\nTeleports %d  |  Pickups %d/%d  |  ESP %d active\nMachines %d done  |  Stalls %d  |  Errors %d",
@@ -2380,7 +2656,10 @@ supervise("diagnostic UI", function() return alive end, function()
 		task.wait(0.7)
 	end
 end)
-debugEvent("SYSTEM", "initialized", { build = BUILD, place = game.PlaceId, mode = "teleport", pickupSettle = FARM.Settle, pickupDwell = FARM.Dwell, pickupRate = FARM.SpamRate, itemWaitMax = MACHINE.ItemWaitMax })
+debugEvent("SYSTEM", "initialized", { build = BUILD, place = game.PlaceId,
+	mode = "tween_pickups_teleport_objectives", pickupSpeed = PICKUP_TRAVEL.Speed,
+	enemyClearance = PICKUP_TRAVEL.SafetyRadius, pickupSettle = FARM.Settle,
+	pickupDwell = FARM.Dwell, pickupRate = FARM.SpamRate, itemWaitMax = MACHINE.ItemWaitMax })
 -- World structure watcher reports renamed/missing objective folders without log spam.
 task.spawn(function()
 	local previous = {}
