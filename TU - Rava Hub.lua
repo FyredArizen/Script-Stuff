@@ -22,6 +22,51 @@ sweepHighlights()
 local connections = {}
 local cleanups = {}
 
+-- Bind the unload action as soon as the window exists, NOT after every
+-- subsystem has initialized. A later startup error must not strand the GUI.
+local UNLOAD = { gui = nil, handler = nil, active = false, exporter = nil,
+	restoreLOS = function() end }
+function UNLOAD.force(source)
+	if UNLOAD.active then return end
+	UNLOAD.active = true
+	alive = false -- First: all workers see the cancellation immediately.
+	_G.TURavaHubUnload = nil
+	if UNLOAD.gui then
+		pcall(function() UNLOAD.gui.Enabled = false end)
+		pcall(function() UNLOAD.gui:Destroy() end)
+	end
+	for _, connection in ipairs(connections) do
+		pcall(function() connection:Disconnect() end)
+	end
+	table.clear(connections)
+	-- An individual slow or broken cleanup must not block the unload button.
+	for _, cleanup in ipairs(cleanups) do
+		task.spawn(function()
+			local ok, err = pcall(cleanup)
+			if not ok then warn("[TU - Rava Hub] cleanup error: " .. tostring(err)) end
+		end)
+	end
+	table.clear(cleanups)
+	task.spawn(function()
+		pcall(UNLOAD.restoreLOS)
+		task.spawn(function()
+			pcall(function()
+				if UNLOAD.exporter then UNLOAD.exporter() end
+			end)
+		end)
+		pcall(sweepHighlights)
+	end)
+end
+function UNLOAD.request(source)
+	if UNLOAD.active then return end
+	if UNLOAD.handler then
+		local ok, err = pcall(UNLOAD.handler, source or "requested")
+		if ok then return end
+		warn("[TU - Rava Hub] unload handler failed; forcing shutdown: " .. tostring(err))
+	end
+	UNLOAD.force(source or "fallback")
+end
+
 local OPTIONS = {
 	AutoHide = true,  AutoElevator = true,
 	Fuseboxes = true,  ItemsFirst = true,
@@ -29,7 +74,7 @@ local OPTIONS = {
 }
 
 -- Diagnostic log: capped circular buffer, timestamps, categories, and counters.
-local BUILD = "2.5.7 Ability HUD Zero / Organized UI"
+local BUILD = "2.5.9 Ability F After Objective"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -46,10 +91,8 @@ local debugStats = {
 	chases = 0, workerErrors = 0, machineCompletions = 0,
 	machinePlacements = 0, machineDangers = 0, fuseAttempts = 0,
 	itemUseAttempts = 0, itemUseFailures = 0, itemUseObserved = 0, itemUseUnverified = 0,
-	abilityDeferredMachine = 0, abilityResumedOffMachine = 0,
-	abilityMachineInterrupts = 0, abilityCooldownTransitions = 0, abilityCooldownUnknown = 0,
-	abilityCooldownRearms = 0, abilityCooldownAwait = 0,
-	abilityAttempts = 0, abilityRemoteFailures = 0, abilityRejected = 0, abilityDispatched = 0,
+	abilityCompletionTriggers = 0, abilityInputFailures = 0, abilityInputDeferred = 0,
+	abilityAttempts = 0, abilityDispatched = 0,
 	abilityWaffles = 0, abilityWaffleFailures = 0, skillcheckExitAttempts = 0, skillcheckExitFailures = 0,
 	deathExports = 0, deathExportFailures = 0,
 	skillcheckLeaveDeferred = 0, skillcheckMoveBlocked = 0,
@@ -510,6 +553,12 @@ local screenGui = new("ScreenGui", {
 	Name = "TURavaHubGUI", ResetOnSpawn = false, DisplayOrder = 2147483647,
 	ZIndexBehavior = Enum.ZIndexBehavior.Sibling, IgnoreGuiInset = false,
 }, playerGui)
+UNLOAD.gui = screenGui
+-- Also supports the explicit console command _G.TURavaHubUnload().
+_G.TURavaHubUnload = UNLOAD.request
+track(screenGui.Destroying:Connect(function()
+	if not UNLOAD.active then UNLOAD.request("gui_destroyed") end
+end))
 local main = new("Frame", {
 	Name = "HubWindow", Size = UDim2.fromOffset(650, 445), AnchorPoint = Vector2.new(0.5, 0.5),
 	Position = UDim2.fromScale(0.5, 0.5), BackgroundColor3 = UI.background,
@@ -537,7 +586,7 @@ local top = new("Frame", { Size = UDim2.new(1, 0, 0, 64), BackgroundColor3 = UI.
 new("Frame", { Size = UDim2.new(1, 0, 0, 2), Position = UDim2.new(0, 0, 1, -2),
 	BackgroundColor3 = UI.accent, BorderSizePixel = 0 }, top)
 uiText(top, "RAVA HUB", 21, true, UI.text, { Position = UDim2.fromOffset(22, 10), Size = UDim2.fromOffset(166, 27) })
-uiText(top, "TU / v2.5.6 / FINAL PICKUP SWEEP", 10, true, UI.muted,
+uiText(top, "TU / v2.5.8 / RELIABLE UNLOAD", 10, true, UI.muted,
 	{ Position = UDim2.fromOffset(23, 37), Size = UDim2.fromOffset(190, 15) })
 local headerStatus = uiText(top, "SYSTEM READY", 12, true, UI.good,
 	{ Position = UDim2.fromOffset(346, 20), Size = UDim2.fromOffset(192, 24), TextXAlignment = Enum.TextXAlignment.Right })
@@ -549,6 +598,11 @@ local unloadButton = new("TextButton", { Text = "×", Size = UDim2.fromOffset(32
 	Position = UDim2.new(1, -45, 0, 15), BackgroundColor3 = Color3.fromRGB(92, 47, 62),
 	TextColor3 = UI.text, TextSize = 24, Font = Enum.Font.GothamBold, BorderSizePixel = 0 }, top)
 corner(unloadButton, 8)
+-- Activated works on mouse, touch and gamepad. Connect it NOW, even if a later
+-- feature errors during initialization.
+track(unloadButton.Activated:Connect(function()
+	UNLOAD.request("header_button")
+end))
 
 local sidebar = new("Frame", { Position = UDim2.fromOffset(0, 64), Size = UDim2.new(0, 158, 1, -94),
 	BackgroundColor3 = UI.surface, BorderSizePixel = 0 }, main)
@@ -559,7 +613,7 @@ local mainArea = new("Frame", { Position = UDim2.fromOffset(158, 64),
 	Size = UDim2.new(1, -158, 1, -94), BackgroundTransparency = 1 }, main)
 local footer = new("Frame", { Position = UDim2.new(0, 0, 1, -30), Size = UDim2.new(1, 0, 0, 30),
 	BackgroundColor3 = UI.surface, BorderSizePixel = 0 }, main)
-local footerLabel = uiText(footer, "v2.5.6   •   FINAL PICKUP CHECK   •   SAFE FARM", 11, false, UI.muted,
+local footerLabel = uiText(footer, "v2.5.8   •   UNLOAD FIX   •   SAFE FARM", 11, false, UI.muted,
 	{ Position = UDim2.fromOffset(17, 5), Size = UDim2.new(1, -30, 0, 21) })
 local pages, menuButtons, activeTab = {}, {}, "Autofarm"
 local toggleRefreshers = {}
@@ -711,7 +765,16 @@ do
 			or input.UserInputType == Enum.UserInputType.Touch
 	end
 	track(top.InputBegan:Connect(function(input)
-		if isPress(input) then dragging, origin, start = true, input.Position, main.Position end
+		-- Do not begin dragging when pressing the minimize or unload buttons.
+		local function onControl(control)
+			local pos, size = control.AbsolutePosition, control.AbsoluteSize
+			local p = input.Position
+			return p.X >= pos.X and p.X <= pos.X + size.X
+				and p.Y >= pos.Y and p.Y <= pos.Y + size.Y
+		end
+		if isPress(input) and not onControl(unloadButton) and not onControl(minimizeButton) then
+			dragging, origin, start = true, input.Position, main.Position
+		end
 	end))
 	track(UserInputService.InputChanged:Connect(function(input)
 		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
@@ -958,6 +1021,13 @@ local FARM = {
 
 local PROMPT_HOLDERS = { "Prompt", "PromptPart" }
 local originalPromptSight = setmetatable({}, { __mode = "k" })
+UNLOAD.restoreLOS = function()
+	for prompt, wasRequired in pairs(originalPromptSight) do
+		if prompt.Parent then
+			pcall(function() prompt.RequiresLineOfSight = wasRequired end)
+		end
+	end
+end
 local function noPromptSight(prompt)
 	if prompt and prompt:IsA("ProximityPrompt") then
 		if originalPromptSight[prompt] == nil then
@@ -1666,218 +1736,132 @@ local function useForMachine(machine)
 	return false
 end
 
--- The HUD CoolDown.Time label is the source of truth for ability readiness.
--- Do not guess an 8-second cooldown or spam a remote while its state is unknown.
-local ABILITY = { Poll = 0.12, ErrorRetry = 2, RejectedRetry = 1.2,
-	ExitWait = 0.45, ExitSettle = 0.20, NoTransitionRetry = 2.5 }
-local abilityStatusLabel -- Created under Autofarm after the automation functions.
-local function readAbilityCooldown()
-	-- Roblox's "Aa" Explorer icon is commonly a TextLabel. Read the *Text*
-	-- property of the exact Time object rather than its visibility or a guessed
-	-- timer. "0" (also "0.0", "00", "0s") means usable; positive means cooling.
-	local hud = playerGui:FindFirstChild("HUD")
-	local items = hud and hud:FindFirstChild("ItemsHolder")
-	local main = items and items:FindFirstChild("MainFrame")
-	local ability = main and main:FindFirstChild("Ability")
-	local button = ability and ability:FindFirstChild("Button")
-	local cooldown = button and button:FindFirstChild("CoolDown")
-	local time = cooldown and cooldown:FindFirstChild("Time")
-	if not time then return nil, "Time_not_found", "", nil end
-	local text
-	if time:IsA("TextLabel") or time:IsA("TextButton") or time:IsA("TextBox") then
-		text = time.Text
-	elseif time:IsA("StringValue") then
-		text = time.Value
-	else
-		return nil, "Time_unexpected_" .. time.ClassName, "", nil
-	end
-	text = tostring(text or "")
-	local trimmed = text:gsub("<[^>]->", ""):gsub("^%s+", ""):gsub("%s+$", "")
-	local lower = trimmed:lower()
-	local numeric = lower:match("^(%d+%.?%d*)%s*s?$")
-	local seconds = numeric and tonumber(numeric) or nil
-	if seconds == nil and lower:match("^%d+:%d%d:?%d?%d?$") then
-		seconds = 0
-		for part in lower:gmatch("%d+") do seconds = seconds * 60 + tonumber(part) end
-	end
-	if seconds ~= nil then
-		-- Deliberately IGNORE CoolDown.Visible. The on-screen text is the
-		-- specified source of truth even when a parent GUI is hidden.
-		return seconds == 0, "Time.Text:" .. time.ClassName, text, seconds
-	end
-	return nil, "Time_text_not_numeric:" .. time.ClassName, text, nil
-end
-
--- These are assigned when the machine subsystem is created farther down.
+-- Ability behavior: one F-key press per completed machine while Auto Use Ability
+-- is enabled. No cooldown HUD polling, ability RemoteFunction invocation, or
+-- machine interruption; sending a key is not evidence that the game used it.
+local ABILITY = { KeyHold = 0.075, InputWait = 0.30, WaffleDelay = 0.02 }
+local abilityStatusLabel -- Created in Autofarm > Automatic Actions.
+-- Assigned when the machine subsystem is created farther down.
 local machineFarm
 local machinesDone
 local leaveObjective
 local machineExitBlockedUntil = 0
-local abilityBusy = false
-local function abilityCanInterrupt()
-	if skillcheckProtected then
-		local protected, ui = skillcheckProtected()
-		if protected then return false, "skillcheck_" .. tostring(ui) end
-	end
-	if machineFarm and machineFarm.moving then return false, "machine_moving" end
-	if os.clock() < machineExitBlockedUntil then return false, "machine_exit_settling" end
-	return true, "available"
-end
 
-local autoAbility = { enabled = false, run = 0 }
+local autoAbility = { enabled = false }
 function autoAbility.enable()
 	if autoAbility.enabled then return end
 	autoAbility.enabled = true
-	autoAbility.run += 1
-	local token = autoAbility.run
-	debugEvent("ABILITY", "enabled", { cooldownSource = "PlayerGui.HUD.ItemsHolder.MainFrame.Ability.Button.CoolDown.Time" })
-	supervise("auto ability", function()
-		return alive and autoAbility.enabled and autoAbility.run == token
-	end, function()
-		local nextAttempt = 0
-		local waitForCooldown, cooldownObserved = false, false
-		local requestAt = 0
-		local lastState = ""
-		while alive and autoAbility.enabled and autoAbility.run == token do
-			local ready, source, label, seconds = readAbilityCooldown()
-			local signature = source .. ":" .. tostring(ready) .. ":" .. tostring(label)
-			if abilityStatusLabel then
-				abilityStatusLabel.Text = "Cooldown HUD: " .. (label ~= "" and label or "<missing>")
-					.. "  |  " .. (ready == nil and ("UNREADABLE (" .. source .. ")")
-						or (ready and "READY (0)" or "COOLING DOWN"))
-				abilityStatusLabel.TextColor3 = ready == true and UI.good
-					or (ready == nil and UI.bad or UI.muted)
-			end
-			if signature ~= lastState then
-				increment("abilityCooldownTransitions")
-				debugEvent("ABILITY", "cooldown_state", {
-					source = source, ready = tostring(ready), text = label,
-					seconds = tostring(seconds), waitingForCooldown = waitForCooldown,
-				})
-				lastState = signature
-			end
-			if ready == nil then
-				debugThrottled("ability_cooldown_unknown", 8, "ABILITY", "cooldown_unreadable", {
-					source = source, label = label,
-				}, "WARN")
-			elseif not ready then
-				if waitForCooldown then cooldownObserved = true end
-			elseif waitForCooldown and cooldownObserved then
-				waitForCooldown, cooldownObserved = false, false
-				increment("abilityCooldownRearms")
-				debugEvent("ABILITY", "cooldown_completed", { source = source, label = label })
-			elseif ready and waitForCooldown and not cooldownObserved
-				and os.clock() - requestAt >= ABILITY.NoTransitionRetry then
-				-- An InvokeServer() return value (especially nil) is NOT proof of
-				-- activation. If the HUD never leaves zero, allow another attempt.
-				-- This is not a cooldown guess: the label still explicitly says 0.
-				waitForCooldown = false
-				increment("abilityCooldownAwait")
-				debugEvent("ABILITY", "no_cooldown_started_retrying", {
-					elapsedMs = math.floor((os.clock() - requestAt) * 1000 + 0.5),
-					label = label, reason = "Time.Text remained zero",
-				}, "WARN")
-			end
-
-			local health = getHealth()
-			local humanoid = player.Character and player.Character:FindFirstChildWhichIsA("Humanoid")
-			local living = player.Character ~= nil and (health == nil or health > 0)
-				and (humanoid == nil or humanoid.Health > 0)
-			local mayInterrupt, blockReason = abilityCanInterrupt()
-			if ready and living and not waitForCooldown and os.clock() >= nextAttempt then
-				if not mayInterrupt then
-					debugThrottled("ability_wait_skillcheck", 3, "ABILITY", "waiting_to_interrupt", {
-						reason = blockReason, target = machineFarm and machineFarm.target and machineFarm.target.Name or "none",
-					}, "INFO")
-				else
-					abilityBusy = true  -- Pause machine farm before we send its leave remote.
-					local ok, err = pcall(function()
-						if machineFarm and machineFarm.enabled and machineFarm.placed then
-							increment("abilityMachineInterrupts")
-							debugEvent("ABILITY", "machine_interrupt_begin", {
-								target = machineFarm.target and machineFarm.target.Name or "none",
-							})
-							local left = leaveObjective and leaveObjective("ability_ready", false, ABILITY.ExitWait)
-							if not left then
-								nextAttempt = os.clock() + 0.7
-								debugEvent("ABILITY", "machine_exit_pending_or_failed", {
-									target = machineFarm.target and machineFarm.target.Name or "none",
-								}, "WARN")
-								return
-							end
-							local machinePrompt = machineFarm.target and getPrompt(machineFarm.target)
-							if machinePrompt then cancelMachinePromptHold(machinePrompt) end
-							machineFarm.placed = false
-							task.wait(ABILITY.ExitSettle)
-						end
-						if skillcheckProtected and skillcheckProtected() then
-							nextAttempt = os.clock() + 0.5
-							debugEvent("ABILITY", "cancelled_new_skillcheck", nil, "INFO")
-							return
-						end
-						if not alive or not autoAbility.enabled or autoAbility.run ~= token then return end
-						local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
-						local remote = remotes and remotes:FindFirstChild("Ability")
-						if not remote or not remote:IsA("RemoteFunction") then
-							nextAttempt = os.clock() + ABILITY.ErrorRetry
-							debugThrottled("ability_missing", 8, "ABILITY", "remote_unavailable", nil, "WARN")
-							return
-						end
-						increment("abilityAttempts")
-						local started = os.clock()
-						local dispatched, response = pcall(function() return remote:InvokeServer(nil) end)
-						local latency = math.floor((os.clock() - started) * 1000 + 0.5)
-						if not dispatched then
-							increment("abilityRemoteFailures")
-							nextAttempt = os.clock() + ABILITY.ErrorRetry
-							debugEvent("ABILITY", "invoke_failed", { error = tostring(response), latencyMs = latency }, "ERROR")
-						elseif response == false then
-							increment("abilityRejected")
-							nextAttempt = os.clock() + ABILITY.RejectedRetry
-							debugEvent("ABILITY", "remote_rejected", { latencyMs = latency, label = label }, "WARN")
-						else
-							increment("abilityDispatched")
-							waitForCooldown, cooldownObserved = true, false
-							requestAt = os.clock()
-							nextAttempt = requestAt + ABILITY.NoTransitionRetry
-							debugEvent("ABILITY", "used_waiting_for_cooldown", {
-								latencyMs = latency, label = label, source = source,
-								response = response == nil and "nil_unverified" or tostring(response),
-							})
-							if ITEM_OPTIONS.AutoTrashUse then
-								local waffleSlot, item, indexSource = findSlot({ Waffle = true })
-								if waffleSlot then
-									local waffleUsed = pressSlot(waffleSlot, "ability_waffle", item, indexSource)
-									increment(waffleUsed and "abilityWaffles" or "abilityWaffleFailures")
-									debugEvent("ABILITY", "waffle_after_ability", { slot = waffleSlot, dispatched = waffleUsed })
-								else
-									debugThrottled("ability_no_waffle", 6, "ITEM", "waffle_not_found", {
-										inventory = inventorySummary(),
-									}, "INFO")
-								end
-							end
-						end
-					end)
-					abilityBusy = false
-					if not ok then
-						increment("workerErrors")
-						nextAttempt = os.clock() + ABILITY.ErrorRetry
-						debugEvent("ABILITY", "worker_error", { error = tostring(err) }, "ERROR")
-					end
-				end
-			end
-			task.wait(ABILITY.Poll)
-		end
-	end)
+	if abilityStatusLabel then
+		abilityStatusLabel.Text = "After each completed machine: press F  |  ENABLED"
+		abilityStatusLabel.TextColor3 = UI.good
+	end
+	debugEvent("ABILITY", "enabled", { trigger = "machine_completion", input = "F", cooldownDetection = false })
 end
 function autoAbility.disable()
 	if not autoAbility.enabled then return end
 	autoAbility.enabled = false
-	autoAbility.run += 1
-	abilityBusy = false
+	if abilityStatusLabel then
+		abilityStatusLabel.Text = "After each completed machine: press F  |  DISABLED"
+		abilityStatusLabel.TextColor3 = UI.muted
+	end
 	debugEvent("ABILITY", "disabled")
 end
 table.insert(cleanups, autoAbility.disable)
+
+-- Called synchronously by machine completion handling, before the next
+-- objective is selected/teleported to. The skillcheck guard is checked again
+-- here in case a UI appeared between objective scanning and key dispatch.
+local function abilityAfterCompletion(machine)
+	if not alive or not autoAbility.enabled then return false, "disabled" end
+	local health = getHealth()
+	local humanoid = player.Character and player.Character:FindFirstChildWhichIsA("Humanoid")
+	if (health and health <= 0) or (humanoid and humanoid.Health <= 0) then
+		return false, "dead"
+	end
+	if skillcheckProtected then
+		local protected, ui = skillcheckProtected()
+		if protected then
+			increment("abilityInputDeferred")
+			debugEvent("ABILITY", "completion_f_deferred_skillcheck", {
+				machine = machine.Name, ui = tostring(ui),
+			}, "WARN")
+			return false, "skillcheck"
+		end
+	end
+	if UserInputService:GetFocusedTextBox() then
+		increment("abilityInputDeferred")
+		debugEvent("ABILITY", "completion_f_deferred_textbox", { machine = machine.Name }, "WARN")
+		return false, "textbox"
+	end
+	-- Do not overlap a slot keypress with the ability keypress.
+	local deadline = os.clock() + ABILITY.InputWait
+	while slotInputBusy and alive and os.clock() < deadline do task.wait(0.02) end
+	if slotInputBusy or not alive then
+		increment("abilityInputDeferred")
+		debugEvent("ABILITY", "completion_f_deferred_input_busy", { machine = machine.Name }, "WARN")
+		return false, "input_busy"
+	end
+
+	increment("abilityCompletionTriggers")
+	increment("abilityAttempts")
+	local driver, ok, err = "none", false, "unavailable"
+	local started = os.clock()
+	if typeof(keypress) == "function" and typeof(keyrelease) == "function" then
+		driver = "executor_keypress"
+		ok, err = pcall(function()
+			keypress(0x46) -- F
+			task.wait(ABILITY.KeyHold)
+			keyrelease(0x46)
+		end)
+		if not ok then pcall(keyrelease, 0x46) end
+	end
+	if not ok then
+		driver = "VirtualInputManager"
+		ok, err = pcall(function()
+			local vim = game:GetService("VirtualInputManager")
+			vim:SendKeyEvent(true, Enum.KeyCode.F, false, game)
+			task.wait(ABILITY.KeyHold)
+			vim:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+		end)
+		if not ok then
+			pcall(function()
+				game:GetService("VirtualInputManager"):SendKeyEvent(false, Enum.KeyCode.F, false, game)
+			end)
+		end
+	end
+	local durationMs = math.floor((os.clock() - started) * 1000 + 0.5)
+	if not ok then increment("abilityInputFailures") end
+	if ok then increment("abilityDispatched") end
+	debugEvent("ABILITY", ok and "completion_f_sent" or "completion_f_failed", {
+		machine = machine.Name, method = driver, durationMs = durationMs,
+		dispatched = ok, acceptedByGame = "unknown", error = ok and "none" or tostring(err),
+	}, ok and "INFO" or "ERROR")
+	if abilityStatusLabel then
+		abilityStatusLabel.Text = ok and ("Last F: " .. machine.Name .. " (input sent)")
+			or ("F input failed: " .. machine.Name)
+		abilityStatusLabel.TextColor3 = ok and UI.good or UI.bad
+	end
+	-- Preserve the existing Waffle pairing, but only when an F key event
+	-- was successfully sent and Auto Use Trash Items is enabled.
+	if ok and ITEM_OPTIONS.AutoTrashUse and alive then
+		task.wait(ABILITY.WaffleDelay)
+		if alive then
+			local waffleSlot, item, source = findSlot({ Waffle = true })
+			if waffleSlot then
+				local waffleSent = pressSlot(waffleSlot, "ability_waffle", item, source)
+				increment(waffleSent and "abilityWaffles" or "abilityWaffleFailures")
+				debugEvent("ABILITY", "waffle_after_f", {
+					machine = machine.Name, slot = waffleSlot, dispatched = waffleSent,
+				})
+			else
+				debugThrottled("ability_no_waffle", 6, "ITEM", "waffle_not_found", {
+					inventory = inventorySummary(),
+				}, "INFO")
+			end
+		end
+	end
+	return ok, ok and "sent" or "input_failed"
+end
 
 local autoUse = { enabled = false }
 local autoUseRun = 0
@@ -2027,10 +2011,10 @@ end
 do
 local farmBody = createSection("Autofarm", 2)
 local farmActions = createSubcategory(farmBody, "AUTOMATIC ACTIONS", 1,
-	"NEW: HUD cooldown ability, tool and Waffle use", true)
+	"F after each finished machine; tools and Waffle support", true)
 createToggleRow(farmActions, "Auto Use Ability", 1, autoAbility,
-	"Time.Text = 0 → exit machine → use ability → resume")
-abilityStatusLabel = uiText(farmActions, "Cooldown HUD: checking Time.Text...", 11, false, UI.muted, {
+	"Presses F once after a machine is completed; no cooldown detection")
+abilityStatusLabel = uiText(farmActions, "After each completed machine: press F", 11, false, UI.muted, {
 	LayoutOrder = 2, Size = UDim2.new(1, -20, 0, 25),
 	TextTruncate = Enum.TextTruncate.AtEnd,
 })
@@ -2644,6 +2628,20 @@ local function newMachineAutofarm()
 		local startupPickupsDone = false
 		local emergencyNextMove = false
 		local handoffStartedAt, handoffFrom, handoffReason = nil, nil, nil
+		local abilityTriggeredFor = setmetatable({}, { __mode = "k" })
+		local function noteMachineCompleted(machine)
+			-- Each completed objective generates at most one F attempt. If the
+			-- same machine is reset for a new round, it is rearmed below.
+			if abilityTriggeredFor[machine] then return end
+			abilityTriggeredFor[machine] = true
+			increment("machineCompletions")
+			debugEvent("MACHINE", "completed", {
+				name = machine.Name, progress = tostring(getProgress(machine)),
+			})
+			if autoAbility.enabled then
+				abilityAfterCompletion(machine)
+			end
+		end
 		local function beginHandoff(reason, from)
 			if handoffStartedAt then return end
 			handoffStartedAt = os.clock()
@@ -2666,13 +2664,6 @@ local function newMachineAutofarm()
 				debugThrottled("machine_skillcheck_hold", 2, "SKILLCHECK", "holding_objective", {
 					ui = checkType, target = farm.target and farm.target.Name or "none",
 					chasePending = chase.pending,
-				}, "INFO")
-				task.wait(MACHINE.Tick)
-				continue
-			end
-			if abilityBusy then
-				debugThrottled("machine_ability_pause", 2.5, "ABILITY", "machine_paused_for_ability", {
-					target = farm.target and farm.target.Name or "none",
 				}, "INFO")
 				task.wait(MACHINE.Tick)
 				continue
@@ -2722,6 +2713,8 @@ local function newMachineAutofarm()
 					lastMachineRescan = now
 					local scannedTarget, scannedStatus = pickMachine()
 					local currentPrompt = target and getPrompt(target)
+					-- Re-arm machines reused for later rounds once their progress is reset.
+					if target and not isComplete(target) then abilityTriggeredFor[target] = nil end
 					local currentUsable = target
 						and isLiveMachineObjective(target)
 						and not isComplete(target)
@@ -2732,10 +2725,7 @@ local function newMachineAutofarm()
 						if target and scannedTarget ~= target then
 							local completed = isComplete(target)
 							beginHandoff(completed and "completed" or "unavailable", target)
-							if completed then
-								increment("machineCompletions")
-								debugEvent("MACHINE", "completed", { name = target.Name, progress = tostring(getProgress(target)) })
-							end
+							if completed then noteMachineCompleted(target) end
 						end
 						target = scannedTarget
 						farm.placed = false
@@ -2752,8 +2742,7 @@ local function newMachineAutofarm()
 				if target and (not target:IsDescendantOf(workspace) or isComplete(target)) then
 					beginHandoff("completed_or_removed", target)
 					if isComplete(target) then
-						increment("machineCompletions")
-						debugEvent("MACHINE", "completed", { name = target.Name, progress = tostring(getProgress(target)) })
+						noteMachineCompleted(target)
 					else
 						debugEvent("MACHINE", "target_removed", { name = target.Name }, "WARN")
 					end
@@ -3268,7 +3257,7 @@ local machineCore = createSubcategory(machinesBody, "OBJECTIVE AUTOMATION", 1,
 	"Fast targeting, auto-interaction and skillchecks", true)
 createToggleRow(machineCore, "Machine Autofarm", 1, machineFarm)
 createToggleRow(machineCore, "Auto Skillcheck", 2, autoSkillcheck,
-	"Active skillchecks block escape and ability interrupts")
+	"Active skillchecks block escape and completion-triggered ability inputs")
 
 local machineSafety = createSubcategory(machinesBody, "SAFETY & THREATS", 2,
 	"React to nearby infected; postpone exits in skillchecks", true)
@@ -3322,6 +3311,16 @@ local copyButton = actionButton("COPY LOG", 101, 119, UI.surface2)
 local warningButton = actionButton("WARNINGS: OFF", 130, 229, UI.surface2)
 local outputStatus = uiText(diagnosticsTools, "Logs export manually, on unload, and automatically at 0 HP.", 11, false, UI.muted,
 	{ Size = UDim2.new(1, -9, 0, 22), LayoutOrder = 3 })
+UNLOAD.secondaryButton = new("TextButton", {
+	Name = "DiagnosticsUnloadHub", Text = "UNLOAD HUB", LayoutOrder = 4,
+	Size = UDim2.new(1, -9, 0, 34), BackgroundColor3 = Color3.fromRGB(92, 47, 62),
+	TextColor3 = UI.text, TextSize = 12, Font = Enum.Font.GothamBold,
+	BorderSizePixel = 0,
+}, diagnosticsTools)
+corner(UNLOAD.secondaryButton, 8)
+track(UNLOAD.secondaryButton.Activated:Connect(function()
+	UNLOAD.request("diagnostics_button")
+end))
 local logDisplay = new("TextBox", { Size = UDim2.new(1, -9, 0, 190),
 	BackgroundColor3 = Color3.fromRGB(11, 14, 21), BorderSizePixel = 0,
 	Text = "No events yet.", TextColor3 = Color3.fromRGB(194, 207, 232),
@@ -3353,9 +3352,8 @@ local function debugReport()
 		"Skillcheck protection=defer remote exits, teleports, pickup tweens, and danger/chase reroutes until UI disappears",
 		"TODO (later)=improve elevator and fusebox event / completion detection",
 		"Final sweep=always verifies enabled pickup sources (including InfectedSamples) before elevator; two checks and 20s maximum",
-		"Ability cooldown=Time.Text numeric zero is ready; positive is cooling; parent visibility ignored",
-		"Ability=HUD CoolDown.Time readiness; pauses active machines, leaves when no skillcheck, then uses ability and resumes farm",
-		"Ability=Ability:InvokeServer(nil); if HUD stays zero after invoke, retry after confirmation window",
+		"Ability=press F once per detected machine completion; no cooldown HUD polling or Ability remote",
+		"Ability input dispatched is not proof the game accepted it; active skillchecks block completion handling",
 		"Item hotkeys=executor keypress preferred, VIM fallback; input success does not prove item effect",
 		"AbilityConfig: " .. fieldString(ABILITY),
 		"Death export=automatic when observed health <= 0 (once per life)",
@@ -3399,23 +3397,31 @@ local function debugReport()
 end
 writeDebugFile = function(reason)
 	reason = reason or "manual"
+	local function showExportStatus(message)
+		pcall(function()
+			if outputStatus and outputStatus.Parent then outputStatus.Text = message end
+		end)
+	end
 	debugEvent("DEBUG", "export_requested", { reason = reason })
 	if typeof(writefile) ~= "function" then
 		debugEvent("DEBUG", "export_failed", { reason = "writefile unavailable" }, "WARN")
-		outputStatus.Text = "Export unavailable. Try Copy Log instead."
+		showExportStatus("Export unavailable. Try Copy Log instead.")
 		return false
 	end
 	local prefix = reason == "death" and "TU_Rava_Hub_DEATH_Debug_" or "TU_Rava_Hub_Debug_"
 	local filename = prefix .. os.time() .. "_" .. math.floor((os.clock() % 1) * 100000) .. ".txt"
 	local ok, err = pcall(writefile, filename, debugReport())
 	if ok then
-		outputStatus.Text = "Saved: " .. filename
+		showExportStatus("Saved: " .. filename)
 		debugEvent("DEBUG", "export_success", { filename = filename, reason = reason })
 		return true
 	end
-	outputStatus.Text = "Export failed: " .. tostring(err):sub(1, 70)
+	showExportStatus("Export failed: " .. tostring(err):sub(1, 70))
 	debugEvent("DEBUG", "export_failed", { error = err, reason = reason }, "ERROR")
 	return false
+end
+UNLOAD.exporter = function()
+	return writeDebugFile("unload")
 end
 track(exportButton.MouseButton1Click:Connect(function() writeDebugFile("manual") end))
 track(copyButton.MouseButton1Click:Connect(function()
@@ -3433,7 +3439,7 @@ supervise("diagnostic UI", function() return alive end, function()
 	while alive do
 		if main.Visible then for _, refresh in ipairs(toggleRefreshers) do refresh() end end
 		local working = (machineFarm.enabled and "MACHINE") or (pickupBusy() and "PICKUPS") or "IDLE"
-		headerStatus.Text = working .. "  •  v2.5.5"
+		headerStatus.Text = working .. "  •  v2.5.9"
 		headerStatus.TextColor3 = working == "IDLE" and UI.muted or UI.good
 		footerLabel.Text = string.format("%s   •   %d pickup tweens   •   %d objective TPs", BUILD, debugStats.pickupTweens, debugStats.teleports)
 		if activeTab == "Diagnostics" and main.Visible then
@@ -3452,7 +3458,7 @@ supervise("diagnostic UI", function() return alive end, function()
 	end
 end)
 debugEvent("SYSTEM", "initialized", { build = BUILD, place = game.PlaceId, ui = "collapsible_subcategories",
-	mode = "tween_pickups_teleport_objectives", lineOfSight = "disabled", abilityAuto = true, abilityCooldown = "HUD.CoolDown.Time.Text==0", sampleFarm = true, pickupSpeed = PICKUP_TRAVEL.Speed,
+	mode = "tween_pickups_teleport_objectives", lineOfSight = "disabled", abilityAuto = true, abilityTrigger = "F_after_machine_completion", sampleFarm = true, pickupSpeed = PICKUP_TRAVEL.Speed,
 	enemyClearance = PICKUP_TRAVEL.SafetyRadius, pickupSettle = FARM.Settle,
 	pickupDwell = FARM.Dwell, pickupRate = FARM.SpamRate, itemWaitMax = MACHINE.ItemWaitMax })
 -- World structure watcher reports renamed/missing objective folders without log spam.
@@ -3473,29 +3479,15 @@ task.spawn(function()
 	end
 end)
 
-local unloaded = false
-local function unload()
-	if unloaded then return end
-	unloaded = true
-	alive = false
+-- The buttons and global unload handler were bound immediately after GUI
+-- creation. This enhanced handler records the event, cancels travel and then
+-- uses the always-available shutdown path. Log export runs separately so a
+-- stalled file write cannot leave an active GUI and background workers behind.
+UNLOAD.handler = function(source)
+	debugEvent("SYSTEM", "unload", {
+		source = source or "requested",
+		elapsed = string.format("%.2f", os.clock() - debugStart),
+	})
 	cancelMotion()
-	_G.TURavaHubUnload = nil
-	for _, cleanup in ipairs(cleanups) do pcall(cleanup) end
-	table.clear(cleanups)
-	debugEvent("SYSTEM", "unload", { elapsed = string.format("%.2f", os.clock() - debugStart) })
-	writeDebugFile("unload")
-	-- Restore the original prompt LOS settings only when the hub is fully unloaded.
-	for prompt, wasRequired in pairs(originalPromptSight) do
-		if prompt.Parent then pcall(function() prompt.RequiresLineOfSight = wasRequired end) end
-	end
-	for _, connection in ipairs(connections) do connection:Disconnect() end
-	table.clear(connections)
-	screenGui:Destroy()
-	sweepHighlights()
-	pcall(function()
-		script.Enabled = false
-	end)
+	UNLOAD.force(source)
 end
-
-_G.TURavaHubUnload = unload
-track(unloadButton.MouseButton1Click:Connect(unload))
