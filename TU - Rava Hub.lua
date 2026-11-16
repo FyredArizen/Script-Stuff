@@ -66,7 +66,7 @@ local OPTIONS = {
 	MovementMode="Teleport",TweenDepth=-15,Disable3DRendering=false,
 }
 
-local BUILD = "TU Rava Hub v2.6.21"
+local BUILD = "TU Rava Hub v2.6.22"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -79,6 +79,7 @@ local debugStats = {
 	pickupRepeatBlocks=0,pickupCircuitTrips=0,pickupCircuitResets=0,
 	pickupFailedInteractions=0,pickupContactRetries=0,pickupContactRecovered=0,pickupContactFailed=0,
 	promptMovePulses=0,promptMoveVerified=0,promptMoveStationary=0,promptMoveBlocked=0,
+	promptWalkKeyInputs=0,promptWalkVerified=0,promptWalkRetries=0,
 	machineNearFinishHeld=0,machineChaseDeferred=0,finalSafeMoves=0,finalSafeFailures=0,
 	elevatorWatchStarts=0,elevatorFallbacks=0,elevatorFallbackSuccess=0,elevatorFallbackFailures=0,
 	elevatorHoldCorrections=0,elevatorDeaths=0,
@@ -246,7 +247,7 @@ local skillcheckProtected -- Initialized after GUI visibility helpers are define
 local infectedNear -- Assigned after monster-folder helpers are defined.
 local motionPauseUntil = 0
 local PICKUP_TRAVEL = {
-	Speed=300,SafetyRadius=24,ArriveTolerance=4.5,
+	Speed=300,ElevatorSpeed=900,SafetyRadius=24,ArriveTolerance=4.5,
 }
 local function cancelMotion(owner)
 	if UNLOAD.abortOrbit then UNLOAD.abortOrbit() end
@@ -273,7 +274,7 @@ local function cancelMotion(owner)
 end
 UNLOAD.cancelMovement = cancelMotion
 local function instantTeleport(destination, keepGoing, owner, mode)
-	local emergency = mode == "emergency"
+	local emergency = mode == "emergency" or mode == "elevator"
 	if not alive or not keepGoing() then return false end
 	local protected, checkType = false, "not_ready"
 	if skillcheckProtected then protected, checkType = skillcheckProtected() end
@@ -336,7 +337,7 @@ local function instantTeleport(destination, keepGoing, owner, mode)
 end
 
 local function tweenUnderMap(destination, keepGoing, owner, mode)
-	local emergency = mode == "emergency"
+	local emergency = mode == "emergency" or mode == "elevator"
 	if not alive or not keepGoing() then return false, "inactive" end
 	if skillcheckProtected and skillcheckProtected() then
 		increment("skillcheckMoveBlocked")
@@ -462,7 +463,8 @@ local function tweenUnderMap(destination, keepGoing, owner, mode)
 				owner == "pickup" and PICKUP_TRAVEL.SafetyRadius or 15) then
 				return abort("enemy_at_destination")
 			end
-			local duration = math.max(0.04, distance / PICKUP_TRAVEL.Speed)
+			local routeSpeed = mode == "elevator" and PICKUP_TRAVEL.ElevatorSpeed or PICKUP_TRAVEL.Speed
+			local duration = math.max(0.04, distance / routeSpeed)
 			local ok, tween = pcall(function()
 				return TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear),
 					{ CFrame=CFrame.new(point) * (destination - destination.Position) })
@@ -1218,21 +1220,41 @@ end
 
 do
 	local binding = "TU_RavaHub_PromptMove"
-	local nudgeRunning = false
-	local nudgeHumanoid = nil
+	local nudgeRunning, nudgeHumanoid, heldKey, moveToRoot = false, nil, nil, nil
+	local keyInputs = {
+		{ key=Enum.KeyCode.W,code=0x57 },{ key=Enum.KeyCode.S,code=0x53 },
+		{ key=Enum.KeyCode.A,code=0x41 },{ key=Enum.KeyCode.D,code=0x44 },
+	}
+	local function releaseKey()
+		local key = heldKey
+		heldKey = nil
+		if not key then return end
+		if key.driver == "executor" then
+			pcall(function() keyrelease(key.code) end)
+		elseif key.driver == "virtual_input" then
+			pcall(function()
+				game:GetService("VirtualInputManager"):SendKeyEvent(false,key.key,false,game)
+			end)
+		end
+	end
 	local function stopNudge()
 		pcall(function() RunService:UnbindFromRenderStep(binding) end)
+		releaseKey()
 		if nudgeHumanoid and nudgeHumanoid.Parent then
-			pcall(function() nudgeHumanoid:Move(Vector3.zero, false) end)
+			pcall(function() nudgeHumanoid:Move(Vector3.zero,false) end)
 		end
-		nudgeHumanoid = nil
-		nudgeRunning = false
+		if moveToRoot and moveToRoot.Parent and nudgeHumanoid and nudgeHumanoid.Parent then
+			pcall(function() nudgeHumanoid:MoveTo(moveToRoot.Position) end)
+		end
+		moveToRoot,nudgeHumanoid,nudgeRunning = nil,nil,false
 	end
-	table.insert(cleanups, stopNudge)
-	UNLOAD.refreshPromptContact = function(prompt, part, keepGoing, reason)
+	table.insert(cleanups,stopNudge)
+	-- A real movement key is important here: direct root CFrame updates do not
+	-- necessarily trigger the same in-game proximity/contact code as walking.
+	UNLOAD.refreshPromptContact = function(prompt,part,keepGoing,reason)
 		if nudgeRunning or not alive or not keepGoing() then
 			increment("promptMoveBlocked")
-			return false, "busy_or_inactive"
+			return false,"busy_or_inactive"
 		end
 		local character = player.Character
 		local root = character and character:FindFirstChild("HumanoidRootPart")
@@ -1241,141 +1263,192 @@ do
 			or not part or not prompt or not prompt.Enabled
 			or (skillcheckProtected and skillcheckProtected()) then
 			increment("promptMoveBlocked")
-			return false, "not_movable"
+			return false,"not_movable"
 		end
 		local start = root.Position
-		local promptPosition = getPromptPosition(prompt, part)
-		local flat = Vector3.new(promptPosition.X - start.X, 0, promptPosition.Z - start.Z)
-		local direction = flat.Magnitude > 1.2 and flat.Unit or Vector3.new(1, 0, 0)
-		local started = os.clock()
-		local function horizontalDistance()
-			local delta = root.Position - start
-			return Vector3.new(delta.X, 0, delta.Z).Magnitude
+		local target = getPromptPosition(prompt,part)
+		local flat = Vector3.new(target.X-start.X,0,target.Z-start.Z)
+		local facing = Vector3.new(root.CFrame.LookVector.X,0,root.CFrame.LookVector.Z)
+		local direction = flat.Magnitude > 0.3 and flat.Unit
+			or facing.Magnitude > 0.01 and facing.Unit or Vector3.new(1,0,0)
+		local initialHealth = humanoid.Health
+		local living = workspace:FindFirstChild("Alive")
+		local actor = living and living:FindFirstChild(player.Name)
+		local livingHealth = actor and actor:GetAttribute("Health")
+		local function distanceMoved()
+			local delta = root.Position-start
+			return Vector3.new(delta.X,0,delta.Z).Magnitude
 		end
 		local function safe()
-			local ok, allowed = pcall(function()
+			local ok,allowed = pcall(function()
 				return alive and player.Character == character and root.Parent ~= nil
-					and humanoid.Parent ~= nil and humanoid.Health > 0 and not root.Anchored
-					and prompt.Parent ~= nil and prompt.Enabled and keepGoing()
-					and not (skillcheckProtected and skillcheckProtected())
-					and not (infectedNear and (infectedNear(root.Position, 11)
-						or infectedNear(root.Position + direction * 0.55, 11)))
+					and humanoid.Parent ~= nil and humanoid.Health >= initialHealth
+					and not root.Anchored and prompt.Parent ~= nil and prompt.Enabled
+					and keepGoing() and not (skillcheckProtected and skillcheckProtected())
+					and (type(livingHealth) ~= "number" or (actor
+						and (actor:GetAttribute("Health") or -1) >= livingHealth))
+					and (root.Position-target).Magnitude <= prompt.MaxActivationDistance + 0.5
+					and not (infectedNear and (infectedNear(root.Position,11)
+						or infectedNear(root.Position + direction*0.45,11)))
 			end)
 			return ok and allowed
 		end
 		if not safe() then
 			increment("promptMoveBlocked")
-			return false, "unsafe_or_interrupted"
+			return false,"unsafe_or_outside_range"
 		end
-		nudgeRunning = true
-		nudgeHumanoid = humanoid
+		nudgeRunning,nudgeHumanoid = true,humanoid
 		increment("promptMovePulses")
-		local movedOnce = false
+		local method = "humanoid_move"
+		local directed = false
 		local function pulse()
 			if not nudgeRunning then return end
-			if safe() and horizontalDistance() < 0.55 then
-				movedOnce = true
-				humanoid:Move(direction, false)
-			else
-				humanoid:Move(Vector3.zero, false)
+			if safe() and distanceMoved() < 0.38 then
+				directed = true
+				pcall(function() humanoid:Move(direction,false) end)
 			end
 		end
 		local bound = pcall(function()
-			RunService:BindToRenderStep(binding, Enum.RenderPriority.Input.Value + 1, pulse)
+			RunService:BindToRenderStep(binding,Enum.RenderPriority.Input.Value+3,pulse)
 		end)
-		if not bound then
-			debugThrottled("prompt_nudge_bind", 5, "PROMPT", "move_bind_fallback", nil, "WARN")
+		-- Choose the key whose camera-relative movement most closely follows the
+		-- safe direction, instead of assuming W is always toward the objective.
+		local camera = workspace.CurrentCamera
+		local cf = camera and camera.CFrame or root.CFrame
+		local forward = Vector3.new(cf.LookVector.X,0,cf.LookVector.Z)
+		local right = Vector3.new(cf.RightVector.X,0,cf.RightVector.Z)
+		if forward.Magnitude > 0.01 and right.Magnitude > 0.01 then
+			local axes = { forward.Unit,-forward.Unit,-right.Unit,right.Unit }
+			local best,bestDot = 1,-math.huge
+			for i,axis in ipairs(axes) do
+				local dot = axis:Dot(direction)
+				if dot > bestDot then best,bestDot = i,dot end
+			end
+			local selected = keyInputs[best]
+			if not UserInputService:GetFocusedTextBox() then
+				if typeof(keypress) == "function" and typeof(keyrelease) == "function" then
+					local ok = pcall(function() keypress(selected.code) end)
+					if ok then
+						heldKey = { driver="executor",code=selected.code }
+						method = "executor_key_"..selected.key.Name
+					end
+				end
+				if not heldKey then
+					local ok = pcall(function()
+						game:GetService("VirtualInputManager"):SendKeyEvent(true,selected.key,false,game)
+					end)
+					if ok then
+						heldKey = { driver="virtual_input",key=selected.key }
+						method = "virtual_key_"..selected.key.Name
+					end
+				end
+			end
 		end
-		while alive and os.clock() - started < 0.05 and safe() do
-			if horizontalDistance() >= 0.38 then break end
-			pulse()
-			RunService.Heartbeat:Wait()
+		local driverUsed = heldKey ~= nil
+		if driverUsed then increment("promptWalkKeyInputs") end
+		local function runPulse(duration)
+			local untilTime = os.clock()+duration
+			while os.clock() < untilTime and safe() and distanceMoved() < 0.075 do
+				pulse()
+				RunService.Heartbeat:Wait()
+			end
 		end
-		local distance = root.Parent and horizontalDistance() or 0
-		local moved = root.Parent ~= nil and distance >= 0.075
+		-- Keep the requested 0.05s key pulse. Only extend contact recovery
+		-- when that brief pulse genuinely produced no physical movement.
+		runPulse(0.05)
+		releaseKey()
+		if distanceMoved() < 0.075 and safe() then
+			increment("promptWalkRetries")
+			-- MoveTo runs through the character controller; unlike root CFrame
+			-- stepping it can establish the game's walking-contact state.
+			pcall(function() RunService:UnbindFromRenderStep(binding) end)
+			pcall(function() humanoid:Move(Vector3.zero,false) end)
+			moveToRoot = root
+			method = driverUsed and "key_then_moveto" or "moveto_fallback"
+			local destination = root.Position + direction*0.38
+			local accepted = pcall(function() humanoid:MoveTo(destination) end)
+			if accepted then
+				local untilTime = os.clock()+0.22
+				while os.clock() < untilTime and safe() and distanceMoved() < 0.075 do
+					RunService.Heartbeat:Wait()
+				end
+			end
+		end
+		local traveled = root.Parent and distanceMoved() or 0
+		local moved = root.Parent ~= nil and traveled >= 0.075
 		stopNudge()
 		increment(moved and "promptMoveVerified" or "promptMoveStationary")
-		debugThrottled("prompt_move_" .. tostring(reason), moved and 3 or 1,
-			"PROMPT", moved and "movement_contact" or "movement_not_verified",
-			{ purpose=reason,distance=string.format("%.2f",distance),
-				method=bound and "humanoid_render" or "humanoid_heartbeat",
-				requested=movedOnce }, moved and "INFO" or "WARN")
-		return moved, moved and "moved" or "stationary"
+		if moved and driverUsed then increment("promptWalkVerified") end
+		debugThrottled("prompt_move_"..tostring(reason),moved and 3 or 1,
+			"PROMPT",moved and "movement_contact" or "movement_not_verified",
+			{ purpose=reason,distance=string.format("%.2f",traveled),
+				method=method,requested=directed,renderBound=bound },moved and "INFO" or "WARN")
+		return moved,moved and "moved" or "stationary"
 	end
 end
 
 do
-	function UNLOAD.seatPrompt(prompt, part, keepGoing, purpose)
+	function UNLOAD.seatPrompt(prompt,part,keepGoing,purpose)
 		increment("promptSeatAttempts")
 		local character = player.Character
 		local root = character and character:FindFirstChild("HumanoidRootPart")
 		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 		if not root or not humanoid or not part or not prompt or not prompt.Enabled
-			or not prompt:IsDescendantOf(workspace) or root.Anchored or humanoid.Health <= 0
-			or not alive or not keepGoing() or (skillcheckProtected and skillcheckProtected()) then
+			or root.Anchored or humanoid.Health <= 0 or not alive or not keepGoing()
+			or (skillcheckProtected and skillcheckProtected()) then
 			increment("promptSeatBlocked")
-			return false, "unavailable"
+			return false,"unavailable"
 		end
-		local position = getPromptPosition(prompt, part)
-		local offset = Vector3.new(position.X - root.Position.X, 0, position.Z - root.Position.Z)
-		local facing = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
-		local direction = offset.Magnitude > 0.55 and offset.Unit
-			or facing.Magnitude > 0.01 and facing.Unit or Vector3.new(1, 0, 0)
-		local shift = math.clamp(prompt.MaxActivationDistance * 0.06, 0.12, 0.24)
-		local destination = root.Position + direction * shift
-		if (destination - position).Magnitude > math.max(0.5, prompt.MaxActivationDistance - 0.25)
-			or (infectedNear and (infectedNear(root.Position, 13)
-				or infectedNear(destination, 13))) then
-			increment("promptSeatBlocked")
-			return false, "unsafe_or_out_of_range"
-		end
-		local start = root.Position
+		local position = getPromptPosition(prompt,part)
+		local flat = Vector3.new(position.X-root.Position.X,0,position.Z-root.Position.Z)
+		local facing = Vector3.new(root.CFrame.LookVector.X,0,root.CFrame.LookVector.Z)
+		local direction = flat.Magnitude > 0.24 and flat.Unit
+			or facing.Magnitude > 0.01 and facing.Unit or Vector3.new(1,0,0)
+		local shift = math.clamp(prompt.MaxActivationDistance*0.06,0.18,0.42)
+		local destination = root.Position + direction*shift
 		local healthBefore = humanoid.Health
-		local aliveFolder = workspace:FindFirstChild("Alive")
-		local actor = aliveFolder and aliveFolder:FindFirstChild(player.Name)
-		local lifeBefore = actor and actor:GetAttribute("Health")
-		local original = root.CFrame
-		local permitted = function()
-			return alive and player.Character == character and root.Parent ~= nil
+		local started = root.Position
+		local live = workspace:FindFirstChild("Alive")
+		local actor = live and live:FindFirstChild(player.Name)
+		local originalHP = actor and actor:GetAttribute("Health")
+		local function safe()
+			return alive and character == player.Character and root.Parent ~= nil
 				and humanoid.Health >= healthBefore and not root.Anchored
-				and (type(lifeBefore) ~= "number" or (actor and actor:GetAttribute("Health") or -1) >= lifeBefore)
 				and prompt.Parent ~= nil and prompt.Enabled and keepGoing()
+				and (type(originalHP) ~= "number" or (actor
+					and (actor:GetAttribute("Health") or -1) >= originalHP))
+				and (root.Position-position).Magnitude <= prompt.MaxActivationDistance+0.4
 				and not (skillcheckProtected and skillcheckProtected())
+				and not (infectedNear and (infectedNear(root.Position,13)
+					or infectedNear(destination,13)))
 		end
-		if not permitted() then
+		if not safe() or (destination-position).Magnitude > prompt.MaxActivationDistance-0.25 then
 			increment("promptSeatBlocked")
-			return false, "interrupted"
+			return false,"unsafe_or_out_of_range"
 		end
-		local success = pcall(function()
-			humanoid:Move(direction, false)
-			if OPTIONS.MovementMode == "Teleport" then
-				root.CFrame = original + direction * shift
-			else
-				local tween = TweenService:Create(root, TweenInfo.new(0.075, Enum.EasingStyle.Linear),
-					{ CFrame=original + direction * shift })
-				tween:Play()
-				local deadline = os.clock() + 0.12
-				while tween.PlaybackState == Enum.PlaybackState.Playing and os.clock() < deadline
-					and permitted() do RunService.Heartbeat:Wait() end
-				if tween.PlaybackState == Enum.PlaybackState.Playing then tween:Cancel() end
+		local ok = pcall(function() humanoid:MoveTo(destination) end)
+		if ok then
+			local untilTime = os.clock()+0.24
+			while os.clock() < untilTime and safe() do
+				local delta = root.Position-started
+				if Vector3.new(delta.X,0,delta.Z).Magnitude >= 0.085 then break end
+				RunService.Heartbeat:Wait()
 			end
-		end)
-		pcall(function() humanoid:Move(Vector3.zero, false) end)
-		if not success or not permitted() then
-			increment("promptSeatBlocked")
-			return false, "movement_failed"
 		end
-		RunService.Heartbeat:Wait()
-		local moved = (Vector3.new(root.Position.X, 0, root.Position.Z)
-			- Vector3.new(start.X, 0, start.Z)).Magnitude
-		local verified = moved >= 0.08 and (root.Position - position).Magnitude <= prompt.MaxActivationDistance
-		if verified then increment("promptSeatVerified") end
-		debugThrottled("prompt_seat_" .. tostring(purpose), 2, "PROMPT",
+		if character == player.Character and humanoid.Parent and root.Parent then
+			pcall(function() humanoid:MoveTo(root.Position) end)
+		end
+		local delta = root.Position-started
+		local traveled = Vector3.new(delta.X,0,delta.Z).Magnitude
+		local verified = ok and traveled >= 0.085
+		if verified then increment("promptSeatVerified")
+		else increment("promptSeatBlocked") end
+		debugThrottled("prompt_seat_"..tostring(purpose),2,"PROMPT",
 			verified and "seat_verified" or "seat_unverified",
 			{ purpose=purpose,mode=OPTIONS.MovementMode,
-				distance=string.format("%.2f",moved),prompt=prompt.Name },
+				distance=string.format("%.2f",traveled),method="humanoid_moveto" },
 			verified and "INFO" or "WARN")
-		return verified, verified and "moved" or "not_verified"
+		return verified,verified and "walked" or "not_verified"
 	end
 end
 
@@ -1415,13 +1488,12 @@ do
 		local actor = samples and samples:FindFirstChild(player.Name)
 		local originalHealth = actor and actor:GetAttribute("Health")
 		local originalHumanoidHealth = humanoid.Health
-		local originalRotation = root.CFrame - root.CFrame.Position
 		local startAngle = horizontal > 0.08 and math.atan2(offset.Z, offset.X)
 			or math.atan2(root.CFrame.LookVector.Z, root.CFrame.LookVector.X)
 		local startRadius = math.clamp(prompt.MaxActivationDistance * 0.22, 0.52, 1.15)
 		local endRadius = math.clamp(prompt.MaxActivationDistance * 0.10, 0.22, 0.52)
 		local period = math.clamp(tonumber(maxSeconds) or 0.85, 0.3, 1.15)
-		local began, lastInput, prevTime = os.clock(), -math.huge, os.clock()
+		local began, lastInput, lastGoal = os.clock(), -math.huge, -math.huge
 		local myEpoch = epoch
 		local fires, moved = 0, false
 		local movedDistance = 0
@@ -1459,36 +1531,32 @@ do
 					result = "enemy_nearby"
 					break
 				end
-				local delta = goal - current
-				local dt = math.clamp(now - prevTime, 0.008, 0.05)
-				prevTime = now
-				local step = delta * math.min(1, dt * 28)
-				if step.Magnitude > 0.22 then step = step.Unit * 0.22 end
-				local nextPosition = current + step
-				if (nextPosition - center).Magnitude > prompt.MaxActivationDistance - 0.18 then
+				if (goal-center).Magnitude > prompt.MaxActivationDistance-0.18 then
 					result = "outside_range"
 					break
 				end
-				local movedOK = pcall(function()
-					root.AssemblyLinearVelocity = Vector3.zero
-					root.CFrame = CFrame.new(nextPosition) * originalRotation
-				end)
-				if not movedOK then
-					result = "movement_error"
-					break
+				-- Make the circle through Humanoid walking so the game observes
+				-- controller movement, not local root-part CFrame changes.
+				if now-lastGoal >= 0.07 then
+					local accepted = pcall(function() humanoid:MoveTo(goal) end)
+					if not accepted then result="movement_error" break end
+					lastGoal = now
 				end
-				local observed = root.Position - current
-				movedDistance += Vector3.new(observed.X, 0, observed.Z).Magnitude
-				moved = moved or movedDistance >= 0.10
-				if now - lastInput >= (purpose:find("pickup") and 1 / FARM.SpamRate or 0.11) then
+				if now-lastInput >= (purpose:find("pickup") and 1/FARM.SpamRate or 0.11) then
 					lastInput = now
-					local firedOK, fired = pcall(activate)
+					local firedOK,fired = pcall(activate)
 					if firedOK and fired then fires += 1 end
 				end
 				RunService.Heartbeat:Wait()
+				local observed = root.Position-current
+				movedDistance += Vector3.new(observed.X,0,observed.Z).Magnitude
+				moved = moved or movedDistance >= 0.10
 			end
 		end)
 		occupied = false
+		if player.Character == character and root.Parent and humanoid.Parent and not activeMotion then
+			pcall(function() humanoid:MoveTo(root.Position) end)
+		end
 		if not loopOK then
 			result = "lua_error"
 			debugEvent("PROMPT", "orbit_error", { purpose=purpose,error=tostring(loopError) }, "ERROR")
@@ -3279,7 +3347,7 @@ local function newMachineAutofarm()
 		if farm.elevatorTransit then return false end
 		farm.elevatorTransit = true
 		farm.elevatorTarget = position
-		local ok, arrived = pcall(move, position, keepGoing, "emergency")
+		local ok, arrived = pcall(move, position, keepGoing, "elevator")
 		farm.elevatorTransit = false
 		if not ok then
 			farm.moving = false
@@ -3426,7 +3494,7 @@ local function newMachineAutofarm()
 			})
 		end
 		local arrived = applyElevatorChoice(chosen, active)
-		if arrived then task.wait(0.1) end
+		if arrived then RunService.Heartbeat:Wait() end
 		local near, geometry, signal = verifyElevatorPosition()
 		if arrived then
 			increment("elevatorHoldChecks")
@@ -3933,7 +4001,7 @@ local function newMachineAutofarm()
 				elseif status == "done" then
 					local now = os.clock()
 					doneCandidateAt = doneCandidateAt or now
-					if not finished and now - doneCandidateAt >= 0.3 then
+					if not finished and now - doneCandidateAt >= 0.18 then
 						local verifyTarget, verifyStatus = pickMachine()
 						if not verifyTarget and verifyStatus == "done" then
 							finished = true
@@ -4022,8 +4090,8 @@ local function newMachineAutofarm()
 						end
 						if farm.elevatorTarget and not farm.finalizing and not farm.elevatorTransit
 							and not farm.elevatorEmergencyLocked and farm.elevatorHoldCorrections < 3
-							and os.clock() - farm.allDoneSince >= 2
-							and os.clock() - farm.lastElevatorHoldAt >= 2.5
+							and os.clock() - farm.allDoneSince >= 0.65
+							and os.clock() - farm.lastElevatorHoldAt >= 1.0
 							and not (skillcheckProtected and skillcheckProtected()) then
 							local near, within, signal = verifyElevatorPosition()
 							if not near or (not within and not signal and farm.elevatorHoldCorrections == 0) then
@@ -4062,11 +4130,11 @@ local function newMachineAutofarm()
 								if not active() then break end
 								local moved = finishAtElevator(active, attempt == 1)
 								if moved then
-									task.wait(0.16)
+									task.wait(0.05)
 									reached, geometry, state = verifyElevatorPosition()
 									if reached and (geometry or state) then break end
 								end
-								if attempt < 2 then task.wait(0.3) end
+								if attempt < 2 then task.wait(0.08) end
 							end
 							local verified = reached and (geometry or state)
 							increment(verified and "elevatorFallbackSuccess" or "elevatorFallbackFailures")
@@ -4099,7 +4167,7 @@ local function newMachineAutofarm()
 						pickupCircuit.reset("auto_elevator_disabled")
 					end
 				end
-				task.wait(0.2)
+				task.wait(0.1)
 			end
 		end)
 	end
