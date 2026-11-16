@@ -23,13 +23,15 @@ local connections = {}
 local cleanups = {}
 
 local UNLOAD = { gui = nil, handler = nil, active = false, exporter = nil,
-	restoreLOS = function() end, cancelMovement = function() end, fullDiagnostics = false }
+	restoreLOS = function() end, restoreRendering = function() end,
+	cancelMovement = function() end, render3d = { enabled = false }, fullDiagnostics = false }
 function UNLOAD.force(source)
 	if UNLOAD.active then return end
 	UNLOAD.active = true
 	alive = false -- Every supervised worker sees cancellation immediately.
 	_G.TURavaHubUnload = nil
 	pcall(UNLOAD.cancelMovement)
+	pcall(UNLOAD.restoreRendering)
 	if UNLOAD.gui then
 		pcall(function() UNLOAD.gui.Enabled = false end)
 		pcall(function() UNLOAD.gui:Destroy() end)
@@ -63,15 +65,16 @@ local OPTIONS = {
 	AutoHide = true,  AutoElevator = true,
 	Fuseboxes = true,  ItemsFirst = true,
 	CollectLast = true,
-	MovementMode = "Teleport", TweenDepth = -15,
+	MovementMode = "Teleport", TweenDepth = -15, Disable3DRendering = false,
 }
 
-local BUILD = "2.6.4 Movement Modes"
+local BUILD = "2.6.7 Flood Loop Guard"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
 local debugStats = {
 	teleports = 0, teleportFailures = 0, unsafeDestinations = 0,
+	renderToggles = 0, renderErrors = 0,
 	pickupTweens = 0, pickupTweenAborts = 0, pickupTweenDetours = 0,
 	underMapTweens = 0, underMapAborts = 0, underMapHealthStops = 0, underMapGuardBlocks = 0,
 	pickupPreemptions = 0, pickupRouteCooldowns = 0,
@@ -79,6 +82,8 @@ local debugStats = {
 	finalSweeps = 0, finalSweepChecks = 0, finalSweepCompleted = 0,
 	finalSweepTimeouts = 0, finalSweepResets = 0, finalSweepLastSecond = 0,
 	finalSweepCollectionAttempts = 0, pickupChasesIgnored = 0,
+	pickupRepeatBlocks = 0, pickupCircuitTrips = 0, pickupCircuitResets = 0,
+	pickupFailedInteractions = 0, finalSweepStallExits = 0,
 	pickupTweenUnsafe = 0, pickupTweenDistance = 0, pickupTravelMs = 0,
 	pickupAttempts = 0, pickupConfirmed = 0, pickupUnconfirmed = 0,
 	promptAttempts = 0, promptFailures = 0, machineTargetChanges = 0,
@@ -137,6 +142,34 @@ local function debugThrottled(key, interval, category, event, fields, level)
 	debugLast[key] = now
 	debugEvent(category, event, fields, level)
 end
+function UNLOAD.render3d.enable()
+	local ok, err = pcall(function() RunService:Set3dRenderingEnabled(false) end)
+	if not ok then
+		increment("renderErrors")
+		debugEvent("RENDER", "disable_failed", { error = tostring(err) }, "ERROR")
+		error(err, 0)
+	end
+	UNLOAD.render3d.enabled = true
+	OPTIONS.Disable3DRendering = true
+	increment("renderToggles")
+	debugEvent("RENDER", "disabled_3d")
+end
+function UNLOAD.render3d.disable()
+	local ok, err = pcall(function() RunService:Set3dRenderingEnabled(true) end)
+	if not ok then
+		increment("renderErrors")
+		debugEvent("RENDER", "restore_failed", { error = tostring(err) }, "ERROR")
+		error(err, 0)
+	end
+	UNLOAD.render3d.enabled = false
+	OPTIONS.Disable3DRendering = false
+	increment("renderToggles")
+	debugEvent("RENDER", "enabled_3d")
+end
+UNLOAD.restoreRendering = function()
+	if UNLOAD.render3d.enabled then UNLOAD.render3d.disable() end
+end
+
 local function debugLog(message)
 	local msg = tostring(message)
 	local category = msg:find("pickup") and "PICKUP"
@@ -1064,7 +1097,8 @@ local FARM = {
 	Height = 3, Settle = 0.08, Dwell = 1.25,
 	Revisit = 5, FailedRetry = 0.65, Empty = 0.12,
 	Poll = 0.04, IdleReturn = 0.55, HeldLimit = 3,
-	SpamRate = 16, BetweenPickups = 0.025, InfectedClear = 22,
+	SpamRate = 16, BetweenPickups = 0.025, TeleportBetweenPickups = 0.10,
+	TeleportSettle = 0.16, InfectedClear = 22,
 }
 
 local PROMPT_HOLDERS = { "Prompt", "PromptPart" }
@@ -1357,6 +1391,77 @@ end
 
 local chase = { pending = false, holdUntil = 0 }
 local finalSweepActive = false
+local pickupCircuit = {
+	paused = false,
+	failed = setmetatable({}, { __mode = "k" }),
+	blocked = setmetatable({}, { __mode = "k" }),
+	failedTargets = setmetatable({}, { __mode = "k" }),
+	distinctFailures = 0,
+	consecutive = 0,
+	lastConfirmed = os.clock(),
+	MaxTargetFailures = 3,
+	MaxConsecutiveFailures = 6,
+	MaxStallSeconds = 12,
+}
+function pickupCircuit.pause(reason)
+	if pickupCircuit.paused then return end
+	pickupCircuit.paused = true
+	increment("pickupCircuitTrips")
+	debugEvent("PICKUP", "collection_paused", {
+		reason = reason, failures = pickupCircuit.consecutive,
+		failedTargets = pickupCircuit.distinctFailures,
+	}, "WARN")
+end
+function pickupCircuit.reset(reason)
+	if not pickupCircuit.paused then return end
+	pickupCircuit.paused = false
+	pickupCircuit.failed = setmetatable({}, { __mode = "k" })
+	pickupCircuit.blocked = setmetatable({}, { __mode = "k" })
+	pickupCircuit.failedTargets = setmetatable({}, { __mode = "k" })
+	pickupCircuit.distinctFailures = 0
+	pickupCircuit.consecutive = 0
+	pickupCircuit.lastConfirmed = os.clock()
+	increment("pickupCircuitResets")
+	debugEvent("PICKUP", "collection_resumed", { reason = reason })
+end
+function pickupCircuit.record(target, folder, confirmed, reason, attempts)
+	if confirmed then
+		pickupCircuit.lastConfirmed = os.clock()
+		pickupCircuit.consecutive = 0
+		pickupCircuit.distinctFailures = 0
+		pickupCircuit.failedTargets = setmetatable({}, { __mode = "k" })
+		pickupCircuit.failed[target] = nil
+		return
+	end
+	if (attempts or 0) < 1 or (reason ~= "confirmation_timeout"
+		and reason ~= "prompt_disabled_without_inventory") then return end
+	increment("pickupFailedInteractions")
+	pickupCircuit.consecutive += 1
+	pickupCircuit.failed[target] = (pickupCircuit.failed[target] or 0) + 1
+	if not pickupCircuit.failedTargets[target] then
+		pickupCircuit.failedTargets[target] = true
+		pickupCircuit.distinctFailures += 1
+	end
+	if pickupCircuit.failed[target] >= pickupCircuit.MaxTargetFailures
+		and not pickupCircuit.blocked[target] then
+		pickupCircuit.blocked[target] = true
+		increment("pickupRepeatBlocks")
+		debugEvent("PICKUP", "item_retry_limit", {
+			folder = folder, name = target.Name,
+			attempts = pickupCircuit.failed[target], reason = reason,
+		}, "WARN")
+	end
+	if pickupCircuit.consecutive >= pickupCircuit.MaxConsecutiveFailures
+		and pickupCircuit.distinctFailures >= 2 then
+		pickupCircuit.pause("repeated_failed_collections")
+	end
+end
+
+track(workspace.ChildAdded:Connect(function(instance)
+	if instance.Name == "Map" or instance.Name == "Items" or instance.Name == "Capsules" then
+		pickupCircuit.reset("world_reloaded")
+	end
+end))
 
 local pickupCoordinator = {
 	owner = nil,  home = nil,  lastActivity = os.clock(),
@@ -1371,7 +1476,7 @@ local function releasePickup(farm)
 end
 
 local function returnPickupHome(force, isBlocked)
-	if finalSweepActive then return end
+	if finalSweepActive or pickupCircuit.paused then return end
 	if not pickupCoordinator.home or pickupCoordinator.owner then return end
 	if isBlocked and isBlocked() then
 		pickupCoordinator.home = nil -- Machine work supersedes the previous pickup origin.
@@ -1409,7 +1514,7 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 	local function loop(myId)
 		local function active() return alive and farm.enabled and runId == myId end
 		local function allowed()
-			return active() and (not gate or gate()) and not (isBlocked and isBlocked())
+			return active() and not pickupCircuit.paused and (not gate or gate()) and not (isBlocked and isBlocked())
 				and (finalSweepActive or os.clock() >= motionPauseUntil)
 				and (finalSweepActive or not (OPTIONS.AutoHide and os.clock() < chase.holdUntil))
 		end
@@ -1432,7 +1537,8 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 						local character = player.Character
 						local root = character and character:FindFirstChild("HumanoidRootPart")
 						local prompt = target.Parent and getPrompt(target)
-						local fresh = (not filter or filter(target)) and (not recent[target] or os.clock() - recent[target] >= FARM.Revisit)
+						local fresh = not pickupCircuit.blocked[target] and (not filter or filter(target))
+							and (not recent[target] or os.clock() - recent[target] >= FARM.Revisit)
 						local part = fresh and root and prompt and prompt.Enabled and getPromptPart(prompt, target)
 						local unsafe = part and infectedNear(part.Position, FARM.InfectedClear)
 						if unsafe then
@@ -1468,7 +1574,7 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 									if isBlocked and isBlocked() then return false, "preempted_by_machine", 0 end
 									return false, "tween_" .. tostring(travelReason), 0
 								end
-								task.wait(FARM.Settle)
+								task.wait(OPTIONS.MovementMode == "Teleport" and FARM.TeleportSettle or FARM.Settle)
 								if isBlocked and isBlocked() then return false, "preempted_by_machine", 0 end
 								if infectedNear(root.Position, FARM.InfectedClear) then
 									return false, "enemy_after_arrival", 0
@@ -1498,7 +1604,9 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 								end
 							end
 							releasePickup(farm)
-							if active() then task.wait(FARM.BetweenPickups) end
+							if active() then
+								task.wait(OPTIONS.MovementMode == "Teleport" and FARM.TeleportBetweenPickups or FARM.BetweenPickups)
+							end
 							if not ok then
 								debugLog("ERROR pickup " .. tostring(target.Name) .. ": " .. tostring(confirmed))
 								warn("[TU - Rava Hub] pickup error: " .. tostring(confirmed))
@@ -1525,6 +1633,7 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 								recent[target] = os.clock() - FARM.Revisit
 									+ (blockedRoute and 4 or FARM.FailedRetry)
 							end
+							pickupCircuit.record(target, folder.Name, confirmed, reason, attempts)
 							debugEvent("PICKUP", "result", { folder = folder.Name, name = target.Name,
 								movement = OPTIONS.MovementMode:lower(), confirmed = confirmed, reason = reason or "unknown", activations = attempts or 0,
 								maxDistance = prompt.MaxActivationDistance, holdDuration = prompt.HoldDuration,
@@ -2033,7 +2142,7 @@ PICKUPS = {
 }
 
 local function scanFinalPickups()
-	local result = { eligible = 0, safe = 0, unsafe = 0, skipped = 0, sources = {} }
+	local result = { eligible = 0, safe = 0, unsafe = 0, skipped = 0, blocked = 0, sources = {} }
 	local inventoryFull = heldCount() >= FARM.HeldLimit
 	for _, entry in ipairs(PICKUPS) do
 		local found = 0
@@ -2048,7 +2157,9 @@ local function scanFinalPickups()
 						local part = getPromptPart(prompt, target)
 						if part then
 							found += 1
-							local accepted = entry.farm.enabled and (not entry.held or not inventoryFull)
+							if pickupCircuit.blocked[target] then result.blocked = result.blocked + 1 end
+							local accepted = not pickupCircuit.blocked[target] and not pickupCircuit.paused
+								and entry.farm.enabled and (not entry.held or not inventoryFull)
 								and (not entry.filter or entry.filter(target))
 							if accepted then
 								result.eligible += 1
@@ -2889,7 +3000,8 @@ local function newMachineAutofarm()
 			local busy = pickupBusy()
 			if busy then lastBusyAt = os.clock() end
 			local waitingPickups = busy or (cachedPickups() and os.clock() - lastBusyAt < MACHINE.ItemIdle)
-			local pending = not startupPickupsDone and not OPTIONS.CollectLast and waitingPickups
+			local pending = not pickupCircuit.paused and not startupPickupsDone
+				and not OPTIONS.CollectLast and waitingPickups
 			if pending and not farm.placed then
 				if not waitStart then
 					waitStart = os.clock()
@@ -2962,6 +3074,9 @@ local function newMachineAutofarm()
 				local prompt = target and getPrompt(target)
 				local part = prompt and getPromptPart(prompt, target)
 				if part then
+					if (finished or finalSweep) and pickupCircuit.paused then
+						pickupCircuit.reset("new_objective")
+					end
 					if finalSweep then
 						finalSweepActive = false
 						increment("finalSweepResets")
@@ -3168,24 +3283,34 @@ local function newMachineAutofarm()
 							end
 							debugThrottled("final_sweep_check", 0.9, "SWEEP", "check", {
 								check = finalSweep.checks, safe = snapshot.safe, unsafe = snapshot.unsafe,
-								ignored = snapshot.skipped, pickupBusy = busyNow,
+								ignored = snapshot.skipped, blocked = snapshot.blocked, pickupBusy = busyNow,
 								attempted = debugStats.finalSweepCollectionAttempts - finalSweep.attemptsStart,
 								confirmedSoFar = debugStats.pickupConfirmed - finalSweep.confirmedStart,
 								sources = snapshot.sourceSummary,
 							})
 							local timedOut = now - finalSweep.started >= MACHINE.CollectWaitMax
+							local noProgressSeconds = now - math.max(finalSweep.started, pickupCircuit.lastConfirmed)
+							local stalled = not pickupCircuit.paused and snapshot.safe > 0
+								and noProgressSeconds >= pickupCircuit.MaxStallSeconds
+								and (debugStats.finalSweepCollectionAttempts > finalSweep.attemptsStart)
+							local circuitBroken = pickupCircuit.paused or stalled
 							local emptyVerified = finalSweep.emptySince
 								and finalSweep.emptyChecks >= 2
 								and now - finalSweep.emptySince >= MACHINE.FinalSweepClearTime
-							if timedOut or emptyVerified then
+							if timedOut or emptyVerified or circuitBroken then
 								local verify = scanFinalPickups()
-								if not timedOut and (verify.safe > 0 or pickupBusy() or pickupCoordinator.owner ~= nil) then
+								if not timedOut and not circuitBroken
+									and (verify.safe > 0 or pickupBusy() or pickupCoordinator.owner ~= nil) then
 									finalSweep.emptySince, finalSweep.emptyChecks = nil, 0
 									increment("finalSweepLastSecond")
 									debugEvent("SWEEP", "last_second_pickup_detected", {
 										safe = verify.safe, sources = verify.sourceSummary,
 									})
 								else
+									if stalled then pickupCircuit.pause("final_sweep_no_progress") end
+									local sweepStatus = circuitBroken and "collection_blocked"
+										or timedOut and "timeout" or "verified_clear"
+									if circuitBroken then increment("finalSweepStallExits") end
 									farm.finalizing = OPTIONS.AutoElevator or OPTIONS.Fuseboxes
 									finalSweepActive = false
 									if farm.finalizing then
@@ -3193,21 +3318,24 @@ local function newMachineAutofarm()
 										pickupCoordinator.home = nil
 									end
 									finished = true
-									increment(timedOut and "finalSweepTimeouts" or "finalSweepCompleted")
-									debugEvent("SWEEP", timedOut and "timeout" or "complete", {
+									if timedOut then
+										increment("finalSweepTimeouts")
+									elseif not circuitBroken then
+										increment("finalSweepCompleted")
+									end
+									debugEvent("SWEEP", sweepStatus == "verified_clear" and "complete" or sweepStatus, {
 										checks = finalSweep.checks, elapsedMs = math.floor((now - finalSweep.started) * 1000 + 0.5),
 										attempted = debugStats.finalSweepCollectionAttempts - finalSweep.attemptsStart,
 										collected = debugStats.pickupConfirmed - finalSweep.confirmedStart,
 										safeRemaining = verify.safe, unsafeRemaining = verify.unsafe,
-										ignored = verify.skipped, sources = verify.sourceSummary,
-									}, timedOut and "WARN" or "INFO")
+										blocked = verify.blocked, ignored = verify.skipped, sources = verify.sourceSummary,
+									}, sweepStatus == "verified_clear" and "INFO" or "WARN")
 									debugEvent("MACHINE", "all_complete", {
 										autoElevator = OPTIONS.AutoElevator, fuseboxes = OPTIONS.Fuseboxes,
-										finalSweep = timedOut and "timeout" or "verified_clear",
+										finalSweep = sweepStatus,
 									})
-									if OPTIONS.Fuseboxes then checkFuseboxes(active) end
+									if OPTIONS.Fuseboxes and not circuitBroken then checkFuseboxes(active) end
 									if OPTIONS.AutoElevator and active() then
-										debugLog("final pickup sweep finished, teleporting to elevator")
 										finishAtElevator(active)
 									else
 										farm.finalizing = false
@@ -3564,6 +3692,9 @@ local machineFlow = createSubcategory(machinesBody, "EXIT & PRIORITIES", 4, true
 createToggleRow(machineFlow, "Auto Elevator", 1, newOption(OPTIONS, "AutoElevator"))
 createToggleRow(machineFlow, "Fusebox Check", 2, newOption(OPTIONS, "Fuseboxes"))
 createToggleRow(machineFlow, "Items First", 3, newOption(OPTIONS, "ItemsFirst"))
+
+local machinePerformance = createSubcategory(machinesBody, "PERFORMANCE", 5, true)
+createToggleRow(machinePerformance, "Disable 3D Rendering", 1, UNLOAD.render3d)
 end
 
 local diagnosticsPage = pages.Diagnostics
@@ -3637,7 +3768,7 @@ local function debugReport()
 		"Machine exit=SkillCheck:InvokeServer() with no arguments; ALL exits deferred while skillcheck UI is visible",
 		"Skillcheck protection=defer exits and travel until UI disappears",
 		"TODO (later)=improve elevator and fusebox event / completion detection",
-		"Final sweep=up to 90s; confirmed pickups; ignores Auto Hide; unsafe pickups skipped",
+		"Final sweep=exits on flood-like repeated pickup failures or no progress; 90s hard cap",
 		"Ability=press F once per detected machine completion; no cooldown HUD polling or Ability remote",
 		"Ability input dispatched is not proof the game accepted it; active skillchecks block completion handling",
 		"Item hotkeys=executor keypress preferred, VIM fallback; input success does not prove item effect",
@@ -3656,6 +3787,7 @@ local function debugReport()
 			debugStats.handoffMaxMs, debugStats.handoffLastMs, debugStats.slowMachineScans,
 			debugStats.targetCacheRefreshes, debugStats.targetCacheHits),
 		"Movement: " .. fieldString({ mode = OPTIONS.MovementMode, depth = OPTIONS.TweenDepth, speed = PICKUP_TRAVEL.Speed }),
+		"Rendering3D=" .. (OPTIONS.Disable3DRendering and "disabled" or "enabled"),
 		"SelenaCamera: " .. fieldString({ enabled = UNLOAD.selenaLook.enabled, chasing = UNLOAD.selenaLook.chaseSeen,
 			tracking = UNLOAD.selenaLook.active }),
 		"CapsuleSources=workspace.Capsules; workspace.Map.InfectedSamples",
@@ -3664,6 +3796,9 @@ local function debugReport()
 			debugStats.underMapTweens, debugStats.underMapAborts, debugStats.underMapHealthStops,
 			debugStats.underMapGuardBlocks, debugStats.pickupTweenDistance),
 		"PickupTiming=" .. (OPTIONS.CollectLast and "After" or "Before"),
+		"PickupGuard: " .. fieldString({ paused = pickupCircuit.paused, failures = pickupCircuit.consecutive,
+			failedTargets = pickupCircuit.distinctFailures, targetLimit = pickupCircuit.MaxTargetFailures,
+			noProgressSeconds = pickupCircuit.MaxStallSeconds }),
 		"Options: " .. fieldString(OPTIONS),
 		"FARM: " .. fieldString(FARM),
 		"MACHINE: " .. fieldString({ Range = MACHINE.Range, StallTimeout = MACHINE.StallTimeout,
@@ -3728,7 +3863,7 @@ supervise("diagnostic UI", function() return alive end, function()
 	while alive do
 		if main.Visible then for _, refresh in ipairs(toggleRefreshers) do refresh() end end
 		local working = (machineFarm.enabled and "MACHINE") or (pickupBusy() and "PICKUPS") or "IDLE"
-		headerStatus.Text = working .. "  •  v2.6.4"
+		headerStatus.Text = working .. "  •  v2.6.5"
 		headerStatus.TextColor3 = working == "IDLE" and UI.muted or UI.good
 		footerLabel.Text = string.format("%s   •   %s   •   %d moves", BUILD, OPTIONS.MovementMode,
 			debugStats.teleports + debugStats.underMapTweens)
