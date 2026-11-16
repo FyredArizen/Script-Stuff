@@ -67,7 +67,7 @@ local OPTIONS = {
 	MovementMode = "Teleport", TweenDepth = -15, Disable3DRendering = false,
 }
 
-local BUILD = "TU Rava Hub v2.6.14"
+local BUILD = "TU Rava Hub v2.6.16"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -1202,10 +1202,7 @@ do
 		local start = root.Position
 		local promptPosition = getPromptPosition(prompt, part)
 		local flat = Vector3.new(promptPosition.X - start.X, 0, promptPosition.Z - start.Z)
-		local facing = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
-		local direction = flat.Magnitude > 1.2 and flat.Unit
-			or (facing.Magnitude > 0.01 and facing.Unit or Vector3.new(1, 0, 0))
-		local maxStep = 0.14
+		local direction = flat.Magnitude > 1.2 and flat.Unit or Vector3.new(1, 0, 0)
 		local started = os.clock()
 		local function horizontalDistance()
 			local delta = root.Position - start
@@ -1232,9 +1229,9 @@ do
 		local movedOnce = false
 		local function pulse()
 			if not nudgeRunning then return end
-			if safe() and horizontalDistance() < maxStep then
+			if safe() and horizontalDistance() < 0.55 then
 				movedOnce = true
-				humanoid:Move(direction * 0.28, false)
+				humanoid:Move(direction, false)
 			else
 				humanoid:Move(Vector3.zero, false)
 			end
@@ -1245,13 +1242,13 @@ do
 		if not bound then
 			debugThrottled("prompt_nudge_bind", 5, "PROMPT", "move_bind_fallback", nil, "WARN")
 		end
-		while alive and os.clock() - started < 0.15 and safe() do
-			if horizontalDistance() >= maxStep then break end
+		while alive and os.clock() - started < 0.05 and safe() do
+			if horizontalDistance() >= 0.38 then break end
 			pulse()
 			RunService.Heartbeat:Wait()
 		end
 		local distance = root.Parent and horizontalDistance() or 0
-		local moved = root.Parent ~= nil and distance >= 0.035
+		local moved = root.Parent ~= nil and distance >= 0.075
 		stopNudge()
 		increment(moved and "promptMoveVerified" or "promptMoveStationary")
 		debugThrottled("prompt_move_" .. tostring(reason), moved and 3 or 1,
@@ -4197,7 +4194,7 @@ supervise("diagnostic UI", function() return alive end, function()
 	while alive do
 		if main.Visible then for _, refresh in ipairs(toggleRefreshers) do refresh() end end
 		local working = (machineFarm.enabled and "MACHINE") or (pickupBusy() and "PICKUPS") or "IDLE"
-		headerStatus.Text = working .. "  •  v2.6.9"
+		headerStatus.Text = working .. "  •  v2.6.15"
 		headerStatus.TextColor3 = working == "IDLE" and UI.muted or UI.good
 		footerLabel.Text = string.format("%s   •   %s   •   %d moves", BUILD, OPTIONS.MovementMode,
 			debugStats.teleports + debugStats.underMapTweens)
