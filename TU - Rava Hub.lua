@@ -24,13 +24,16 @@ local cleanups = {}
 
 -- Bind the unload action as soon as the window exists, NOT after every
 -- subsystem has initialized. A later startup error must not strand the GUI.
+-- Central shutdown coordinator. Keep cleanup and prompt-property restoration
+-- ordered: async cleanups in older builds could re-disable LOS after a rerun.
 local UNLOAD = { gui = nil, handler = nil, active = false, exporter = nil,
-	restoreLOS = function() end }
+	restoreLOS = function() end, cancelMovement = function() end, fullDiagnostics = false }
 function UNLOAD.force(source)
 	if UNLOAD.active then return end
 	UNLOAD.active = true
-	alive = false -- First: all workers see the cancellation immediately.
+	alive = false -- Every supervised worker sees cancellation immediately.
 	_G.TURavaHubUnload = nil
+	pcall(UNLOAD.cancelMovement)
 	if UNLOAD.gui then
 		pcall(function() UNLOAD.gui.Enabled = false end)
 		pcall(function() UNLOAD.gui:Destroy() end)
@@ -39,21 +42,17 @@ function UNLOAD.force(source)
 		pcall(function() connection:Disconnect() end)
 	end
 	table.clear(connections)
-	-- An individual slow or broken cleanup must not block the unload button.
+	-- These cleanups have no intentional yields. Run them in order so restoring
+	-- original prompt sight properties happens after machine-prompt cleanup.
 	for _, cleanup in ipairs(cleanups) do
-		task.spawn(function()
-			local ok, err = pcall(cleanup)
-			if not ok then warn("[TU - Rava Hub] cleanup error: " .. tostring(err)) end
-		end)
+		local ok, err = pcall(cleanup)
+		if not ok then warn("[TU - Rava Hub] cleanup error: " .. tostring(err)) end
 	end
 	table.clear(cleanups)
+	pcall(UNLOAD.restoreLOS)
+	-- File I/O and last-resort ESP sweeps are independent of UI shutdown.
 	task.spawn(function()
-		pcall(UNLOAD.restoreLOS)
-		task.spawn(function()
-			pcall(function()
-				if UNLOAD.exporter then UNLOAD.exporter() end
-			end)
-		end)
+		pcall(function() if UNLOAD.exporter then UNLOAD.exporter() end end)
 		pcall(sweepHighlights)
 	end)
 end
@@ -74,7 +73,7 @@ local OPTIONS = {
 }
 
 -- Diagnostic log: capped circular buffer, timestamps, categories, and counters.
-local BUILD = "2.5.9 Ability F After Objective"
+local BUILD = "2.6 Reworked / Stable GUI and Farming"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -167,6 +166,37 @@ local function allDebugLines()
 	return lines
 end
 
+-- Minimal exporter is deliberately available BEFORE any farm workers initialize.
+-- If a later startup error occurs, Diagnostics still has a working export button.
+UNLOAD.fallbackReport = function()
+	local summary = {
+		"TU - Rava Hub | Startup / Fallback Diagnostic Report",
+		"Build=" .. BUILD,
+		"Exported=" .. os.date("%Y-%m-%d %H:%M:%S"),
+		"PlaceId=" .. tostring(game.PlaceId) .. " JobId=" .. tostring(game.JobId),
+		"FullDiagnostics=" .. tostring(UNLOAD.fullDiagnostics),
+		"Stats: " .. fieldString(debugStats),
+		"Status: " .. fieldString(debugStatus),
+		"---- EVENTS ----",
+	}
+	for _, event in ipairs(allDebugLines()) do table.insert(summary, event) end
+	return table.concat(summary, "\n")
+end
+UNLOAD.fallbackExport = function(reason)
+	if typeof(writefile) ~= "function" then
+		debugEvent("DEBUG", "fallback_export_unavailable", { reason = reason }, "WARN")
+		return false
+	end
+	local prefix = reason == "death" and "TU_Rava_Hub_DEATH_Debug_"
+		or ("TU_Rava_Hub_" .. tostring(reason or "STARTUP") .. "_Debug_")
+	local filename = prefix .. os.time() .. "_" .. math.floor((os.clock() % 1) * 100000) .. ".txt"
+	local ok, err = pcall(writefile, filename, UNLOAD.fallbackReport())
+	debugEvent("DEBUG", ok and "fallback_export_saved" or "fallback_export_error",
+		{ filename = filename, reason = reason, error = ok and "none" or tostring(err) }, ok and "INFO" or "ERROR")
+	return ok
+end
+UNLOAD.exporter = function() return UNLOAD.fallbackExport("UNLOAD") end
+
 -- Hybrid navigation: pickups tween through verified clear corridors; objectives teleport.
 -- Moving enemies are rechecked during travel. If no safe route exists, SKIP the pickup.
 local activeMotion
@@ -187,6 +217,7 @@ local function cancelMotion(owner)
 		debugEvent("MOVE", "cancel", { owner = motion.owner, phase = motion.phase or "unknown" })
 	end
 end
+UNLOAD.cancelMovement = cancelMotion
 local function teleportCharacter(destination, keepGoing, owner, mode)
 	local emergency = mode == "emergency"
 	if not alive or not keepGoing() then return false end
@@ -586,7 +617,7 @@ local top = new("Frame", { Size = UDim2.new(1, 0, 0, 64), BackgroundColor3 = UI.
 new("Frame", { Size = UDim2.new(1, 0, 0, 2), Position = UDim2.new(0, 0, 1, -2),
 	BackgroundColor3 = UI.accent, BorderSizePixel = 0 }, top)
 uiText(top, "RAVA HUB", 21, true, UI.text, { Position = UDim2.fromOffset(22, 10), Size = UDim2.fromOffset(166, 27) })
-uiText(top, "TU / v2.5.8 / RELIABLE UNLOAD", 10, true, UI.muted,
+uiText(top, "TU / v2.6 / RAVA HUB", 10, true, UI.muted,
 	{ Position = UDim2.fromOffset(23, 37), Size = UDim2.fromOffset(190, 15) })
 local headerStatus = uiText(top, "SYSTEM READY", 12, true, UI.good,
 	{ Position = UDim2.fromOffset(346, 20), Size = UDim2.fromOffset(192, 24), TextXAlignment = Enum.TextXAlignment.Right })
@@ -613,8 +644,17 @@ local mainArea = new("Frame", { Position = UDim2.fromOffset(158, 64),
 	Size = UDim2.new(1, -158, 1, -94), BackgroundTransparency = 1 }, main)
 local footer = new("Frame", { Position = UDim2.new(0, 0, 1, -30), Size = UDim2.new(1, 0, 0, 30),
 	BackgroundColor3 = UI.surface, BorderSizePixel = 0 }, main)
-local footerLabel = uiText(footer, "v2.5.8   •   UNLOAD FIX   •   SAFE FARM", 11, false, UI.muted,
+local footerLabel = uiText(footer, "v2.6   •   STABLE GUI   •   SAFE FARM", 11, false, UI.muted,
 	{ Position = UDim2.fromOffset(17, 5), Size = UDim2.new(1, -30, 0, 21) })
+-- Diagnostics gets a dedicated dock outside the sidebar list so it cannot
+-- be pushed off-screen if the other navigation controls change in height.
+local diagnosticsDock = new("Frame", {
+    Name = "DiagnosticsDock", Position = UDim2.new(0, 0, 1, -96),
+    Size = UDim2.fromOffset(158, 65), BackgroundColor3 = UI.surface,
+    BorderSizePixel = 0, ZIndex = 3,
+}, main)
+new("Frame", { Size = UDim2.new(1, -20, 0, 1), Position = UDim2.fromOffset(10, 2),
+    BackgroundColor3 = UI.soft, BorderSizePixel = 0, ZIndex = 3 }, diagnosticsDock)
 local pages, menuButtons, activeTab = {}, {}, "Autofarm"
 local toggleRefreshers = {}
 local TAB_ORDER = { "ESP", "Autofarm", "Machines", "Diagnostics" }
@@ -629,17 +669,36 @@ local function showTab(name)
 	end
 end
 for index, name in ipairs(TAB_ORDER) do
-	local button = new("TextButton", { Name = name .. "Tab", Size = UDim2.new(1, 0, 0, 45),
-		LayoutOrder = index, BackgroundColor3 = UI.surface, BorderSizePixel = 0,
-		Text = "  " .. TAB_SYMBOL[name] .. "    " .. name, Font = Enum.Font.GothamMedium,
-		TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = UI.muted }, sidebar)
-	corner(button, 9)
-	menuButtons[name] = button
-	track(button.MouseButton1Click:Connect(function()
-		showTab(name)
-		debugEvent("UI", "open_tab", { tab = name })
-	end))
+    local diagnostic = name == "Diagnostics"
+    local button = new("TextButton", {
+        Name = name .. "Tab", Size = diagnostic and UDim2.new(1, -20, 0, 45)
+            or UDim2.new(1, 0, 0, 45),
+        Position = diagnostic and UDim2.fromOffset(10, 9) or UDim2.new(),
+        LayoutOrder = index, BackgroundColor3 = UI.surface, BorderSizePixel = 0,
+        ZIndex = diagnostic and 4 or 1,
+        Text = "  " .. TAB_SYMBOL[name] .. "    " .. name,
+        Font = Enum.Font.GothamMedium, TextSize = 14,
+        TextXAlignment = Enum.TextXAlignment.Left, TextColor3 = UI.muted,
+    }, diagnostic and diagnosticsDock or sidebar)
+    corner(button, 9)
+    menuButtons[name] = button
+    track(button.Activated:Connect(function()
+        showTab(name)
+        debugEvent("UI", "open_tab", { tab = name, access = diagnostic and "dock" or "sidebar" })
+    end))
 end
+-- Second route to Diagnostics, deliberately outside the scrolling area.
+local diagnosticsQuick = new("TextButton", {
+    Name = "DiagnosticsQuickAccess", Text = "LOGS",
+    Position = UDim2.fromOffset(259, 16), Size = UDim2.fromOffset(72, 31),
+    Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = UI.text,
+    BackgroundColor3 = UI.surface2, BorderSizePixel = 0,
+}, top)
+corner(diagnosticsQuick, 8)
+track(diagnosticsQuick.Activated:Connect(function()
+    showTab("Diagnostics")
+    debugEvent("UI", "open_tab", { tab = "Diagnostics", access = "header" })
+end))
 local function createSection(name)
 	local page = new("ScrollingFrame", {
 		Name = name .. "Page", Position = UDim2.fromOffset(0, 0), Size = UDim2.fromScale(1, 1),
@@ -715,6 +774,43 @@ local function createSubcategory(page, heading, order, subtitle, initiallyOpen)
 	return body
 end
 
+-- Create Diagnostics *before* the automation workers. If subsequent setup
+-- fails, the tab and this startup status page still exist and remain reachable.
+pages.Diagnostics = createSection("Diagnostics")
+uiText(pages.Diagnostics, "Initializing... If this stays visible, a startup error interrupted a feature. Export the fallback log or check the console.",
+	12, false, UI.muted, {
+		Name = "DiagnosticsStartupNotice", LayoutOrder = 1,
+		Size = UDim2.new(1, -12, 0, 68), TextWrapped = true,
+		TextYAlignment = Enum.TextYAlignment.Top,
+	})
+UNLOAD.bootstrapExport = new("TextButton", {
+	Name = "DiagnosticsStartupExport", LayoutOrder = 2,
+	Size = UDim2.new(1, -12, 0, 38), BackgroundColor3 = UI.accent,
+	Text = "EXPORT STARTUP LOG", Font = Enum.Font.GothamBold,
+	TextColor3 = UI.text, TextSize = 12, BorderSizePixel = 0,
+}, pages.Diagnostics)
+corner(UNLOAD.bootstrapExport, 8)
+track(UNLOAD.bootstrapExport.Activated:Connect(function()
+	UNLOAD.fallbackExport("STARTUP")
+end))
+UNLOAD.bootstrapUnload = new("TextButton", {
+	Name = "DiagnosticsStartupUnload", LayoutOrder = 3,
+	Size = UDim2.new(1, -12, 0, 38), BackgroundColor3 = Color3.fromRGB(92, 47, 62),
+	Text = "UNLOAD HUB", Font = Enum.Font.GothamBold,
+	TextColor3 = UI.text, TextSize = 12, BorderSizePixel = 0,
+}, pages.Diagnostics)
+corner(UNLOAD.bootstrapUnload, 8)
+track(UNLOAD.bootstrapUnload.Activated:Connect(function()
+	UNLOAD.request("startup_diagnostics")
+end))
+task.delay(6, function()
+	if alive and not UNLOAD.fullDiagnostics then
+		increment("workerErrors")
+		debugEvent("SYSTEM", "startup_incomplete", {
+			diagnostics = "fallback_available", note = "check_executor_console",
+		}, "ERROR")
+	end
+end)
 local function createToggleRow(parent, name, order, feature, description)
 	local row = new("Frame", { Size = UDim2.new(1, -9, 0, description and 58 or 43),
 		BackgroundColor3 = UI.surface, BorderSizePixel = 0, LayoutOrder = order }, parent)
@@ -980,9 +1076,15 @@ local function newESP(config)
 		state.enabled = true
 		state.run += 1
 		local myRun = state.run
-		state.rootAdded = workspace.ChildAdded:Connect(function(child)
+		state.rootAdded = workspace.DescendantAdded:Connect(function(child)
+			-- Match the full path, not only the final name; prevents false positives
+			-- and handles nested Map.InfectedSamples streaming in immediately.
 			for _, folderName in ipairs(config.Folders) do
-				if child.Name == folderName then watchRoot(child) end
+				if child.Name == (folderName:match("([^%.]+)$"))
+					and child == resolveWorkspacePath(folderName) then
+					watchRoot(child)
+					break
+				end
 			end
 		end)
 		supervise("esp " .. config.Name, function() return alive and state.enabled and state.run == myRun end, function()
@@ -2140,7 +2242,7 @@ local function nearestInfected(position)
 	end
 	return nearestName, nearestDistance, nearestPosition
 end
-local writeDebugFile -- assigned by Diagnostics after the GUI is created
+local writeDebugFile = UNLOAD.fallbackExport -- overwritten by full Diagnostics when ready
 local deathExport = { handled = false, life = 0, character = nil }
 local function exportOnDeath(reason, hp)
 	if deathExport.handled or not alive then return end
@@ -3252,6 +3354,13 @@ autoSkillcheck.enable()
 machineFarm = newMachineAutofarm()
 
 do
+local function createSubcategoryNote(parent, message, order)
+	return uiText(parent, message, 11, false, UI.muted, {
+		Name = "SectionNote", LayoutOrder = order,
+		Size = UDim2.new(1, -16, 0, 40), TextWrapped = true,
+		TextYAlignment = Enum.TextYAlignment.Center,
+	})
+end
 local machinesBody = createSection("Machines", 3)
 local machineCore = createSubcategory(machinesBody, "OBJECTIVE AUTOMATION", 1,
 	"Fast targeting, auto-interaction and skillchecks", true)
@@ -3277,8 +3386,11 @@ createSubcategoryNote(machineFlow,
 
 end
 
--- Diagnostics page: live counters, warning filter, and export on demand.
-local diagnosticsPage = createSection("Diagnostics")
+-- Diagnostics already exists (created early for startup-error resilience).
+-- Replace its initialization notice with the complete reporting controls.
+local diagnosticsPage = pages.Diagnostics
+-- Keep the bootstrap controls alive until all full Diagnostics callbacks exist.
+-- A failed late initialization must leave a usable fallback page.
 local diagnosticsOverview = createSubcategory(diagnosticsPage, "SESSION OVERVIEW", 1,
 	"Live counters, movement, damage and ability activity", true)
 local diagnosticsTools = createSubcategory(diagnosticsPage, "EXPORT & FILTER", 2,
@@ -3439,7 +3551,7 @@ supervise("diagnostic UI", function() return alive end, function()
 	while alive do
 		if main.Visible then for _, refresh in ipairs(toggleRefreshers) do refresh() end end
 		local working = (machineFarm.enabled and "MACHINE") or (pickupBusy() and "PICKUPS") or "IDLE"
-		headerStatus.Text = working .. "  •  v2.5.9"
+		headerStatus.Text = working .. "  •  v2.6"
 		headerStatus.TextColor3 = working == "IDLE" and UI.muted or UI.good
 		footerLabel.Text = string.format("%s   •   %d pickup tweens   •   %d objective TPs", BUILD, debugStats.pickupTweens, debugStats.teleports)
 		if activeTab == "Diagnostics" and main.Visible then
@@ -3457,11 +3569,23 @@ supervise("diagnostic UI", function() return alive end, function()
 		task.wait(0.7)
 	end
 end)
-debugEvent("SYSTEM", "initialized", { build = BUILD, place = game.PlaceId, ui = "collapsible_subcategories",
+-- Finalize Diagnostics only after its live worker and export handlers exist.
+UNLOAD.fullDiagnostics = true
+pcall(function()
+	for _, item in ipairs(diagnosticsPage:GetChildren()) do
+		if item.Name == "DiagnosticsStartupNotice" or item.Name == "DiagnosticsStartupExport"
+			or item.Name == "DiagnosticsStartupUnload" then item:Destroy() end
+	end
+end)
+debugEvent("SYSTEM", "initialized", { build = BUILD, place = game.PlaceId,
+	startupChecks = "passed", fallbackExport = true,
+    diagnosticsTab = menuButtons.Diagnostics ~= nil and pages.Diagnostics ~= nil,
+    diagnosticsDock = diagnosticsDock.Parent ~= nil, ui = "collapsible_subcategories",
 	mode = "tween_pickups_teleport_objectives", lineOfSight = "disabled", abilityAuto = true, abilityTrigger = "F_after_machine_completion", sampleFarm = true, pickupSpeed = PICKUP_TRAVEL.Speed,
 	enemyClearance = PICKUP_TRAVEL.SafetyRadius, pickupSettle = FARM.Settle,
 	pickupDwell = FARM.Dwell, pickupRate = FARM.SpamRate, itemWaitMax = MACHINE.ItemWaitMax })
 -- World structure watcher reports renamed/missing objective folders without log spam.
+-- Elevator/fusebox event detection remains a documented TODO, not guessed behavior.
 task.spawn(function()
 	local previous = {}
 	while alive do
