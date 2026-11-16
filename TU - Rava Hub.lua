@@ -66,7 +66,7 @@ local OPTIONS = {
 	MovementMode="Teleport",TweenDepth=-15,Disable3DRendering=false,
 }
 
-local BUILD = "TU Rava Hub v2.6.22"
+local BUILD = "TU Rava Hub v2.6.23"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -103,6 +103,9 @@ local debugStats = {
 	elevatorFallbackVerified=0,elevatorFallbackUnverified=0,
 	machineStalls=0,skillcheckInputs=0,skillcheckInputFailures=0,
 	skillcheckRebinds=0,skillcheckInputSignal=0,skillcheckInputVIM=0,
+	skillcheckRoundSeen=0,skillcheckBarSeen=0,skillcheckMissingParts=0,
+	skillcheckLateAttached=0,skillcheckRearms=0,skillcheckUiRecreated=0,
+	skillcheckWatchErrors=0,skillcheckFrameConnections=0,
 	chases=0,workerErrors=0,machineCompletions=0,
 	machinePlacements=0,machineDangers=0,fuseAttempts=0,
 	itemUseAttempts=0,itemUseFailures=0,itemUseObserved=0,itemUseUnverified=0,
@@ -3178,26 +3181,33 @@ local function skillcheckWidgetOnScreen(gui)
 	return true
 end
 
+-- A UI can be recreated inside its existing ScreenGui, or nested beneath an
+-- extra container. Resolve the live widgets rather than caching a single path.
+function UNLOAD.skillcheckNodes()
+	local round = playerGui:FindFirstChild("RoundSkillcheck")
+		or playerGui:FindFirstChild("RoundSkillcheck", true)
+	local normal = round and round:FindFirstChild("Normal", true)
+	local lock = playerGui:FindFirstChild("LockUI")
+		or playerGui:FindFirstChild("LockUI", true)
+	local skill = lock and lock:FindFirstChild("Skillcheck", true)
+	local main = skill and skill:FindFirstChild("Main", true)
+	local marker = main and main:FindFirstChild("Marker", true)
+	return normal,main,marker
+end
+
 local lastSkillcheckOnScreenAt = -math.huge
 skillcheckProtected = function()
-	local round = playerGui:FindFirstChild("RoundSkillcheck")
-	local container = round and round:FindFirstChild("Container")
-	local normal = container and container:FindFirstChild("Normal")
+	local normal, _, marker = UNLOAD.skillcheckNodes()
 	if skillcheckWidgetOnScreen(normal) then
 		lastSkillcheckOnScreenAt = os.clock()
-		return true, "round"
+		return true,"round"
 	end
-	local lock = playerGui:FindFirstChild("LockUI")
-	local hud = lock and lock:FindFirstChild("HUD")
-	local skill = hud and hud:FindFirstChild("Skillcheck")
-	local main = skill and skill:FindFirstChild("Main")
-	local marker = main and main:FindFirstChild("Marker")
 	if skillcheckWidgetOnScreen(marker) then
 		lastSkillcheckOnScreenAt = os.clock()
-		return true, "bar"
+		return true,"bar"
 	end
-	if os.clock() - lastSkillcheckOnScreenAt < 0.18 then return true, "ui_transition" end
-	return false, "none"
+	if os.clock() - lastSkillcheckOnScreenAt < 0.18 then return true,"ui_transition" end
+	return false,"none"
 end
 
 local autoSkillcheck
@@ -3206,34 +3216,24 @@ local skillcheckMovedAt = 0
 local lastDial, lastBar
 
 local function skillcheckVisible()
-	local round = playerGui:FindFirstChild("RoundSkillcheck")
-	local container = round and round:FindFirstChild("Container")
-	local normal = container and container:FindFirstChild("Normal")
-	local lockUI = playerGui:FindFirstChild("LockUI")
-	local hud = lockUI and lockUI:FindFirstChild("HUD")
-	local skillcheck = hud and hud:FindFirstChild("Skillcheck")
-	local main = skillcheck and skillcheck:FindFirstChild("Main")
-	local marker = main and main:FindFirstChild("Marker")
-	local now = os.clock()
-	local visible = false
-	if normal and effectivelyVisible(normal) then
+	local normal, _, marker = UNLOAD.skillcheckNodes()
+	local now,visible = os.clock(),false
+	if normal and skillcheckWidgetOnScreen(normal) then
 		visible = true
-		local aim = normal:FindFirstChild("AimImage")
+		local aim = normal:FindFirstChild("AimImage",true)
 		local rotation = aim and aim.Rotation
 		if rotation ~= lastDial then
-			lastDial = rotation
-			skillcheckMovedAt = now
+			lastDial,skillcheckMovedAt = rotation,now
 		end
 	end
-	if marker and effectivelyVisible(marker) then
+	if marker and skillcheckWidgetOnScreen(marker) then
 		visible = true
 		local x = marker.AbsolutePosition.X
 		if x ~= lastBar then
-			lastBar = x
-			skillcheckMovedAt = now
+			lastBar,skillcheckMovedAt = x,now
 		end
 	end
-	return visible and now - skillcheckMovedAt < 0.5
+	return visible and now-skillcheckMovedAt < 0.5
 end
 
 local skillcheckSince = nil
@@ -4266,152 +4266,241 @@ end
 local function normRot(r) return (r + 180) % 360 - 180 end
 
 local function newAutoSkillcheck()
-    local feature = { enabled=false }
-    local runId = 0
-    local beats = {}
-    local function active(myId) return alive and feature.enabled and runId == myId end
-    local function stop()
-        for connection in pairs(beats) do connection:Disconnect() end
-        table.clear(beats)
-    end
-    local function findPath(parts)
-        local current = playerGui
-        for _, name in ipairs(parts) do
-            current = current and current:FindFirstChild(name)
-            if not current then return nil end
-        end
-        return current
-    end
-    local function awaitPath(parts, myId)
-        while active(myId) do
-            local found = findPath(parts)
-            if found then return found end
-            task.wait(0.05)
-        end
-    end
-    local function watchFrames(callback)
-        local heartbeat = RunService.Heartbeat:Connect(callback)
-        beats[heartbeat] = true
-        return function()
-            heartbeat:Disconnect()
-            beats[heartbeat] = nil
-        end
-    end
-    local function watchRound(myId)
-        while active(myId) do
-            local normal = awaitPath({ "RoundSkillcheck","Container","Normal" }, myId)
-            if not normal then break end
-            local aimImage = normal:FindFirstChild("AimImage")
-            local target = normal:FindFirstChild("Target")
-            local hit = normal:FindFirstChild("Hit")
-            if not (aimImage and target and hit) then
-                task.wait(0.05)
-                continue
-            end
-            local fired, lastV7 = false, nil
-            local lastVisible = effectivelyVisible(normal)
-            local function check()
-                if not active(myId) or not normal:IsDescendantOf(playerGui) then return end
-                local visible = effectivelyVisible(normal)
-                if visible ~= lastVisible then
-                    if visible then fired, lastV7 = false, nil end
-                    lastVisible = visible
-                end
-                if not visible or fired then return end
-                local aim = normRot(aimImage.Rotation + 180)
-                local zoneStart = normRot(target.Rotation - 30)
-                local v7 = math.abs(((aim - zoneStart) + 180) % 360 - 180) / 60
-                if lastV7 and lastV7 < 0.44 and v7 >= 0.44 then
-                    local sent, method = pressGuiButton(hit)
-                    fired = sent
-                    if sent then increment("skillcheckInputs")
-                    else increment("skillcheckInputFailures") end
-                    debugEvent("SKILLCHECK", "dial_input", {
-                        dispatched=sent,method=method,
-                        position=string.format("%.3f",v7),
-                    }, sent and "INFO" or "WARN")
-                end
-                lastV7 = v7
-            end
-            local disconnect = watchFrames(check)
-            increment("skillcheckRebinds")
-            while active(myId) and normal:IsDescendantOf(playerGui)
-                and findPath({ "RoundSkillcheck","Container","Normal" }) == normal
-                and aimImage.Parent == normal and target.Parent == normal and hit.Parent == normal do
-                task.wait(0.10)
-            end
-            disconnect()
-        end
-    end
-    local function watchLock(myId)
-        while active(myId) do
-            local main = awaitPath({ "LockUI","HUD","Skillcheck","Main" }, myId)
-            if not main then break end
-            local marker = main:FindFirstChild("Marker")
-            local objective = main:FindFirstChild("Objective")
-            local button = main:FindFirstChild("MobileButtonClick")
-            if not (marker and objective and button) then
-                task.wait(0.05)
-                continue
-            end
-            local fired, lastDist = false, nil
-            local lastVisible = effectivelyVisible(marker)
-            local function check()
-                if not active(myId) or not main:IsDescendantOf(playerGui) then return end
-                local visible = effectivelyVisible(marker)
-                if visible ~= lastVisible then
-                    if visible then fired, lastDist = false, nil end
-                    lastVisible = visible
-                end
-                if not visible or fired then return end
-                local markerCenter = marker.AbsolutePosition.X + marker.AbsoluteSize.X * 0.5
-                local objectiveCenter = objective.AbsolutePosition.X + objective.AbsoluteSize.X * 0.5
-                local dist = markerCenter - objectiveCenter
-                if lastDist and lastDist < -2 and dist >= -2 then
-                    local sent, method = pressGuiButton(button)
-                    fired = sent
-                    if sent then increment("skillcheckInputs")
-                    else increment("skillcheckInputFailures") end
-                    debugEvent("SKILLCHECK", "bar_input", {
-                        dispatched=sent,method=method,
-                        distance=string.format("%.2f",dist),
-                    }, sent and "INFO" or "WARN")
-                end
-                lastDist = dist
-            end
-            local disconnect = watchFrames(check)
-            increment("skillcheckRebinds")
-            while active(myId) and main:IsDescendantOf(playerGui)
-                and findPath({ "LockUI","HUD","Skillcheck","Main" }) == main
-                and marker.Parent == main and objective.Parent == main and button.Parent == main do
-                task.wait(0.10)
-            end
-            disconnect()
-        end
-    end
-    function feature.enable()
-        if feature.enabled then return end
-        feature.enabled = true
-        runId += 1
-        local myId = runId
-        supervise("skillcheck dial", function()
-            return active(myId)
-        end, function()
-            watchRound(myId)
-        end)
-        supervise("skillcheck bar", function()
-            return active(myId)
-        end, function()
-            watchLock(myId)
-        end)
-    end
-    function feature.disable()
-        feature.enabled = false
-        runId += 1
-        stop()
-    end
-    table.insert(cleanups, feature.disable)
-    return feature
+	local feature = { enabled=false }
+	local runId = 0
+	local beats = {}
+	local function active(id) return alive and feature.enabled and runId == id end
+	local function stop()
+		for connection in pairs(beats) do pcall(function() connection:Disconnect() end) end
+		table.clear(beats)
+	end
+	-- Heartbeat is reliable even with 3D rendering disabled. PreRender provides a
+	-- second chance to see short-lived GUI frames without changing hit timing.
+	local function watchFrames(callback)
+		local failed, errors = false,0
+		local function protectedCheck()
+			if failed then return end
+			local ok,err = pcall(callback)
+			if not ok then
+				errors += 1
+				increment("skillcheckWatchErrors")
+				debugThrottled("skillcheck_frame_error",1,"SKILLCHECK","watch_error",
+					{ error=tostring(err),count=errors },"WARN")
+				if errors >= 2 then failed = true end
+			else
+				errors = 0
+			end
+		end
+		local attached = {}
+		local heartbeat = RunService.Heartbeat:Connect(protectedCheck)
+		beats[heartbeat],attached[heartbeat] = true,true
+		local ok,render = pcall(function()
+			return RunService.PreRender:Connect(protectedCheck)
+		end)
+		if ok and render then
+			beats[render],attached[render] = true,true
+			increment("skillcheckFrameConnections")
+		end
+		return function()
+			for connection in pairs(attached) do
+				connection:Disconnect()
+				beats[connection] = nil
+			end
+		end,function() return failed end
+	end
+	local function bindRound(id)
+		local missingEpisode = false
+		while active(id) do
+			local normal = UNLOAD.skillcheckNodes()
+			local aim = normal and normal:FindFirstChild("AimImage",true)
+			local target = normal and normal:FindFirstChild("Target",true)
+			local hit = normal and normal:FindFirstChild("Hit",true)
+			if not (normal and aim and target and hit) then
+				if normal and effectivelyVisible(normal) and not missingEpisode then
+					missingEpisode = true
+					increment("skillcheckMissingParts")
+					debugThrottled("round_parts_missing",0.75,"SKILLCHECK","round_waiting_for_parts",
+						{ aim=aim ~= nil,target=target ~= nil,hit=hit ~= nil },"WARN")
+				end
+			task.wait(0.03)
+			else
+				missingEpisode = false
+				local fired, firedAt = false,0
+				local lastVisible,lastValue,lastAim,lastTarget = false,nil,nil,nil
+				local bindTime = os.clock()
+				local function check()
+					if not active(id) or not normal:IsDescendantOf(playerGui) then return end
+					local visible = effectivelyVisible(normal)
+					if visible ~= lastVisible then
+						if visible then
+							fired,firedAt,lastValue,lastAim,lastTarget = false,0,nil,nil,nil
+							increment("skillcheckRoundSeen")
+							debugThrottled("round_ui_seen",0.5,"SKILLCHECK","round_detected",
+								{ bindDelayMs=math.floor((os.clock()-bindTime)*1000) })
+						else
+							lastValue,lastAim,lastTarget = nil,nil,nil
+						end
+						lastVisible = visible
+					end
+					if not visible then return end
+					local now = os.clock()
+					local aimRot,targetRot = aim.Rotation,target.Rotation
+					local currentAim = normRot(aimRot+180)
+					local zoneStart = normRot(targetRot-30)
+					local value = math.abs(((currentAim-zoneStart)+180)%360-180)/60
+					-- A widget may remain Visible across separate checks. A changed
+					-- target, or a discontinuous pointer reset, marks a NEW check.
+					if fired and now-firedAt > 0.30 then
+						local targetReset = lastTarget and math.abs(normRot(targetRot-lastTarget)) > 5
+						local pointerReset = lastAim and math.abs(normRot(aimRot-lastAim)) > 75
+						if targetReset or pointerReset then
+							fired,lastValue = false,nil
+							increment("skillcheckRearms")
+							debugThrottled("round_rearm",0.3,"SKILLCHECK","round_new_cycle",
+								{ reason=targetReset and "target_changed" or "pointer_reset" })
+						end
+					end
+					if not fired then
+						local crossed = lastValue and lastValue < 0.44 and value >= 0.44
+						local late = lastValue == nil and value >= 0.44 and value <= 0.52
+						if crossed or late then
+							-- Lock BEFORE dispatch: both Heartbeat and PreRender observe
+							-- the same widget, but must never double-activate it.
+							fired,firedAt = true,now
+							if late then increment("skillcheckLateAttached") end
+							local sent,method = pressGuiButton(hit)
+							if sent then increment("skillcheckInputs")
+							else increment("skillcheckInputFailures") end
+							debugEvent("SKILLCHECK","dial_input",{
+								dispatched=sent,method=method,lateAttach=late,
+								position=string.format("%.3f",value),
+							},sent and "INFO" or "WARN")
+						end
+					end
+					lastValue,lastAim,lastTarget = value,aimRot,targetRot
+				end
+				local disconnect,broken = watchFrames(check)
+				increment("skillcheckRebinds")
+				while active(id) and not broken() and normal:IsDescendantOf(playerGui)
+					and aim:IsDescendantOf(normal) and target:IsDescendantOf(normal)
+					and hit:IsDescendantOf(normal) do
+					local latest = UNLOAD.skillcheckNodes()
+					if latest ~= normal then
+						 increment("skillcheckUiRecreated")
+						 break
+					end
+					if normal:FindFirstChild("AimImage",true) ~= aim
+						or normal:FindFirstChild("Target",true) ~= target
+						or normal:FindFirstChild("Hit",true) ~= hit then
+						increment("skillcheckUiRecreated")
+						break
+					end
+					task.wait(0.04)
+				end
+			disconnect()
+		end
+		end
+	end
+	local function bindBar(id)
+		local missingEpisode = false
+		while active(id) do
+			local _,main,marker = UNLOAD.skillcheckNodes()
+			local objective = main and main:FindFirstChild("Objective",true)
+			local button = main and main:FindFirstChild("MobileButtonClick",true)
+			if not (main and marker and objective and button) then
+				if main and effectivelyVisible(main) and not missingEpisode then
+					missingEpisode = true
+					increment("skillcheckMissingParts")
+					debugThrottled("bar_parts_missing",0.75,"SKILLCHECK","bar_waiting_for_parts",
+						{ marker=marker ~= nil,objective=objective ~= nil,button=button ~= nil },"WARN")
+				end
+			task.wait(0.03)
+			else
+				missingEpisode = false
+				local fired,firedAt = false,0
+				local lastVisible,lastDist,lastMarkerX,lastObjectiveX = false,nil,nil,nil
+				local bindTime = os.clock()
+				local function check()
+					if not active(id) or not main:IsDescendantOf(playerGui) then return end
+					local visible = effectivelyVisible(marker)
+					if visible ~= lastVisible then
+						if visible then
+							fired,firedAt,lastDist,lastMarkerX,lastObjectiveX = false,0,nil,nil,nil
+							increment("skillcheckBarSeen")
+							debugThrottled("bar_ui_seen",0.5,"SKILLCHECK","bar_detected",
+								{ bindDelayMs=math.floor((os.clock()-bindTime)*1000) })
+						else
+							lastDist,lastMarkerX,lastObjectiveX = nil,nil,nil
+						end
+						lastVisible = visible
+					end
+					if not visible then return end
+					local now = os.clock()
+					local markerX = marker.AbsolutePosition.X+marker.AbsoluteSize.X*0.5
+					local objectiveX = objective.AbsolutePosition.X+objective.AbsoluteSize.X*0.5
+					local dist = markerX-objectiveX
+					if fired and now-firedAt > 0.30 then
+						local targetReset = lastObjectiveX and math.abs(objectiveX-lastObjectiveX) > 7
+						local pointerReset = lastMarkerX and (lastMarkerX-markerX) > math.max(35,marker.AbsoluteSize.X*3)
+							and dist < -math.max(12,objective.AbsoluteSize.X*0.75)
+						if targetReset or pointerReset then
+							fired,lastDist = false,nil
+							increment("skillcheckRearms")
+							debugThrottled("bar_rearm",0.3,"SKILLCHECK","bar_new_cycle",
+								{ reason=targetReset and "objective_changed" or "marker_reset" })
+						end
+					end
+					if not fired then
+						local crossed = lastDist and lastDist < -2 and dist >= -2
+						local late = lastDist == nil and dist >= -2
+							and dist <= math.max(4,objective.AbsoluteSize.X*0.20)
+						if crossed or late then
+							fired,firedAt = true,now
+							if late then increment("skillcheckLateAttached") end
+							local sent,method = pressGuiButton(button)
+							if sent then increment("skillcheckInputs")
+							else increment("skillcheckInputFailures") end
+							debugEvent("SKILLCHECK","bar_input",{
+								 dispatched=sent,method=method,lateAttach=late,
+								 distance=string.format("%.2f",dist),
+							},sent and "INFO" or "WARN")
+						end
+					end
+					lastDist,lastMarkerX,lastObjectiveX = dist,markerX,objectiveX
+				end
+				local disconnect,broken = watchFrames(check)
+				increment("skillcheckRebinds")
+				while active(id) and not broken() and main:IsDescendantOf(playerGui)
+					and marker:IsDescendantOf(main) and objective:IsDescendantOf(main)
+					and button:IsDescendantOf(main) do
+					local _,latestMain,latestMarker = UNLOAD.skillcheckNodes()
+					if latestMain ~= main or latestMarker ~= marker
+						or main:FindFirstChild("Objective",true) ~= objective
+						or main:FindFirstChild("MobileButtonClick",true) ~= button then
+						increment("skillcheckUiRecreated")
+						break
+					end
+					task.wait(0.04)
+				end
+			disconnect()
+		end
+	end
+	end
+	function feature.enable()
+		if feature.enabled then return end
+		feature.enabled = true
+		runId += 1
+		local id = runId
+		supervise("skillcheck dial",function() return active(id) end,function() bindRound(id) end)
+		supervise("skillcheck bar",function() return active(id) end,function() bindBar(id) end)
+	end
+	function feature.disable()
+		feature.enabled = false
+		runId += 1
+		stop()
+	end
+	table.insert(cleanups,feature.disable)
+	return feature
 end
 
 autoSkillcheck = newAutoSkillcheck()
