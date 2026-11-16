@@ -62,12 +62,11 @@ end
 
 local OPTIONS = {
 	AutoHide = true,  AutoElevator = true,
-	Fuseboxes = true,  ItemsFirst = true,
-	CollectLast = true,
+	Fuseboxes = true,
 	MovementMode = "Teleport", TweenDepth = -15, Disable3DRendering = false,
 }
 
-local BUILD = "TU Rava Hub v2.6.16"
+local BUILD = "TU Rava Hub v2.6.17"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -87,6 +86,9 @@ local debugStats = {
 	promptMovePulses = 0, promptMoveVerified = 0, promptMoveStationary = 0, promptMoveBlocked = 0,
 	machineNearFinishHeld = 0, machineChaseDeferred = 0, finalSafeMoves = 0, finalSafeFailures = 0,
 	elevatorWatchStarts = 0, elevatorFallbacks = 0, elevatorFallbackSuccess = 0, elevatorFallbackFailures = 0,
+	elevatorHoldCorrections = 0, elevatorDeaths = 0,
+	pickupBeforeWaits = 0, pickupBeforeCompleted = 0, pickupBeforeTimeouts = 0, masterToggles = 0,
+	elevatorPlatformDetections = 0, elevatorUncertainArrivals = 0, elevatorGeometryMisses = 0,
 	pickupTweenUnsafe = 0, pickupTweenDistance = 0, pickupTravelMs = 0,
 	pickupAttempts = 0, pickupConfirmed = 0, pickupUnconfirmed = 0,
 	promptAttempts = 0, promptFailures = 0, machineTargetChanges = 0,
@@ -673,10 +675,10 @@ local diagnosticsDock = new("Frame", {
 }, main)
 new("Frame", { Size = UDim2.new(1, -20, 0, 1), Position = UDim2.fromOffset(10, 2),
     BackgroundColor3 = UI.soft, BorderSizePixel = 0, ZIndex = 3 }, diagnosticsDock)
-local pages, menuButtons, activeTab = {}, {}, "Autofarm"
+local pages, menuButtons, activeTab = {}, {}, "Main"
 local toggleRefreshers = {}
-local TAB_ORDER = { "ESP", "Autofarm", "Machines", "Diagnostics" }
-local TAB_SYMBOL = { ESP = "◉", Autofarm = "◆", Machines = "▣", Diagnostics = "≡" }
+local TAB_ORDER = { "Main", "Autofarm", "Machines", "ESP", "Diagnostics" }
+local TAB_SYMBOL = { Main = "⌂", Autofarm = "◆", Machines = "▣", ESP = "◉", Diagnostics = "≡" }
 local function showTab(name)
 	activeTab = name
 	for _, refresh in ipairs(toggleRefreshers) do refresh() end
@@ -779,6 +781,7 @@ local function createSubcategory(page, heading, order, initiallyOpen)
 	return body
 end
 
+pages.Main = createSection("Main")
 pages.Diagnostics = createSection("Diagnostics")
 uiText(pages.Diagnostics, "Initializing Diagnostics…",
 	12, false, UI.muted, {
@@ -852,7 +855,7 @@ local function createToggleRow(parent, name, order, feature, description)
 			increment("workerErrors")
 			debugEvent("UI", "toggle_error", { name = name, error = err }, "ERROR")
 		end
-		refresh()
+		for _, update in ipairs(toggleRefreshers) do update() end
 	end))
 end
 
@@ -1493,7 +1496,6 @@ heldCount = function()
 end
 
 local chase = { pending = false, holdUntil = 0 }
-local finalSweepActive = false
 local pickupCircuit = {
 	paused = false, finalized = false,
 	failed = setmetatable({}, { __mode = "k" }),
@@ -1568,6 +1570,20 @@ track(workspace.ChildAdded:Connect(function(instance)
 	end
 end))
 
+UNLOAD.pickupBefore = { completed = false, started = nil, mapRef = workspace:FindFirstChild("Map") }
+function UNLOAD.pickupBefore.reset(reason)
+	UNLOAD.pickupBefore.completed = false
+	UNLOAD.pickupBefore.started = nil
+	UNLOAD.pickupBefore.mapRef = workspace:FindFirstChild("Map")
+	pickupCircuit.reset(reason)
+	debugEvent("PICKUP", "before_phase_reset", { reason = reason })
+end
+track(workspace.ChildAdded:Connect(function(inst)
+	if inst.Name == "Map" and inst ~= UNLOAD.pickupBefore.mapRef then
+		UNLOAD.pickupBefore.reset("new_map")
+	end
+end))
+
 local pickupCoordinator = {
 	owner = nil,  home = nil,  lastActivity = os.clock(),
 	enabledCount = 0,
@@ -1581,7 +1597,7 @@ local function releasePickup(farm)
 end
 
 local function returnPickupHome(force, isBlocked)
-	if finalSweepActive or pickupCircuit.paused or pickupCircuit.finalized then return end
+	if pickupCircuit.paused or pickupCircuit.finalized then return end
 	if not pickupCoordinator.home or pickupCoordinator.owner then return end
 	if isBlocked and isBlocked() then
 		pickupCoordinator.home = nil -- Machine work supersedes the previous pickup origin.
@@ -1620,8 +1636,8 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 		local function active() return alive and farm.enabled and runId == myId end
 		local function allowed()
 			return active() and not pickupCircuit.paused and not pickupCircuit.finalized and (not gate or gate()) and not (isBlocked and isBlocked())
-				and (finalSweepActive or os.clock() >= motionPauseUntil)
-				and (finalSweepActive or not (OPTIONS.AutoHide and os.clock() < chase.holdUntil))
+				and (os.clock() >= motionPauseUntil)
+				and not (OPTIONS.AutoHide and os.clock() < chase.holdUntil)
 		end
 		while active() do
 			local folders = {}
@@ -1657,7 +1673,6 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 							didWork = true
 							farm.working = true
 							increment("pickupAttempts")
-							if finalSweepActive then increment("finalSweepCollectionAttempts") end
 							local beganAt = os.clock()
 							debugEvent("PICKUP", "attempt", { folder = folder.Name, name = target.Name,
 								held = heldCount(), prompt = prompt.Name, distance = string.format("%.1f", (root.Position - part.Position).Magnitude) })
@@ -2225,29 +2240,12 @@ local function pickupBusy()
 	return false
 end
 
-local function pickupsRemaining()
-	for _, entry in ipairs(PICKUPS) do
-		if entry.farm.enabled and (not entry.held or heldCount() < FARM.HeldLimit) then
-			local folder = resolveWorkspacePath(entry.folder)
-			if folder then
-				for _, target in ipairs(getTargets(folder)) do
-					local prompt = getPrompt(target)
-					if prompt and prompt.Enabled and (not entry.filter or entry.filter(target)) then return true end
-				end
-			end
-		end
-	end
-	return false
-end
-
 local function collectOpen()
-	if finalSweepActive then return true end
-	if OPTIONS.CollectLast then return machinesDone ~= nil and machinesDone() end
-	return true
+	return not UNLOAD.pickupBefore.completed and not pickupCircuit.finalized
+		and not (machinesDone and machinesDone())
 end
 
 local function machineBusy()
-	if finalSweepActive then return false end
 	return machineFarm ~= nil and machineFarm.enabled == true and
 		(machineFarm.target ~= nil or machineFarm.placed == true or machineFarm.moving == true
 			or machineFarm.finalizing == true)
@@ -2331,49 +2329,13 @@ local farmBody = createSection("Autofarm", 2)
 local farmActions = createSubcategory(farmBody, "AUTOMATIC ACTIONS", 1, true)
 createToggleRow(farmActions, "Auto Use Ability", 1, autoAbility)
 createToggleRow(farmActions, "Auto Use Items", 3, autoUse)
-createToggleRow(farmActions, "Auto Use Trash Items", 4,
-	newOption(ITEM_OPTIONS, "AutoTrashUse"))
+UNLOAD.trashUseToggle = newOption(ITEM_OPTIONS, "AutoTrashUse")
+createToggleRow(farmActions, "Auto Use Trash Items", 4, UNLOAD.trashUseToggle)
 
 local farmPickups = createSubcategory(farmBody, "PICKUP ROUTES", 2, true)
 createToggleRow(farmPickups, "Capsule Autofarm", 1, capsuleFarm)
 createToggleRow(farmPickups, "Item Autofarm", 2, itemFarm)
 createToggleRow(farmPickups, "Candy Autofarm", 3, candyFarm)
-local timingRow = new("Frame", {
-	LayoutOrder = 4, Size = UDim2.new(1, -9, 0, 43),
-	BackgroundColor3 = UI.surface, BorderSizePixel = 0,
-}, farmPickups)
-corner(timingRow, 9)
-uiStroke(timingRow)
-uiText(timingRow, "Pickup Timing", 14, true, UI.text, {
-	Position = UDim2.fromOffset(12, 0), Size = UDim2.new(0.42, 0, 1, 0),
-})
-local beforeButton = new("TextButton", {
-	Text = "BEFORE", Font = Enum.Font.GothamBold, TextSize = 11,
-	TextColor3 = UI.text, BorderSizePixel = 0,
-	Position = UDim2.new(0.46, 0, 0.5, -14), Size = UDim2.new(0.25, -3, 0, 28),
-}, timingRow)
-local afterButton = new("TextButton", {
-	Text = "AFTER", Font = Enum.Font.GothamBold, TextSize = 11,
-	TextColor3 = UI.text, BorderSizePixel = 0,
-	Position = UDim2.new(0.72, 0, 0.5, -14), Size = UDim2.new(0.26, -8, 0, 28),
-}, timingRow)
-corner(beforeButton, 7)
-corner(afterButton, 7)
-local function refreshTiming()
-	beforeButton.BackgroundColor3 = OPTIONS.CollectLast and UI.soft or UI.accent
-	afterButton.BackgroundColor3 = OPTIONS.CollectLast and UI.accent or UI.soft
-end
-local function setTiming(after)
-	if OPTIONS.CollectLast == after then return end
-	OPTIONS.CollectLast = after
-	refreshTiming()
-	debugEvent("PICKUP", "timing_changed", { mode = after and "after" or "before" })
-end
-track(beforeButton.Activated:Connect(function() setTiming(false) end))
-track(afterButton.Activated:Connect(function() setTiming(true) end))
-table.insert(toggleRefreshers, refreshTiming)
-refreshTiming()
-
 local farmFilters = createSubcategory(farmBody, "COLLECTION FILTERS", 3, true)
 createToggleRow(farmFilters, "Pick Up Trash Items", 1, newOption(ITEM_OPTIONS, "Trash"))
 createToggleRow(farmFilters, "Pick Up Health Items", 2, newOption(ITEM_OPTIONS, "Health"))
@@ -2389,8 +2351,7 @@ local MACHINE = {
 	Elevator = "Map.SpecialFolder.ExitElevator",  ElevatorFallback = "Elevator",  ElevatorHeight = -20,
 	Tick = 0.03, Settle = 0.025, PromptRetry = 0.08,
 	RescanInterval = 0.12, StallTimeout = 3, UseTimeout = 8, NearFinishAt = 90, NearFinishHold = 20,
-	ClearHold = 1.0, ItemWaitMax = 35, CollectWaitMax = 90, ItemIdle = 0.2,
-	FinalSweepPoll = 0.18, FinalSweepClearTime = 0.25,
+	ClearHold = 1.0, ItemWaitMax = 35,
 	EyeHeight = 3,  SkillcheckPause = 3,  SkillcheckStale = 6,
 	ChaseHold = 3,  DoneValue = 100,  FuseDwell = 1,
 	Fuseboxes = {
@@ -2642,9 +2603,17 @@ local function bindHealthSource()
 				position = playerPos and tostring(playerPos) or "unknown",
 				machineTarget = debugStatus.currentTarget,
 				pickupActive = pickupCoordinator.owner ~= nil,
-				finalSweep = finalSweepActive,
 				attribution = "proximity_only",
 			}, "WARN")
+			if previous >= 3 and newValue <= 0 then
+				increment("elevatorDeaths")
+				debugEvent("HITS", "elevator_death", {
+					nearestInfected = name or "none", nearestDistance = distance or "unknown",
+					position = playerPos and tostring(playerPos) or "unknown",
+					lastElevator = machineFarm and machineFarm.elevatorSource or "none",
+					platformFound = machineFarm and machineFarm.elevatorPlatform ~= nil or false,
+				}, "ERROR")
+			end
 		end
 		if newValue <= 0 then exportOnDeath(mode or "unknown", newValue) end
 	end
@@ -2697,7 +2666,7 @@ task.spawn(function()
 				end
 				if arg == "Started" and OPTIONS.AutoHide then
 					increment("chases")
-					local pickupTravel = finalSweepActive or pickupCoordinator.owner ~= nil
+					local pickupTravel = pickupCoordinator.owner ~= nil
 						or (activeMotion and activeMotion.owner == "pickup")
 						or ((capsuleFarm.enabled or itemFarm.enabled or candyFarm.enabled)
 							and not machineBusy())
@@ -2976,18 +2945,10 @@ end
 local function newMachineAutofarm()
 	local farm = { enabled = false, target = nil, finalizing = false,
 		elevatorTransit = false, elevatorTarget = nil, allDoneSince = nil,
-		elevatorEmergencyLocked = false, elevatorWatchFired = false }
+		elevatorEmergencyLocked = false, elevatorWatchFired = false,
+		elevatorHoldCorrections = 0, lastElevatorHoldAt = 0 }
 	local runId = 0
 	local elevatorPreference = 1
-	local pickupsAt, pickupsValue = 0, false
-	local function cachedPickups()
-		local now = os.clock()
-		if now - pickupsAt >= 0.25 then
-			pickupsAt = now
-			pickupsValue = scanFinalPickups().safe > 0
-		end
-		return pickupsValue
-	end
 	local function move(position, keepGoing, mode)
 		farm.moving = true
 		local arrived = teleportCharacter(CFrame.new(position), keepGoing, "machine", mode)
@@ -3007,41 +2968,104 @@ local function newMachineAutofarm()
 		end
 		return arrived == true
 	end
+	local function elevatorPlatform(elevator)
+		if not elevator then return nil end
+		local reference = targetPosition(elevator)
+		local fallback = reference and (reference + Vector3.new(0, MACHINE.ElevatorHeight, 0))
+		if not fallback then return nil end
+		local best, bestScore = nil, -math.huge
+		local function consider(part)
+			if not part:IsA("BasePart") or part.Size.X < 3 or part.Size.Z < 3
+				or part.Size.X > 70 or part.Size.Z > 70
+				or part.CFrame.UpVector.Y < 0.75 then return end
+			local horizontal = Vector3.new(part.Position.X - fallback.X, 0,
+				part.Position.Z - fallback.Z).Magnitude
+			if horizontal > 24 then return end
+			local name = part.Name:lower()
+			if name:find("door") or name:find("wall") or name:find("glass")
+				or name:find("ceiling") or name:find("roof") then return end
+			local strength = 0
+			if name:find("floor") then strength = 12
+			elseif name:find("platform") then strength = 11
+			elseif name:find("interior") or name:find("inside") then strength = 10
+			elseif name:find("base") then strength = 7
+			elseif name:find("trigger") or name:find("zone") then strength = 6 end
+			if strength == 0 then return end
+			if part.CanCollide then strength += 2 end
+			strength = strength - math.min(20, math.abs(part.Position.Y - fallback.Y)) * 0.12
+			if strength > bestScore then best, bestScore = part, strength end
+		end
+		if elevator:IsA("BasePart") then consider(elevator) end
+		for _, descendant in ipairs(elevator:GetDescendants()) do consider(descendant) end
+		if best and bestScore >= 5 then
+			local pos = best.Position + best.CFrame.UpVector * (best.Size.Y * 0.5 + 2.75)
+			return pos, best, "platform"
+		end
+		return fallback, nil, "legacy_offset"
+	end
+	local function platformContains(part, point)
+		if not part or not part.Parent then return false end
+		local localPoint = part.CFrame:PointToObjectSpace(point)
+		return math.abs(localPoint.X) <= part.Size.X * 0.5 + 1
+			and math.abs(localPoint.Z) <= part.Size.Z * 0.5 + 1
+			and localPoint.Y >= part.Size.Y * 0.5 - 1.5
+			and localPoint.Y <= part.Size.Y * 0.5 + 6.5
+	end
+	local function verifyElevatorPosition()
+		local root = getPlayerRoot()
+		local near = root ~= nil and farm.elevatorTarget ~= nil
+			and (root.Position - farm.elevatorTarget).Magnitude <= 7
+		local geometry = near and platformContains(farm.elevatorPlatform, root.Position) or false
+		return near == true, geometry == true
+	end
+	local function chooseElevator(paths)
+		local fallback = nil
+		for _, path in ipairs(paths) do
+			local instance = resolveWorkspacePath(path)
+			local spot, platform, detection = elevatorPlatform(instance)
+			if spot then
+				local choice = { pos = spot, platform = platform, detection = detection,
+					instance = instance, path = path }
+				if platform then return choice end
+				fallback = fallback or choice
+			end
+		end
+		return fallback
+	end
 	local function goElevator(advancePreference, keepGoing)
 		keepGoing = keepGoing or function() return alive and farm.enabled end
 		local paths = elevatorPreference == 1
 			and { MACHINE.Elevator, MACHINE.ElevatorFallback }
 			or { MACHINE.ElevatorFallback, MACHINE.Elevator }
-		for _, path in ipairs(paths) do
-			local elevator = resolveWorkspacePath(path)
-			local spot = elevator and targetPosition(elevator)
-			if spot then
-				local arrived = elevatorMove(spot + Vector3.new(0, MACHINE.ElevatorHeight, 0), keepGoing)
-				if arrived and advancePreference then
-					elevatorPreference = elevatorPreference == 1 and 2 or 1
-				end
-				return arrived
-			end
-		end
-		return false
+		local chosen = chooseElevator(paths)
+		if not chosen then return false end
+		farm.elevatorPlatform = chosen.platform
+		farm.elevatorSource = chosen.path
+		local arrived = elevatorMove(chosen.pos, keepGoing)
+		if arrived and advancePreference then elevatorPreference = elevatorPreference == 1 and 2 or 1 end
+		return arrived
 	end
 	local function finishAtElevator(active)
-		for _, path in ipairs({ MACHINE.Elevator, MACHINE.ElevatorFallback }) do
-			local elevator = resolveWorkspacePath(path)
-			local spot = elevator and targetPosition(elevator)
-			if spot then
-				local arrived = elevatorMove(spot + Vector3.new(0, MACHINE.ElevatorHeight, 0), active)
-				increment(arrived and "finalSafeMoves" or "finalSafeFailures")
-				debugEvent("MACHINE", arrived and "final_safespot_arrived" or "final_safespot_failed", {
-					path = path, mode = OPTIONS.MovementMode,
-				}, arrived and "INFO" or "WARN")
-				if arrived then return true end
-			end
+		local chosen = chooseElevator({ MACHINE.Elevator, MACHINE.ElevatorFallback })
+		if not chosen then
+			debugEvent("MACHINE", "elevator_location_missing", nil, "WARN")
+			return false
 		end
-		debugEvent("MACHINE", "final_safespot_unavailable", nil, "WARN")
-		return false
+		farm.elevatorPlatform = chosen.platform
+		farm.elevatorSource = chosen.path
+		local arrived = elevatorMove(chosen.pos, active)
+		local within, geometry = verifyElevatorPosition()
+		if chosen.platform then increment("elevatorPlatformDetections") end
+		if arrived and not geometry then increment("elevatorUncertainArrivals") end
+		if arrived and not within then increment("elevatorGeometryMisses") end
+		increment(arrived and "finalSafeMoves" or "finalSafeFailures")
+		debugEvent("MACHINE", arrived and "elevator_position_reached" or "elevator_move_failed", {
+			path = chosen.path, mode = OPTIONS.MovementMode, detection = chosen.detection,
+			nearTarget = within, platformVerified = geometry,
+			positionOnly = chosen.platform == nil,
+		}, arrived and geometry and "INFO" or "WARN")
+		return arrived
 	end
-	-- TODO (later): detect fusebox enable/completion events directly so the
 	local function checkFuseboxes(active)
 		for _, path in ipairs(MACHINE.Fuseboxes) do
 			if not active() then return end
@@ -3083,9 +3107,8 @@ local function newMachineAutofarm()
 		local lastContactAt = -math.huge
 		local clearSince = nil
 		local waitStart = nil
-		local lastBusyAt = os.clock()
-		local finalSweep = nil
-		local startupPickupsDone = false
+		local startupPickupsDone = UNLOAD.pickupBefore.completed
+		local doneCandidateAt = nil
 		local emergencyNextMove = false
 		local handoffStartedAt, handoffFrom, handoffReason = nil, nil, nil
 		local abilityTriggeredFor = setmetatable({}, { __mode = "k" })
@@ -3127,7 +3150,6 @@ local function newMachineAutofarm()
 				task.wait(MACHINE.Tick)
 				continue
 			end
-			if chase.pending and finalSweepActive then chase.pending = false end
 			if chase.pending and root and farm.target and farm.placed then
 				local remaining = getProgress(farm.target)
 				if remaining and remaining >= MACHINE.NearFinishAt and remaining < MACHINE.DoneValue then
@@ -3159,20 +3181,61 @@ local function newMachineAutofarm()
 					hidden = false
 				end
 			end
-			local busy = pickupBusy()
-			if busy then lastBusyAt = os.clock() end
-			local waitingPickups = busy or (cachedPickups() and os.clock() - lastBusyAt < MACHINE.ItemIdle)
-			local pending = not pickupCircuit.paused and not startupPickupsDone
-				and not OPTIONS.CollectLast and waitingPickups
-			if pending and not farm.placed then
-				if not waitStart then
-					waitStart = os.clock()
-					debugEvent("PICKUP", "before_machines_started", { limitSeconds = MACHINE.ItemWaitMax })
+			if finished and not farm.elevatorEmergencyLocked then
+				local newObjective, newStatus = pickMachine()
+				if newObjective and newStatus == "work" then
+					UNLOAD.pickupBefore.reset("new_objectives")
+					startupPickupsDone = false
+					finished = false
+					waitStart = nil
+					farm.finalizing = false
+					debugEvent("MACHINE", "new_round_detected", { target = newObjective.Name })
 				end
-			else
-				waitStart = nil
 			end
-			if not farm.placed and pending and os.clock() - waitStart < MACHINE.ItemWaitMax then
+			local anyPickup = capsuleFarm.enabled or itemFarm.enabled or candyFarm.enabled
+			local pending = false
+			if not UNLOAD.pickupBefore.completed and not startupPickupsDone and anyPickup then
+				local availableObjective, objectiveStatus = pickMachine()
+				if availableObjective or objectiveStatus == "wait" then
+					local now = os.clock()
+					UNLOAD.pickupBefore.started = UNLOAD.pickupBefore.started or now
+					if not waitStart then
+						waitStart = UNLOAD.pickupBefore.started
+						increment("pickupBeforeWaits")
+						debugEvent("PICKUP", "before_machines_started", { limitSeconds = MACHINE.ItemWaitMax })
+					end
+					local elapsed = now - waitStart
+					local snapshot = scanFinalPickups()
+					local collectorWorking = pickupBusy() or pickupCoordinator.owner ~= nil
+					local safePending = snapshot.safe > 0 or collectorWorking
+					local spawnGrace = elapsed < 1.5
+					local expired = elapsed >= MACHINE.ItemWaitMax
+					local stalled = elapsed > pickupCircuit.MaxStallSeconds
+						and debugStats.pickupAttempts > 0
+						and now - math.max(waitStart, pickupCircuit.lastConfirmed) >= pickupCircuit.MaxStallSeconds
+					if (safePending or spawnGrace) and not expired and not stalled and not pickupCircuit.paused then
+						pending = true
+					else
+						UNLOAD.pickupBefore.completed = true
+						startupPickupsDone = true
+						pickupCoordinator.home = nil
+						if activeMotion and activeMotion.owner == "pickup" then cancelMotion("pickup") end
+						pickupCoordinator.owner = nil
+						increment(expired and "pickupBeforeTimeouts" or "pickupBeforeCompleted")
+						debugEvent("PICKUP", "before_machines_complete", {
+							reason = pickupCircuit.paused and "flood_blocked" or expired and "time_budget"
+								or stalled and "no_progress" or "collected_or_unavailable",
+								seconds = math.floor(elapsed * 10 + 0.5) / 10,
+							safeRemaining = snapshot.safe, unsafeRemaining = snapshot.unsafe,
+						}, expired or stalled and "WARN" or "INFO")
+					end
+				end
+			end
+			if not anyPickup and not UNLOAD.pickupBefore.completed then
+				UNLOAD.pickupBefore.completed = true
+				startupPickupsDone = true
+			end
+			if pending and not farm.placed then
 				local currentPrompt = farm.target and getPrompt(farm.target)
 				if currentPrompt then cancelMachinePromptHold(currentPrompt) end
 				hidden, farm.placed = false, false
@@ -3248,17 +3311,9 @@ local function newMachineAutofarm()
 				local prompt = target and getPrompt(target)
 				local part = prompt and getPromptPart(prompt, target)
 				if part then
-					if (finished or finalSweep) and (pickupCircuit.paused or pickupCircuit.finalized) then
+					doneCandidateAt = nil
+					if finished and pickupCircuit.finalized and not UNLOAD.pickupBefore.completed then
 						pickupCircuit.reset("new_objective")
-					end
-					if finalSweep then
-						finalSweepActive = false
-						increment("finalSweepResets")
-						debugEvent("SWEEP", "cancelled_new_objective", {
-							newTarget = target.Name,
-							previousMs = math.floor((os.clock() - finalSweep.started) * 1000 + 0.5),
-						})
-						finalSweep = nil
 					end
 					farm.finalizing = false
 					finished = false
@@ -3360,6 +3415,7 @@ local function newMachineAutofarm()
 							fireAfter = 0
 							farm.placed = true
 							startupPickupsDone = true
+							UNLOAD.pickupBefore.completed = true
 							moved = true
 							placedAt = os.clock()
 							increment("machinePlacements")
@@ -3450,106 +3506,43 @@ local function newMachineAutofarm()
 						end
 					end
 				elseif status == "done" then
-					if handoffStartedAt then
-						debugEvent("PERF", "handoff_no_next_objective", {
-								from = handoffFrom, reason = handoffReason,
-								ms = math.floor((os.clock() - handoffStartedAt) * 1000 + 0.5),
-							})
-						handoffStartedAt, handoffFrom, handoffReason = nil, nil, nil
-						debugStatus.handoffPending = "None"
-					end
-					if not finished then
-						local now = os.clock()
-						if not finalSweep then
-							finalSweepActive = true
-							chase.pending = false
-							chase.holdUntil = 0
-							motionPauseUntil = 0
+					local now = os.clock()
+					doneCandidateAt = doneCandidateAt or now
+					if not finished and now - doneCandidateAt >= 0.3 then
+						local verifyTarget, verifyStatus = pickMachine()
+						if not verifyTarget and verifyStatus == "done" then
+							finished = true
+							UNLOAD.pickupBefore.completed = true
+							pickupCircuit.finalized = true
 							pickupCoordinator.home = nil
-							finalSweep = { started = now, lastCheck = -math.huge, emptySince = nil,
-								emptyChecks = 0, checks = 0, confirmedStart = debugStats.pickupConfirmed,
-								attemptsStart = debugStats.finalSweepCollectionAttempts }
-							increment("finalSweeps")
-							debugEvent("SWEEP", "start", {
-								maxWaitSeconds = MACHINE.CollectWaitMax,
-								collectAfterMachines = OPTIONS.CollectLast,
-								items = itemFarm.enabled, capsules = capsuleFarm.enabled, candies = candyFarm.enabled,
-							})
-						end
-						if now - finalSweep.lastCheck >= MACHINE.FinalSweepPoll then
-							finalSweep.lastCheck = now
-							finalSweep.checks += 1
-							increment("finalSweepChecks")
-							local snapshot = scanFinalPickups()
-							local busyNow = pickupBusy() or pickupCoordinator.owner ~= nil
-							local pending = snapshot.safe > 0 or busyNow
-							if pending then
-								finalSweep.emptySince, finalSweep.emptyChecks = nil, 0
-							else
-								finalSweep.emptySince = finalSweep.emptySince or now
-								finalSweep.emptyChecks += 1
+							pickupCoordinator.owner = nil
+							if activeMotion and activeMotion.owner == "pickup" then cancelMotion("pickup") end
+							if handoffStartedAt then
+								debugEvent("PERF", "handoff_no_next_objective", {
+									from = handoffFrom, reason = handoffReason,
+									ms = math.floor((now - handoffStartedAt) * 1000 + 0.5),
+								})
+								handoffStartedAt, handoffFrom, handoffReason = nil, nil, nil
+								debugStatus.handoffPending = "None"
 							end
-							debugThrottled("final_sweep_check", 0.9, "SWEEP", "check", {
-								check = finalSweep.checks, safe = snapshot.safe, unsafe = snapshot.unsafe,
-								ignored = snapshot.skipped, blocked = snapshot.blocked, pickupBusy = busyNow,
-								attempted = debugStats.finalSweepCollectionAttempts - finalSweep.attemptsStart,
-								confirmedSoFar = debugStats.pickupConfirmed - finalSweep.confirmedStart,
-								sources = snapshot.sourceSummary,
-							})
-							local timedOut = now - finalSweep.started >= MACHINE.CollectWaitMax
-							local noProgressSeconds = now - math.max(finalSweep.started, pickupCircuit.lastConfirmed)
-							local stalled = not pickupCircuit.paused and snapshot.safe > 0
-								and noProgressSeconds >= pickupCircuit.MaxStallSeconds
-								and (debugStats.finalSweepCollectionAttempts > finalSweep.attemptsStart)
-							local circuitBroken = pickupCircuit.paused or stalled
-							local emptyVerified = finalSweep.emptySince
-								and finalSweep.emptyChecks >= 2
-								and now - finalSweep.emptySince >= MACHINE.FinalSweepClearTime
-							if timedOut or emptyVerified or circuitBroken then
-								local verify = scanFinalPickups()
-								if not timedOut and not circuitBroken
-									and (verify.safe > 0 or pickupBusy() or pickupCoordinator.owner ~= nil) then
-									finalSweep.emptySince, finalSweep.emptyChecks = nil, 0
-									increment("finalSweepLastSecond")
-									debugEvent("SWEEP", "last_second_pickup_detected", {
-										safe = verify.safe, sources = verify.sourceSummary,
-									})
-								else
-									if stalled then pickupCircuit.pause("final_sweep_no_progress") end
-									local sweepStatus = circuitBroken and "collection_blocked"
-										or timedOut and "timeout" or "verified_clear"
-									if circuitBroken then increment("finalSweepStallExits") end
-									farm.finalizing = OPTIONS.AutoElevator or OPTIONS.Fuseboxes
-									pickupCircuit.finalized = true
-									finalSweepActive = false
-									if activeMotion and activeMotion.owner == "pickup" then cancelMotion("pickup") end
-									pickupCoordinator.home = nil
-									if pickupCoordinator.owner ~= nil then pickupCoordinator.owner = nil end
-									finished = true
-									if timedOut then
-										increment("finalSweepTimeouts")
-									elseif not circuitBroken then
-										increment("finalSweepCompleted")
-									end
-									debugEvent("SWEEP", sweepStatus == "verified_clear" and "complete" or sweepStatus, {
-										checks = finalSweep.checks, elapsedMs = math.floor((now - finalSweep.started) * 1000 + 0.5),
-										attempted = debugStats.finalSweepCollectionAttempts - finalSweep.attemptsStart,
-										collected = debugStats.pickupConfirmed - finalSweep.confirmedStart,
-										safeRemaining = verify.safe, unsafeRemaining = verify.unsafe,
-										blocked = verify.blocked, ignored = verify.skipped, sources = verify.sourceSummary,
-									}, sweepStatus == "verified_clear" and "INFO" or "WARN")
-									debugEvent("MACHINE", "all_complete", {
-										autoElevator = OPTIONS.AutoElevator, fuseboxes = OPTIONS.Fuseboxes,
-										finalSweep = sweepStatus,
-									})
-									if OPTIONS.AutoElevator and active() and not farm.elevatorEmergencyLocked then finishAtElevator(active) end
-									if OPTIONS.Fuseboxes and not circuitBroken and active() and not farm.elevatorEmergencyLocked then
-										checkFuseboxes(active)
-										if OPTIONS.AutoElevator and active() and not farm.elevatorEmergencyLocked then finishAtElevator(active) end
-									end
-									if not farm.elevatorEmergencyLocked then farm.finalizing = false end
+							debugEvent("MACHINE", "all_complete", { autoElevator = OPTIONS.AutoElevator,
+								fuseboxes = OPTIONS.Fuseboxes, pickupTiming = "before" })
+							farm.finalizing = OPTIONS.AutoElevator or OPTIONS.Fuseboxes
+							if OPTIONS.AutoElevator and active() and not farm.elevatorEmergencyLocked then
+								finishAtElevator(active)
+							end
+							if OPTIONS.Fuseboxes and active() and not farm.elevatorEmergencyLocked then
+								checkFuseboxes(active)
+								if OPTIONS.AutoElevator and active() and not farm.elevatorEmergencyLocked then
+									finishAtElevator(active)
 								end
 							end
+							if not farm.elevatorEmergencyLocked then farm.finalizing = false end
+						else
+							doneCandidateAt = nil
+							debugThrottled("machine_done_recheck", 2, "MACHINE", "done_recheck_failed", {
+								status = verifyStatus, target = verifyTarget and verifyTarget.Name or "none",
+							}, "WARN")
 						end
 					end
 					task.wait(0.08)
@@ -3588,15 +3581,32 @@ local function newMachineAutofarm()
 						if not farm.allDoneSince then
 							farm.allDoneSince = os.clock()
 							farm.elevatorWatchFired = false
+							farm.elevatorHoldCorrections = 0
 							increment("elevatorWatchStarts")
 							debugEvent("MACHINE", "elevator_watch_started", { deadlineSeconds = 15 })
+						end
+						if farm.elevatorTarget and not farm.finalizing and not farm.elevatorTransit
+							and not farm.elevatorEmergencyLocked and farm.elevatorHoldCorrections < 3
+							and os.clock() - farm.allDoneSince >= 2
+							and os.clock() - farm.lastElevatorHoldAt >= 2.5
+							and not (skillcheckProtected and skillcheckProtected()) then
+							local near, within = verifyElevatorPosition()
+							if not near or (farm.elevatorPlatform and not within) then
+								farm.elevatorHoldCorrections += 1
+								farm.lastElevatorHoldAt = os.clock()
+								increment("elevatorHoldCorrections")
+								debugEvent("MACHINE", "elevator_position_correction", {
+									near = near, platformVerified = within,
+									attempt = farm.elevatorHoldCorrections,
+								}, "WARN")
+								finishAtElevator(active)
+							end
 						end
 						if not farm.elevatorWatchFired and os.clock() - farm.allDoneSince >= 15
 							and not farm.elevatorTransit and not (skillcheckProtected and skillcheckProtected()) then
 							farm.elevatorWatchFired = true
 							farm.elevatorEmergencyLocked = true
 							farm.finalizing = true
-							finalSweepActive = false
 							pickupCircuit.finalized = true
 							pickupCoordinator.home = nil
 							pickupCoordinator.owner = nil
@@ -3608,26 +3618,25 @@ local function newMachineAutofarm()
 							debugEvent("MACHINE", "elevator_fallback_triggered", {
 								seconds = math.floor(os.clock() - farm.allDoneSince), mode = OPTIONS.MovementMode,
 							})
-							local reached = false
+							local reached, geometry = false, false
 							for attempt = 1, 2 do
 								if not active() then break end
 								local moved = finishAtElevator(active)
 								if moved then
 									task.wait(0.16)
-									local root = getPlayerRoot()
-									reached = root ~= nil and farm.elevatorTarget ~= nil
-										and (root.Position - farm.elevatorTarget).Magnitude <= 8
-									if reached then break end
+									reached, geometry = verifyElevatorPosition()
+									if reached and geometry then break end
 								end
 								if attempt < 2 then task.wait(0.3) end
 							end
 							increment(reached and "elevatorFallbackSuccess" or "elevatorFallbackFailures")
 							local root = getPlayerRoot()
-							debugEvent("MACHINE", reached and "elevator_fallback_arrived" or "elevator_fallback_failed", {
-								mode = OPTIONS.MovementMode, verifiedPosition = reached,
+							debugEvent("MACHINE", reached and "elevator_fallback_near" or "elevator_fallback_failed", {
+								mode = OPTIONS.MovementMode, nearTarget = reached, platformVerified = geometry,
+								elevator = farm.elevatorSource or "none",
 								position = root and tostring(root.Position) or "missing",
 								target = farm.elevatorTarget and tostring(farm.elevatorTarget) or "missing",
-							}, reached and "INFO" or "WARN")
+							}, geometry and "INFO" or "WARN")
 						end
 					else
 						if farm.allDoneSince then
@@ -3659,7 +3668,6 @@ local function newMachineAutofarm()
 		farm.allDoneSince = nil
 		farm.elevatorWatchFired = false
 		farm.elevatorEmergencyLocked = false
-		finalSweepActive = false
 		runId += 1
 		farm.target, farm.placed, farm.moving, farm.finalizing = nil, false, false, false
 		cancelMotion("machine")
@@ -3903,6 +3911,41 @@ autoSkillcheck.enable()
 machineFarm = newMachineAutofarm()
 
 do
+local mainBody = pages.Main
+local mainControl = createSubcategory(mainBody, "AUTOFARM", 1, true)
+local farmFeatures = { capsuleFarm, itemFarm, candyFarm, machineFarm,
+	autoSkillcheck, autoUse, autoAbility, UNLOAD.trashUseToggle }
+local master = { enabled = false }
+local function allEnabled()
+	for _, feature in ipairs(farmFeatures) do
+		if not feature.enabled then return false end
+	end
+	return true
+end
+function master.enable()
+	for _, feature in ipairs(farmFeatures) do
+		if not feature.enabled then feature.enable() end
+	end
+	master.enabled = allEnabled()
+	increment("masterToggles")
+	debugEvent("MAIN", "autofarm_enabled", { allEnabled = master.enabled })
+end
+function master.disable()
+	for _, feature in ipairs(farmFeatures) do
+		if feature.enabled then feature.disable() end
+	end
+	master.enabled = false
+	increment("masterToggles")
+	debugEvent("MAIN", "autofarm_disabled")
+end
+local function refreshMaster()
+	master.enabled = allEnabled()
+end
+table.insert(toggleRefreshers, refreshMaster)
+createToggleRow(mainControl, "Master Autofarm", 1, master)
+end
+
+do
 local machinesBody = createSection("Machines", 3)
 local machineCore = createSubcategory(machinesBody, "OBJECTIVE AUTOMATION", 1, true)
 createToggleRow(machineCore, "Machine Autofarm", 1, machineFarm)
@@ -4018,7 +4061,6 @@ end)
 local machineFlow = createSubcategory(machinesBody, "EXIT & PRIORITIES", 4, true)
 createToggleRow(machineFlow, "Auto Elevator", 1, newOption(OPTIONS, "AutoElevator"))
 createToggleRow(machineFlow, "Fusebox Check", 2, newOption(OPTIONS, "Fuseboxes"))
-createToggleRow(machineFlow, "Items First", 3, newOption(OPTIONS, "ItemsFirst"))
 
 local machinePerformance = createSubcategory(machinesBody, "PERFORMANCE", 5, true)
 createToggleRow(machinePerformance, "Disable 3D Rendering", 1, UNLOAD.render3d)
@@ -4094,9 +4136,9 @@ local function debugReport()
 		"Selena camera=look after Chase Started when TSelena is loaded; stops when unloaded/toggle off",
 		"Machine exit=SkillCheck:InvokeServer() with no arguments; ALL exits deferred while skillcheck UI is visible",
 		"Skillcheck protection=defer exits and travel until UI disappears",
-		"TODO (later)=improve elevator and fusebox event / completion detection",
-		"Final sweep=exits on flood-like repeated pickup failures or no progress; 90s hard cap",
-		"Elevator fallback=after 15s of all objectives complete, independent of pickup sweep",
+		"Elevator check=physical floor/platform detection when present; proximity is not server exit confirmation",
+		"Pickups=before machines only; no post-objective collection",
+		"Elevator fallback=15s after all objectives complete; platform geometry checked when available",
 		"Ability=press F once per detected machine completion; no cooldown HUD polling or Ability remote",
 		"Ability input dispatched is not proof the game accepted it; active skillchecks block completion handling",
 		"Item hotkeys=executor keypress preferred, VIM fallback; input success does not prove item effect",
@@ -4123,7 +4165,9 @@ local function debugReport()
 		string.format("Tween: arrived=%d aborted=%d hpStops=%d guards=%d pickupDistance=%d",
 			debugStats.underMapTweens, debugStats.underMapAborts, debugStats.underMapHealthStops,
 			debugStats.underMapGuardBlocks, debugStats.pickupTweenDistance),
-		"PickupTiming=" .. (OPTIONS.CollectLast and "After" or "Before"),
+		"PickupTiming=Before",
+		"PickupPhase: " .. fieldString({ completed = UNLOAD.pickupBefore.completed,
+			started = UNLOAD.pickupBefore.started ~= nil, mapLoaded = UNLOAD.pickupBefore.mapRef ~= nil }),
 		"PickupGuard: " .. fieldString({ paused = pickupCircuit.paused, finalized = pickupCircuit.finalized,
 			contactRetries = debugStats.pickupContactRetries, contactRecovered = debugStats.pickupContactRecovered,
 			failures = pickupCircuit.consecutive,
@@ -4134,8 +4178,7 @@ local function debugReport()
 		"MACHINE: " .. fieldString({ Range = MACHINE.Range, NearFinishAt = MACHINE.NearFinishAt,
 			NearFinishHold = MACHINE.NearFinishHold, StallTimeout = MACHINE.StallTimeout,
 			UseTimeout = MACHINE.UseTimeout, ChaseHold = MACHINE.ChaseHold,
-			ItemWaitMax = MACHINE.ItemWaitMax, CollectWaitMax = MACHINE.CollectWaitMax, RescanInterval = MACHINE.RescanInterval,
-			FinalSweepPoll = MACHINE.FinalSweepPoll, FinalSweepClearTime = MACHINE.FinalSweepClearTime }),
+			ItemWaitMax = MACHINE.ItemWaitMax, RescanInterval = MACHINE.RescanInterval }),
 		"ItemInput: " .. fieldString({ executorKeypress = typeof(keypress) == "function",
 			executorKeyrelease = typeof(keyrelease) == "function", virtualInput = pcall(function()
 				return game:GetService("VirtualInputManager") end) }),
@@ -4194,7 +4237,7 @@ supervise("diagnostic UI", function() return alive end, function()
 	while alive do
 		if main.Visible then for _, refresh in ipairs(toggleRefreshers) do refresh() end end
 		local working = (machineFarm.enabled and "MACHINE") or (pickupBusy() and "PICKUPS") or "IDLE"
-		headerStatus.Text = working .. "  •  v2.6.15"
+		headerStatus.Text = working .. "  •  v2.6.17"
 		headerStatus.TextColor3 = working == "IDLE" and UI.muted or UI.good
 		footerLabel.Text = string.format("%s   •   %s   •   %d moves", BUILD, OPTIONS.MovementMode,
 			debugStats.teleports + debugStats.underMapTweens)
