@@ -63,15 +63,17 @@ local OPTIONS = {
 	AutoHide = true,  AutoElevator = true,
 	Fuseboxes = true,  ItemsFirst = true,
 	CollectLast = true,
+	MovementMode = "Teleport", TweenDepth = -15,
 }
 
-local BUILD = "2.6.3 Selena Camera / Pickup Routes"
+local BUILD = "2.6.4 Movement Modes"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
 local debugStats = {
 	teleports = 0, teleportFailures = 0, unsafeDestinations = 0,
 	pickupTweens = 0, pickupTweenAborts = 0, pickupTweenDetours = 0,
+	underMapTweens = 0, underMapAborts = 0, underMapHealthStops = 0, underMapGuardBlocks = 0,
 	pickupPreemptions = 0, pickupRouteCooldowns = 0,
 	pickupPathfindAttempts = 0, pickupPathfindRoutes = 0, pickupPathfindFailures = 0,
 	finalSweeps = 0, finalSweepChecks = 0, finalSweepCompleted = 0,
@@ -195,7 +197,6 @@ UNLOAD.exporter = function() return UNLOAD.fallbackExport("UNLOAD") end
 local activeMotion
 local skillcheckProtected -- Initialized after GUI visibility helpers are defined.
 local infectedNear -- Assigned after monster-folder helpers are defined.
-local pickupThreats -- Assigned after the machine/infected helpers are defined.
 local motionPauseUntil = 0
 local PICKUP_TRAVEL = {
 	Speed = 300, SafetyRadius = 24, CheckInterval = 0.035,
@@ -207,11 +208,16 @@ local function cancelMotion(owner)
 		activeMotion = nil
 		motion.cancelled = true
 		if motion.tween then pcall(function() motion.tween:Cancel() end) end
+		if not alive and motion.returnSurface then
+			motion.unloading = true
+			pcall(motion.returnSurface)
+		end
+		if motion.restore then pcall(motion.restore) end
 		debugEvent("MOVE", "cancel", { owner = motion.owner, phase = motion.phase or "unknown" })
 	end
 end
 UNLOAD.cancelMovement = cancelMotion
-local function teleportCharacter(destination, keepGoing, owner, mode)
+local function instantTeleport(destination, keepGoing, owner, mode)
 	local emergency = mode == "emergency"
 	if not alive or not keepGoing() then return false end
 	local protected, checkType = false, "not_ready"
@@ -274,231 +280,180 @@ local function teleportCharacter(destination, keepGoing, owner, mode)
 	return true
 end
 
-local function segmentThreat(a, b, threats, radius)
-	local diff = b - a
-	local lengthSquared = diff:Dot(diff)
-	for _, enemy in ipairs(threats) do
-		local velocity = enemy.velocity or Vector3.zero
-		for predictionIndex = 1, 2 do
-			local pos = enemy.pos + velocity * (predictionIndex == 1 and 0 or 0.35)
-			local t = lengthSquared > 0.001 and math.clamp((pos - a):Dot(diff) / lengthSquared, 0, 1) or 0
-			local nearest = a + diff * t
-			local clearance = (pos - nearest).Magnitude
-			if clearance < radius then return enemy, clearance end
-		end
-	end
-	return nil
-end
-local function segmentObstacle(a, b, character, target)
-	local diff = b - a
-	if diff.Magnitude < 1 then return false end
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	local monsters = workspace:FindFirstChild("MonsterFolder")
-	local ignored = { character }
-	if monsters then table.insert(ignored, monsters) end
-	if target then table.insert(ignored, target) end
-	params.FilterDescendantsInstances = ignored
-	params.RespectCanCollide = true
-	local hit = workspace:Raycast(a + Vector3.new(0, 0.6, 0),
-		diff.Unit * math.max(0.05, diff.Magnitude - 1), params)
-	return hit ~= nil, hit
-end
-UNLOAD.pathRetryAt = setmetatable({}, { __mode = "k" })
-local function planPickupRoute(from, destination, threats, character, target)
-	local radius = PICKUP_TRAVEL.SafetyRadius
-	if segmentThreat(destination, destination, threats, radius) then return nil, "unsafe_destination" end
-	if segmentThreat(from, from, threats, radius) then return nil, "unsafe_start" end
-	local function safeRoute(points)
-		local previous = from
-		for _, point in ipairs(points) do
-			if segmentThreat(previous, point, threats, radius) then return false end
-			if segmentObstacle(previous, point, character, target) then return false end
-			previous = point
-		end
-		return true
-	end
-	if safeRoute({ destination }) then return { destination }, "direct" end
-	local heading = destination - from
-	local planar = Vector3.new(heading.X, 0, heading.Z)
-	if planar.Magnitude < 1 then return nil, "vertical_route_blocked" end
-	local forward = planar.Unit
-	local side = Vector3.new(-forward.Z, 0, forward.X)
-	local length = planar.Magnitude
-	local candidates = {}
-	local function try(points)
-		if not safeRoute(points) then return end
-		local total, last = 0, from
-		for _, point in ipairs(points) do total += (point - last).Magnitude; last = point end
-		table.insert(candidates, { points = points, length = total })
-	end
-	for _, enemy in ipairs(threats) do
-		local t = math.clamp((enemy.pos - from):Dot(forward), 0, length)
-		local near = from + (destination - from) * (t / length)
-		if (enemy.pos - near).Magnitude < radius * 2 then
-			for _, sign in ipairs({ -1, 1 }) do
-				for _, scale in ipairs({ 1.6, 2.1 }) do
-					local lateral = side * (radius * scale * sign)
-					local before = near - forward * (radius * 1.35) + lateral
-					local after = near + forward * (radius * 1.35) + lateral
-					try({ before, after, destination })
-					try({ near + lateral, destination })
-				end
-			end
-		end
-	end
-	if #candidates == 0 then
-		local midpoint = (from + destination) * 0.5
-		for _, offset in ipairs({ 12, 25, 45 }) do
-			for _, sign in ipairs({ -1, 1 }) do
-				local lateral = side * offset * sign
-				try({ midpoint + lateral, destination })
-				try({ from + lateral, destination + lateral, destination })
-			end
-		end
-	end
-	if #candidates == 0 then
-		local now = os.clock()
-		if not target or now >= (UNLOAD.pathRetryAt[target] or 0) then
-			if target then UNLOAD.pathRetryAt[target] = now + 4 end
-			increment("pickupPathfindAttempts")
-			local succeeded, path = pcall(function()
-				local route = game:GetService("PathfindingService"):CreatePath({
-					AgentRadius = 2, AgentHeight = 5, AgentCanJump = false,
-					AgentCanClimb = false, WaypointSpacing = 12,
-				})
-				route:ComputeAsync(from, destination)
-				return route
-			end)
-			if succeeded and path and path.Status == Enum.PathStatus.Success then
-				local waypoints = path:GetWaypoints()
-				if #waypoints >= 2 and #waypoints <= 32 then
-					local points, previous, length, safe = {}, from, 0, true
-					for i = 2, #waypoints do
-						if waypoints[i].Action == Enum.PathWaypointAction.Jump then
-							safe = false
-							break
-						end
-						local nextPoint = i == #waypoints and destination
-							or (waypoints[i].Position + Vector3.new(0, 2.5, 0))
-						length += (nextPoint - previous).Magnitude
-						if segmentThreat(previous, nextPoint, threats, radius) then
-							safe = false
-							break
-						end
-						table.insert(points, nextPoint)
-						previous = nextPoint
-					end
-					if safe and length <= (destination - from).Magnitude * 2.7 + 35 then
-						increment("pickupPathfindRoutes")
-						debugEvent("MOVE", "pickup_path_found", { waypoints = #points,
-							distance = string.format("%.1f", length) })
-						return points, "pathfinding"
-					end
-				end
-			end
-			increment("pickupPathfindFailures")
-			debugThrottled("pickup_pathfind_failed", 5, "MOVE", "pickup_path_unavailable",
-				{ status = succeeded and tostring(path and path.Status) or "error" }, "INFO")
-		end
-		return nil, "no_safe_corridor"
-	end
-	table.sort(candidates, function(a, b) return a.length < b.length end)
-	return candidates[1].points, "detour"
-end
-local function tweenPickup(destination, keepGoing, target)
+local function tweenUnderMap(destination, keepGoing, owner, mode)
+	local emergency = mode == "emergency"
 	if not alive or not keepGoing() then return false, "inactive" end
-	if skillcheckProtected and skillcheckProtected() then return false, "skillcheck_visible" end
-	if activeMotion then return false, "movement_busy" end
+	if skillcheckProtected and skillcheckProtected() then
+		increment("skillcheckMoveBlocked")
+		return false, "skillcheck_visible"
+	end
+	if owner == "machine" and activeMotion and activeMotion.owner ~= "machine" then
+		cancelMotion()
+	end
+	if activeMotion then
+		if emergency then cancelMotion() else return false, "movement_busy" end
+	end
 	local character = player.Character
 	local root = character and character:FindFirstChild("HumanoidRootPart")
 	if not root or not root:IsDescendantOf(workspace) then return false, "missing_root" end
 	local from = root.Position
-	local threats = pickupThreats and pickupThreats() or {}
-	local points, routeMode = planPickupRoute(from, destination.Position, threats, character, target)
-	if not points then
-		increment("pickupTweenUnsafe")
-		debugThrottled("pickup_route_" .. routeMode, 2, "MOVE", "pickup_route_rejected",
-			{ reason = routeMode, distance = string.format("%.1f", (destination.Position - from).Magnitude) }, "WARN")
-		return false, routeMode
+	local goal = destination.Position
+	if (from - goal).Magnitude < 0.25 then return true, "already_there" end
+	if not emergency and infectedNear and infectedNear(goal, owner == "pickup" and PICKUP_TRAVEL.SafetyRadius or 15) then
+		increment("underMapGuardBlocks")
+		return false, "unsafe_destination"
 	end
-	if routeMode == "detour" then increment("pickupTweenDetours") end
-	local motion = { owner = "pickup", phase = "route", cancelled = false }
+	local cruiseY = math.min(from.Y, goal.Y) + OPTIONS.TweenDepth
+	if from.Y < goal.Y + OPTIONS.TweenDepth + 2 then
+		cruiseY = math.min(cruiseY + math.abs(OPTIONS.TweenDepth), from.Y)
+	end
+	local destroyY = workspace.FallenPartsDestroyHeight
+	if cruiseY <= destroyY + 20 then
+		increment("underMapGuardBlocks")
+		debugEvent("MOVE", "depth_blocked", { requestedY = cruiseY, destroyY = destroyY,
+			depth = OPTIONS.TweenDepth, owner = owner }, "WARN")
+		return false, "near_destroy_height"
+	end
+	local points = {
+		Vector3.new(from.X, cruiseY, from.Z),
+		Vector3.new(goal.X, cruiseY, goal.Z),
+		goal,
+	}
+	local motion = { owner = owner, phase = "descent", cancelled = false }
+	local originalAnchored = root.Anchored
+	local collision = {}
+	for _, part in ipairs(character:GetDescendants()) do
+		if part:IsA("BasePart") then
+			collision[part] = part.CanCollide
+			part.CanCollide = false
+		end
+	end
+	root.Anchored = true
+	function motion.restore()
+		if motion.restored then return end
+		motion.restored = true
+		for part, value in pairs(collision) do
+			if part.Parent then pcall(function() part.CanCollide = value end) end
+		end
+		if root.Parent then pcall(function() root.Anchored = originalAnchored end) end
+	end
 	activeMotion = motion
-	local started, traveled = os.clock(), 0
-	debugEvent("MOVE", "pickup_tween_start", { mode = routeMode, segments = #points,
-		distance = string.format("%.1f", (destination.Position - from).Magnitude) })
-	local function stop(reason, emergency)
-		if activeMotion == motion then activeMotion = nil end
-		motion.cancelled = true
-		if motion.tween then pcall(function() motion.tween:Cancel() end) end
-		increment("pickupTweenAborts")
-		debugEvent("MOVE", "pickup_tween_abort", { reason = reason,
-			elapsedMs = math.floor((os.clock() - started) * 1000),
-			position = tostring(root.Position) }, "WARN")
-		if emergency and alive and player.Character == character and infectedNear then
-			if not infectedNear(from, PICKUP_TRAVEL.SafetyRadius) then
-				teleportCharacter(CFrame.new(from), function() return alive end, "pickup_escape", "emergency")
+	local startAt = os.clock()
+	local tracked = workspace:FindFirstChild("Alive")
+	tracked = tracked and tracked:FindFirstChild(player.Name)
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local function health()
+		local hp = tracked and tracked:GetAttribute("Health")
+		if type(hp) == "number" then return hp end
+		return humanoid and humanoid.Health or nil
+	end
+	local healthAtStart = health()
+	function motion.returnSurface()
+		if root.Parent and root.Anchored then
+			local ok, tween = pcall(function()
+				return TweenService:Create(root, TweenInfo.new(0.12, Enum.EasingStyle.Linear),
+					{ CFrame = CFrame.new(from) })
+			end)
+			if ok then
+				pcall(function() tween:Play() end)
+				local deadline = os.clock() + 0.22
+				while tween.PlaybackState == Enum.PlaybackState.Playing
+					and os.clock() < deadline do RunService.Heartbeat:Wait() end
 			end
 		end
+	end
+	local function abort(reason)
+		local stillOwns = activeMotion == motion
+		motion.cancelled = true
+		if motion.tween then pcall(function() motion.tween:Cancel() end) end
+		if stillOwns and character == player.Character and root.Parent and health() ~= 0 then
+			local surface = CFrame.new(from)
+			local recovered, recovery = pcall(function()
+				return TweenService:Create(root, TweenInfo.new(0.12, Enum.EasingStyle.Linear),
+					{ CFrame = surface })
+			end)
+			if recovered then
+				motion.tween = recovery
+				pcall(function() recovery:Play() end)
+				local untilTime = os.clock() + 0.25
+				while recovery.PlaybackState == Enum.PlaybackState.Playing and alive
+					and os.clock() < untilTime do RunService.Heartbeat:Wait() end
+			end
+		end
+		if stillOwns and activeMotion == motion then activeMotion = nil end
+		if not motion.unloading then motion.restore() end
+		increment("underMapAborts")
+		if reason == "health_dropped" then increment("underMapHealthStops") end
+		debugEvent("MOVE", "undermap_abort", { owner = owner, reason = reason,
+			elapsedMs = math.floor((os.clock() - startAt) * 1000 + 0.5),
+			depth = OPTIONS.TweenDepth }, "WARN")
 		return false, reason
 	end
-	for index, point in ipairs(points) do
-		if not keepGoing() or motion.cancelled or activeMotion ~= motion then return stop("interrupted", false) end
-		local stepDistance = (point - root.Position).Magnitude
-		if stepDistance > 0.2 then
-			motion.phase = "segment_" .. index
-			local duration = math.max(0.035, stepDistance / PICKUP_TRAVEL.Speed)
-			local created, tween = pcall(function()
+	debugEvent("MOVE", "undermap_start", { owner = owner, depth = OPTIONS.TweenDepth,
+			cruiseY = string.format("%.1f", cruiseY),
+			distance = string.format("%.1f", (from - goal).Magnitude) })
+	local length = 0
+	for i, point in ipairs(points) do
+		if motion.cancelled or activeMotion ~= motion or not keepGoing() then
+			return abort("interrupted")
+		end
+		local distance = (root.Position - point).Magnitude
+		if distance > 0.2 then
+			motion.phase = ({ "descent", "underground", "ascent" })[i]
+			if i == 3 and not emergency and infectedNear and infectedNear(goal,
+				owner == "pickup" and PICKUP_TRAVEL.SafetyRadius or 15) then
+				return abort("enemy_at_destination")
+			end
+			local duration = math.max(0.04, distance / PICKUP_TRAVEL.Speed)
+			local ok, tween = pcall(function()
 				return TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear),
-					{ CFrame = CFrame.new(point) })
+					{ CFrame = CFrame.new(point) * (destination - destination.Position) })
 			end)
-			if not created then
-				debugEvent("MOVE", "pickup_tween_create_failed", { error = tostring(tween) }, "ERROR")
-				return stop("tween_create_failed", false)
-			end
+			if not ok then return abort("tween_create_failed") end
 			motion.tween = tween
-			local played, playError = pcall(function() tween:Play() end)
-			if not played then
-				debugEvent("MOVE", "pickup_tween_play_failed", { error = tostring(playError) }, "ERROR")
-				return stop("tween_play_failed", false)
-			end
-			local checkAt = 0
-			local deadline = os.clock() + duration + 0.4
+			local played = pcall(function() tween:Play() end)
+			if not played then return abort("tween_play_failed") end
+			local deadline = os.clock() + duration + 0.5
 			while tween.PlaybackState == Enum.PlaybackState.Playing do
 				RunService.Heartbeat:Wait()
-				if skillcheckProtected and skillcheckProtected() then
-					return stop("skillcheck_visible", false)
+				if motion.cancelled or activeMotion ~= motion or player.Character ~= character
+					or not alive or not keepGoing() then return abort("interrupted") end
+				if skillcheckProtected and skillcheckProtected() then return abort("skillcheck_visible") end
+				if os.clock() > deadline then return abort("tween_stalled") end
+				local currentHealth = health()
+				if healthAtStart and currentHealth and currentHealth < healthAtStart then
+					return abort("health_dropped")
 				end
-				if motion.cancelled or activeMotion ~= motion or player.Character ~= character then
-					return stop("interrupted", false)
-				end
-				local now = os.clock()
-				if now > deadline then return stop("tween_stalled", false) end
-				if now >= checkAt then
-					checkAt = now + PICKUP_TRAVEL.CheckInterval
-					local live = pickupThreats and pickupThreats() or {}
-					if segmentThreat(root.Position, point, live, PICKUP_TRAVEL.SafetyRadius) then
-						return stop("enemy_entered_path", true)
-					end
-				end
-				if not keepGoing() then return stop("interrupted", false) end
 			end
 			if (root.Position - point).Magnitude > PICKUP_TRAVEL.ArriveTolerance then
-				return stop("arrival_drift", false)
+				return abort("arrival_drift")
 			end
-			traveled += stepDistance
+			length += distance
 		end
 	end
 	if activeMotion == motion then activeMotion = nil end
-	motion.tween = nil
-	increment("pickupTweens")
-	increment("pickupTweenDistance", math.floor(traveled))
-	local ms = math.floor((os.clock() - started) * 1000)
-	increment("pickupTravelMs", ms)
-	debugEvent("MOVE", "pickup_tween_arrived", { mode = routeMode, ms = ms,
-		distance = string.format("%.1f", traveled) })
-	return true, routeMode
+	motion.restore()
+	increment("underMapTweens")
+	if owner == "pickup" then
+		increment("pickupTweens")
+		increment("pickupTweenDistance", math.floor(length))
+		increment("pickupTravelMs", math.floor((os.clock() - startAt) * 1000))
+	end
+	debugEvent("MOVE", "undermap_arrived", { owner = owner, depth = OPTIONS.TweenDepth,
+			ms = math.floor((os.clock() - startAt) * 1000 + 0.5) })
+	return true, "undermap"
+end
+
+local function teleportCharacter(destination, keepGoing, owner, mode)
+	if OPTIONS.MovementMode == "Teleport" then
+		return instantTeleport(destination, keepGoing, owner, mode)
+	end
+	return tweenUnderMap(destination, keepGoing, owner, mode)
+end
+
+local function tweenPickup(destination, keepGoing, target)
+	local arrived, reason = teleportCharacter(destination, keepGoing, "pickup", "routine")
+	return arrived, reason or OPTIONS.MovementMode:lower()
 end
 
 local function track(connection)
@@ -1563,14 +1518,15 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 								recent[target] = os.clock() - FARM.Revisit + 0.15
 							else
 								increment("pickupUnconfirmed")
-								local blockedRoute = reason == "tween_no_safe_corridor"
-									or reason == "tween_unsafe_destination" or reason == "tween_unsafe_start"
+								local blockedRoute = reason == "tween_unsafe_destination"
+									or reason == "tween_enemy_at_destination"
+									or reason == "tween_near_destroy_height"
 								if blockedRoute then increment("pickupRouteCooldowns") end
 								recent[target] = os.clock() - FARM.Revisit
 									+ (blockedRoute and 4 or FARM.FailedRetry)
 							end
 							debugEvent("PICKUP", "result", { folder = folder.Name, name = target.Name,
-								movement = "tween", confirmed = confirmed, reason = reason or "unknown", activations = attempts or 0,
+								movement = OPTIONS.MovementMode:lower(), confirmed = confirmed, reason = reason or "unknown", activations = attempts or 0,
 								maxDistance = prompt.MaxActivationDistance, holdDuration = prompt.HoldDuration,
 								requiresSight = prompt.RequiresLineOfSight,
 								duration = string.format("%.2f", os.clock() - beganAt), held = heldCount() },
@@ -2335,25 +2291,7 @@ infectedNear = function(position, radius)
 	return false
 end
 
-pickupThreats = function()
-	local folder = workspace:FindFirstChild("MonsterFolder")
-	local list = {}
-	if not folder then return list end
-	for _, enemy in ipairs(getTargets(folder)) do
-		if not isInsideMachineExcludedFolder(enemy)
-			and (not MACHINE.Allowed[enemy.Name] or enemy.Name == "TSelena") then
-			local pos = targetPosition(enemy)
-			if pos then
-				local body = enemy:IsA("BasePart") and enemy
-					or (enemy:IsA("Model") and (enemy.PrimaryPart or enemy:FindFirstChild("HumanoidRootPart")))
-				local v = body and body.AssemblyLinearVelocity or Vector3.zero
-				if v.Magnitude > 48 then v = v.Unit * 48 end
-				table.insert(list, { name = enemy.Name, pos = pos, velocity = v })
-			end
-		end
-	end
-	return list
-end
+
 
 local function twistedNear(position)
 	if not OPTIONS.AutoHide then return false end
@@ -3515,7 +3453,106 @@ local machineCore = createSubcategory(machinesBody, "OBJECTIVE AUTOMATION", 1, t
 createToggleRow(machineCore, "Machine Autofarm", 1, machineFarm)
 createToggleRow(machineCore, "Auto Skillcheck", 2, autoSkillcheck)
 
-local machineSafety = createSubcategory(machinesBody, "SAFETY & THREATS", 2, true)
+local machineMovement = createSubcategory(machinesBody, "MOVEMENT", 2, true)
+local modeRow = new("Frame", { LayoutOrder = 1, Size = UDim2.new(1, -9, 0, 43),
+	BackgroundColor3 = UI.surface, BorderSizePixel = 0 }, machineMovement)
+corner(modeRow, 9)
+uiStroke(modeRow)
+uiText(modeRow, "Movement Mode", 14, true, UI.text, {
+	Position = UDim2.fromOffset(12, 0), Size = UDim2.new(0.42, 0, 1, 0),
+})
+local tweenButton = new("TextButton", {
+	Text = "TWEEN", Font = Enum.Font.GothamBold, TextSize = 11,
+	TextColor3 = UI.text, BorderSizePixel = 0,
+	Position = UDim2.new(0.46, 0, 0.5, -14), Size = UDim2.new(0.25, -3, 0, 28),
+}, modeRow)
+local teleportButton = new("TextButton", {
+	Text = "TELEPORT", Font = Enum.Font.GothamBold, TextSize = 10,
+	TextColor3 = UI.text, BorderSizePixel = 0,
+	Position = UDim2.new(0.72, 0, 0.5, -14), Size = UDim2.new(0.26, -8, 0, 28),
+}, modeRow)
+corner(tweenButton, 7)
+corner(teleportButton, 7)
+local depthRow = new("Frame", { LayoutOrder = 2, Size = UDim2.new(1, -9, 0, 65),
+	BackgroundColor3 = UI.surface, BorderSizePixel = 0, Visible = false }, machineMovement)
+corner(depthRow, 9)
+uiStroke(depthRow)
+uiText(depthRow, "Under-map Depth", 14, true, UI.text, {
+	Position = UDim2.fromOffset(12, 2), Size = UDim2.new(1, -110, 0, 26),
+})
+local depthValue = uiText(depthRow, "−15 studs", 12, true, UI.accent, {
+	Position = UDim2.new(1, -108, 0, 2), Size = UDim2.fromOffset(96, 26),
+	TextXAlignment = Enum.TextXAlignment.Right,
+})
+local depthTrack = new("TextButton", { Text = "", AutoButtonColor = false,
+	Position = UDim2.new(0, 16, 0, 33), Size = UDim2.new(1, -32, 0, 24),
+	BackgroundTransparency = 1, BorderSizePixel = 0 }, depthRow)
+local depthRail = new("Frame", { BackgroundColor3 = UI.soft, BorderSizePixel = 0,
+	Position = UDim2.fromOffset(0, 9), Size = UDim2.new(1, 0, 0, 6) }, depthTrack)
+corner(depthRail, 3)
+local depthFill = new("Frame", { BackgroundColor3 = UI.accent, BorderSizePixel = 0,
+	Position = UDim2.fromOffset(0, 9), Size = UDim2.new(0, 0, 0, 6) }, depthTrack)
+corner(depthFill, 3)
+local depthKnob = new("Frame", { AnchorPoint = Vector2.new(0.5, 0.5),
+	Size = UDim2.fromOffset(17, 17), BackgroundColor3 = UI.text,
+	BorderSizePixel = 0 }, depthTrack)
+corner(depthKnob, 9)
+local draggingDepth = false
+local function refreshMovementMode()
+	local tween = OPTIONS.MovementMode == "Tween"
+	tweenButton.BackgroundColor3 = tween and UI.accent or UI.soft
+	teleportButton.BackgroundColor3 = tween and UI.soft or UI.accent
+	depthRow.Visible = tween
+	local ratio = (OPTIONS.TweenDepth + 50) / 40
+	depthFill.Size = UDim2.new(ratio, 0, 0, 6)
+	depthKnob.Position = UDim2.fromScale(ratio, 0.5)
+	depthValue.Text = string.format("%d studs", OPTIONS.TweenDepth)
+end
+local function selectMovementMode(mode)
+	if OPTIONS.MovementMode == mode then return end
+	if activeMotion then
+		debugEvent("MOVE", "mode_change_blocked", { requested = mode, reason = "travel_active" }, "WARN")
+		return
+	end
+	OPTIONS.MovementMode = mode
+	refreshMovementMode()
+	debugEvent("MOVE", "mode_changed", { mode = mode, depth = OPTIONS.TweenDepth })
+end
+track(tweenButton.Activated:Connect(function() selectMovementMode("Tween") end))
+track(teleportButton.Activated:Connect(function() selectMovementMode("Teleport") end))
+local function setDepthFromX(x)
+	local width = math.max(1, depthTrack.AbsoluteSize.X)
+	local fraction = math.clamp((x - depthTrack.AbsolutePosition.X) / width, 0, 1)
+	local depth = math.clamp(math.floor(-50 + fraction * 40 + 0.5), -50, -10)
+	if OPTIONS.TweenDepth ~= depth then
+		OPTIONS.TweenDepth = depth
+		refreshMovementMode()
+	end
+end
+track(depthTrack.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		draggingDepth = true
+		setDepthFromX(input.Position.X)
+	end
+end))
+track(UserInputService.InputChanged:Connect(function(input)
+	if draggingDepth and (input.UserInputType == Enum.UserInputType.MouseMovement
+		or input.UserInputType == Enum.UserInputType.Touch) then
+		setDepthFromX(input.Position.X)
+	end
+end))
+track(UserInputService.InputEnded:Connect(function(input)
+	if draggingDepth and (input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch) then
+		draggingDepth = false
+		debugEvent("MOVE", "depth_changed", { depth = OPTIONS.TweenDepth })
+	end
+end))
+table.insert(toggleRefreshers, refreshMovementMode)
+refreshMovementMode()
+
+local machineSafety = createSubcategory(machinesBody, "SAFETY & THREATS", 3, true)
 createToggleRow(machineSafety, "Auto Hide", 1, newOption(OPTIONS, "AutoHide"))
 createToggleRow(machineSafety, "Look At Selena", 2, UNLOAD.selenaLook)
 createInputRow(machineSafety, "Danger range (studs)", 3, function(value)
@@ -3523,11 +3560,10 @@ createInputRow(machineSafety, "Danger range (studs)", 3, function(value)
 	return MACHINE.Range
 end)
 
-local machineFlow = createSubcategory(machinesBody, "EXIT & PRIORITIES", 3, true)
-createToggleRow(machineFlow, "Auto Elevator (Teleport)", 1, newOption(OPTIONS, "AutoElevator"))
+local machineFlow = createSubcategory(machinesBody, "EXIT & PRIORITIES", 4, true)
+createToggleRow(machineFlow, "Auto Elevator", 1, newOption(OPTIONS, "AutoElevator"))
 createToggleRow(machineFlow, "Fusebox Check", 2, newOption(OPTIONS, "Fuseboxes"))
 createToggleRow(machineFlow, "Items First", 3, newOption(OPTIONS, "ItemsFirst"))
-
 end
 
 local diagnosticsPage = pages.Diagnostics
@@ -3592,14 +3628,14 @@ local function debugReport()
 		"Exported=" .. os.date("%Y-%m-%d %H:%M:%S"),
 		string.format("SessionSeconds=%.2f PlaceId=%s JobId=%s",
 			os.clock() - debugStart, tostring(game.PlaceId), tostring(game.JobId)),
-		"Mode=pickup-tween/objective-teleport",
-		"Pickup routes=fast tweens, safe detours/pathfinding, cooldown for blocked routes",
+		"Mode=" .. OPTIONS.MovementMode .. " underMapDepth=" .. tostring(OPTIONS.TweenDepth),
+		"Movement policy=one selected mode for all pickups and objectives",
 		"Movement priority=active machine objectives preempt pickup travel; prompt spam stays at 16/s",
 		"LOS=disabled for prompts and infected detection (client-side; server checks may differ)",
 		"Hit attribution=nearest infected only (not confirmed attacker)",
 		"Selena camera=look after Chase Started when TSelena is loaded; stops when unloaded/toggle off",
 		"Machine exit=SkillCheck:InvokeServer() with no arguments; ALL exits deferred while skillcheck UI is visible",
-		"Skillcheck protection=defer remote exits, teleports, pickup tweens, and danger/chase reroutes until UI disappears",
+		"Skillcheck protection=defer exits and travel until UI disappears",
 		"TODO (later)=improve elevator and fusebox event / completion detection",
 		"Final sweep=up to 90s; confirmed pickups; ignores Auto Hide; unsafe pickups skipped",
 		"Ability=press F once per detected machine completion; no cooldown HUD polling or Ability remote",
@@ -3619,15 +3655,14 @@ local function debugReport()
 			debugStats.handoffs > 0 and debugStats.handoffTotalMs / debugStats.handoffs or 0,
 			debugStats.handoffMaxMs, debugStats.handoffLastMs, debugStats.slowMachineScans,
 			debugStats.targetCacheRefreshes, debugStats.targetCacheHits),
-		"PickupMovement: " .. fieldString(PICKUP_TRAVEL),
+		"Movement: " .. fieldString({ mode = OPTIONS.MovementMode, depth = OPTIONS.TweenDepth, speed = PICKUP_TRAVEL.Speed }),
 		"SelenaCamera: " .. fieldString({ enabled = UNLOAD.selenaLook.enabled, chasing = UNLOAD.selenaLook.chaseSeen,
 			tracking = UNLOAD.selenaLook.active }),
 		"CapsuleSources=workspace.Capsules; workspace.Map.InfectedSamples",
 		"TrashItems=Coffee; Socks; Waffle; Pristine Boots (Waffle preferred after ability)",
-		string.format("PickupTween: arrived=%d aborted=%d rerouted=%d rejected=%d totalDistance=%d avgTravelMs=%.1f",
-			debugStats.pickupTweens, debugStats.pickupTweenAborts, debugStats.pickupTweenDetours,
-			debugStats.pickupTweenUnsafe, debugStats.pickupTweenDistance,
-			debugStats.pickupTweens > 0 and debugStats.pickupTravelMs / debugStats.pickupTweens or 0),
+		string.format("Tween: arrived=%d aborted=%d hpStops=%d guards=%d pickupDistance=%d",
+			debugStats.underMapTweens, debugStats.underMapAborts, debugStats.underMapHealthStops,
+			debugStats.underMapGuardBlocks, debugStats.pickupTweenDistance),
 		"PickupTiming=" .. (OPTIONS.CollectLast and "After" or "Before"),
 		"Options: " .. fieldString(OPTIONS),
 		"FARM: " .. fieldString(FARM),
@@ -3693,9 +3728,10 @@ supervise("diagnostic UI", function() return alive end, function()
 	while alive do
 		if main.Visible then for _, refresh in ipairs(toggleRefreshers) do refresh() end end
 		local working = (machineFarm.enabled and "MACHINE") or (pickupBusy() and "PICKUPS") or "IDLE"
-		headerStatus.Text = working .. "  •  v2.6.3"
+		headerStatus.Text = working .. "  •  v2.6.4"
 		headerStatus.TextColor3 = working == "IDLE" and UI.muted or UI.good
-		footerLabel.Text = string.format("%s   •   %d pickup tweens   •   %d objective TPs", BUILD, debugStats.pickupTweens, debugStats.teleports)
+		footerLabel.Text = string.format("%s   •   %s   •   %d moves", BUILD, OPTIONS.MovementMode,
+			debugStats.teleports + debugStats.underMapTweens)
 		if activeTab == "Diagnostics" and main.Visible then
 			stateLabel.Text = "Target: " .. debugStatus.currentTarget .. "  |  Last handoff: " .. tostring(debugStats.handoffLastMs) .. "ms"
 			statsLabel.Text = string.format("Hits %d  |  Damage %.1f  |  Handoffs %d (avg %.0fms)\nTeleports %d  |  Pickups %d/%d  |  ESP %d active\nMachines %d done  |  Stalls %d  |  Errors %d\nAbilities %d  |  Trash inputs %d  |  Death logs %d",
@@ -3722,7 +3758,7 @@ debugEvent("SYSTEM", "initialized", { build = BUILD, place = game.PlaceId,
 	startupChecks = "passed", fallbackExport = true,
     diagnosticsTab = menuButtons.Diagnostics ~= nil and pages.Diagnostics ~= nil,
     diagnosticsDock = diagnosticsDock.Parent ~= nil, ui = "collapsible_subcategories",
-	mode = "tween_pickups_teleport_objectives", selenaCamera = true,
+	mode = OPTIONS.MovementMode, underMapDepth = OPTIONS.TweenDepth, selenaCamera = true,
 	lineOfSight = "disabled", abilityAuto = true, abilityTrigger = "F_after_machine_completion", sampleFarm = true, pickupSpeed = PICKUP_TRAVEL.Speed,
 	enemyClearance = PICKUP_TRAVEL.SafetyRadius, pickupSettle = FARM.Settle,
 	pickupDwell = FARM.Dwell, pickupRate = FARM.SpamRate, itemWaitMax = MACHINE.ItemWaitMax })
