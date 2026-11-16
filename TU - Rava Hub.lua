@@ -67,7 +67,7 @@ local OPTIONS = {
 	MovementMode = "Teleport", TweenDepth = -15, Disable3DRendering = false,
 }
 
-local BUILD = "TU Rava Hub v2.6.12"
+local BUILD = "TU Rava Hub v2.6.14"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -86,6 +86,7 @@ local debugStats = {
 	pickupContactRetries = 0, pickupContactRecovered = 0, pickupContactFailed = 0,
 	promptMovePulses = 0, promptMoveVerified = 0, promptMoveStationary = 0, promptMoveBlocked = 0,
 	machineNearFinishHeld = 0, machineChaseDeferred = 0, finalSafeMoves = 0, finalSafeFailures = 0,
+	elevatorWatchStarts = 0, elevatorFallbacks = 0, elevatorFallbackSuccess = 0, elevatorFallbackFailures = 0,
 	pickupTweenUnsafe = 0, pickupTweenDistance = 0, pickupTravelMs = 0,
 	pickupAttempts = 0, pickupConfirmed = 0, pickupUnconfirmed = 0,
 	promptAttempts = 0, promptFailures = 0, machineTargetChanges = 0,
@@ -1201,7 +1202,10 @@ do
 		local start = root.Position
 		local promptPosition = getPromptPosition(prompt, part)
 		local flat = Vector3.new(promptPosition.X - start.X, 0, promptPosition.Z - start.Z)
-		local direction = flat.Magnitude > 1.2 and flat.Unit or Vector3.new(1, 0, 0)
+		local facing = Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z)
+		local direction = flat.Magnitude > 1.2 and flat.Unit
+			or (facing.Magnitude > 0.01 and facing.Unit or Vector3.new(1, 0, 0))
+		local maxStep = 0.14
 		local started = os.clock()
 		local function horizontalDistance()
 			local delta = root.Position - start
@@ -1228,9 +1232,9 @@ do
 		local movedOnce = false
 		local function pulse()
 			if not nudgeRunning then return end
-			if safe() and horizontalDistance() < 0.55 then
+			if safe() and horizontalDistance() < maxStep then
 				movedOnce = true
-				humanoid:Move(direction, false)
+				humanoid:Move(direction * 0.28, false)
 			else
 				humanoid:Move(Vector3.zero, false)
 			end
@@ -1241,13 +1245,13 @@ do
 		if not bound then
 			debugThrottled("prompt_nudge_bind", 5, "PROMPT", "move_bind_fallback", nil, "WARN")
 		end
-		while alive and os.clock() - started < 0.19 and safe() do
-			if horizontalDistance() >= 0.38 then break end
+		while alive and os.clock() - started < 0.15 and safe() do
+			if horizontalDistance() >= maxStep then break end
 			pulse()
 			RunService.Heartbeat:Wait()
 		end
 		local distance = root.Parent and horizontalDistance() or 0
-		local moved = root.Parent ~= nil and distance >= 0.075
+		local moved = root.Parent ~= nil and distance >= 0.035
 		stopNudge()
 		increment(moved and "promptMoveVerified" or "promptMoveStationary")
 		debugThrottled("prompt_move_" .. tostring(reason), moved and 3 or 1,
@@ -2973,7 +2977,9 @@ local function safeAlternative(current)
 end
 
 local function newMachineAutofarm()
-	local farm = { enabled = false, target = nil, finalizing = false }
+	local farm = { enabled = false, target = nil, finalizing = false,
+		elevatorTransit = false, elevatorTarget = nil, allDoneSince = nil,
+		elevatorEmergencyLocked = false, elevatorWatchFired = false }
 	local runId = 0
 	local elevatorPreference = 1
 	local pickupsAt, pickupsValue = 0, false
@@ -2991,7 +2997,19 @@ local function newMachineAutofarm()
 		farm.moving = false
 		return arrived
 	end
-	-- TODO (later): detect elevator activation / ready state from actual events,
+	local function elevatorMove(position, keepGoing)
+		if farm.elevatorTransit then return false end
+		farm.elevatorTransit = true
+		farm.elevatorTarget = position
+		local ok, arrived = pcall(move, position, keepGoing, "emergency")
+		farm.elevatorTransit = false
+		if not ok then
+			farm.moving = false
+			debugEvent("MACHINE", "elevator_move_error", { error = tostring(arrived) }, "ERROR")
+			return false
+		end
+		return arrived == true
+	end
 	local function goElevator(advancePreference, keepGoing)
 		keepGoing = keepGoing or function() return alive and farm.enabled end
 		local paths = elevatorPreference == 1
@@ -3001,7 +3019,7 @@ local function newMachineAutofarm()
 			local elevator = resolveWorkspacePath(path)
 			local spot = elevator and targetPosition(elevator)
 			if spot then
-				local arrived = move(spot + Vector3.new(0, MACHINE.ElevatorHeight, 0), keepGoing, "emergency")
+				local arrived = elevatorMove(spot + Vector3.new(0, MACHINE.ElevatorHeight, 0), keepGoing)
 				if arrived and advancePreference then
 					elevatorPreference = elevatorPreference == 1 and 2 or 1
 				end
@@ -3011,11 +3029,11 @@ local function newMachineAutofarm()
 		return false
 	end
 	local function finishAtElevator(active)
-		for _, path in ipairs({ MACHINE.ElevatorFallback, MACHINE.Elevator }) do
+		for _, path in ipairs({ MACHINE.Elevator, MACHINE.ElevatorFallback }) do
 			local elevator = resolveWorkspacePath(path)
 			local spot = elevator and targetPosition(elevator)
 			if spot then
-				local arrived = move(spot + Vector3.new(0, MACHINE.ElevatorHeight, 0), active, "emergency")
+				local arrived = elevatorMove(spot + Vector3.new(0, MACHINE.ElevatorHeight, 0), active)
 				increment(arrived and "finalSafeMoves" or "finalSafeFailures")
 				debugEvent("MACHINE", arrived and "final_safespot_arrived" or "final_safespot_failed", {
 					path = path, mode = OPTIONS.MovementMode,
@@ -3096,6 +3114,10 @@ local function newMachineAutofarm()
 		farm.placed = false
 		beginHandoff("start", nil)
 		while active() do
+			if farm.elevatorEmergencyLocked then
+				task.wait(0.12)
+				continue
+			end
 			local root = getPlayerRoot()
 			local moved = false
 			local protected, checkType = skillcheckProtected()
@@ -3523,12 +3545,12 @@ local function newMachineAutofarm()
 										autoElevator = OPTIONS.AutoElevator, fuseboxes = OPTIONS.Fuseboxes,
 										finalSweep = sweepStatus,
 									})
-									if OPTIONS.AutoElevator and active() then finishAtElevator(active) end
-									if OPTIONS.Fuseboxes and not circuitBroken and active() then
+									if OPTIONS.AutoElevator and active() and not farm.elevatorEmergencyLocked then finishAtElevator(active) end
+									if OPTIONS.Fuseboxes and not circuitBroken and active() and not farm.elevatorEmergencyLocked then
 										checkFuseboxes(active)
-										if OPTIONS.AutoElevator and active() then finishAtElevator(active) end
+										if OPTIONS.AutoElevator and active() and not farm.elevatorEmergencyLocked then finishAtElevator(active) end
 									end
-									farm.finalizing = false
+									if not farm.elevatorEmergencyLocked then farm.finalizing = false end
 								end
 							end
 						end
@@ -3547,6 +3569,9 @@ local function newMachineAutofarm()
 	function farm.enable()
 		if farm.enabled then return end
 		farm.enabled = true
+		farm.allDoneSince = nil
+		farm.elevatorWatchFired = false
+		farm.elevatorEmergencyLocked = false
 		chase.pending = false
 		runId += 1
 		local myId = runId
@@ -3555,10 +3580,88 @@ local function newMachineAutofarm()
 		end, function()
 			loop(myId)
 		end)
+		supervise("elevator watchdog", function()
+			return alive and farm.enabled and runId == myId
+		end, function()
+			local function active() return alive and farm.enabled and runId == myId end
+			while active() do
+				if OPTIONS.AutoElevator then
+					local completed = machinesDone()
+					if completed then
+						if not farm.allDoneSince then
+							farm.allDoneSince = os.clock()
+							farm.elevatorWatchFired = false
+							increment("elevatorWatchStarts")
+							debugEvent("MACHINE", "elevator_watch_started", { deadlineSeconds = 15 })
+						end
+						if not farm.elevatorWatchFired and os.clock() - farm.allDoneSince >= 15
+							and not farm.elevatorTransit and not (skillcheckProtected and skillcheckProtected()) then
+							farm.elevatorWatchFired = true
+							farm.elevatorEmergencyLocked = true
+							farm.finalizing = true
+							finalSweepActive = false
+							pickupCircuit.finalized = true
+							pickupCoordinator.home = nil
+							pickupCoordinator.owner = nil
+							if activeMotion and activeMotion.owner == "pickup" then cancelMotion("pickup") end
+							chase.pending = false
+							chase.holdUntil = 0
+							motionPauseUntil = 0
+							increment("elevatorFallbacks")
+							debugEvent("MACHINE", "elevator_fallback_triggered", {
+								seconds = math.floor(os.clock() - farm.allDoneSince), mode = OPTIONS.MovementMode,
+							})
+							local reached = false
+							for attempt = 1, 2 do
+								if not active() then break end
+								local moved = finishAtElevator(active)
+								if moved then
+									task.wait(0.16)
+									local root = getPlayerRoot()
+									reached = root ~= nil and farm.elevatorTarget ~= nil
+										and (root.Position - farm.elevatorTarget).Magnitude <= 8
+									if reached then break end
+								end
+								if attempt < 2 then task.wait(0.3) end
+							end
+							increment(reached and "elevatorFallbackSuccess" or "elevatorFallbackFailures")
+							local root = getPlayerRoot()
+							debugEvent("MACHINE", reached and "elevator_fallback_arrived" or "elevator_fallback_failed", {
+								mode = OPTIONS.MovementMode, verifiedPosition = reached,
+								position = root and tostring(root.Position) or "missing",
+								target = farm.elevatorTarget and tostring(farm.elevatorTarget) or "missing",
+							}, reached and "INFO" or "WARN")
+						end
+					else
+						if farm.allDoneSince then
+							farm.allDoneSince = nil
+							farm.elevatorWatchFired = false
+							if farm.elevatorEmergencyLocked then
+								farm.elevatorEmergencyLocked = false
+								farm.finalizing = false
+								pickupCircuit.reset("new_objective")
+							end
+						end
+					end
+				else
+					farm.allDoneSince = nil
+					farm.elevatorWatchFired = false
+					if farm.elevatorEmergencyLocked then
+						farm.elevatorEmergencyLocked = false
+						farm.finalizing = false
+						pickupCircuit.reset("auto_elevator_disabled")
+					end
+				end
+				task.wait(0.2)
+			end
+		end)
 	end
 	function farm.disable()
 		local wasEnabled = farm.enabled
 		farm.enabled = false
+		farm.allDoneSince = nil
+		farm.elevatorWatchFired = false
+		farm.elevatorEmergencyLocked = false
 		finalSweepActive = false
 		runId += 1
 		farm.target, farm.placed, farm.moving, farm.finalizing = nil, false, false, false
@@ -3996,6 +4099,7 @@ local function debugReport()
 		"Skillcheck protection=defer exits and travel until UI disappears",
 		"TODO (later)=improve elevator and fusebox event / completion detection",
 		"Final sweep=exits on flood-like repeated pickup failures or no progress; 90s hard cap",
+		"Elevator fallback=after 15s of all objectives complete, independent of pickup sweep",
 		"Ability=press F once per detected machine completion; no cooldown HUD polling or Ability remote",
 		"Ability input dispatched is not proof the game accepted it; active skillchecks block completion handling",
 		"Item hotkeys=executor keypress preferred, VIM fallback; input success does not prove item effect",
