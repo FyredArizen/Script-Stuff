@@ -13,9 +13,8 @@ local function sweepHighlights()
 end
 
 if _G.TURavaHubUnload then pcall(_G.TURavaHubUnload) end
-if _G.TUClaudeUnload then pcall(_G.TUClaudeUnload) end
 
-local old = playerGui:FindFirstChild("TURavaHubGUI") or playerGui:FindFirstChild("TUClaudeGUI")
+local old = playerGui:FindFirstChild("TURavaHubGUI")
 if old then old:Destroy() end
 sweepHighlights()
 
@@ -42,13 +41,13 @@ function UNLOAD.force(source)
 	table.clear(connections)
 	for _, cleanup in ipairs(cleanups) do
 		local ok, err = pcall(cleanup)
-		if not ok then warn("[TU - Rava Hub] cleanup error: " .. tostring(err)) end
+		if not ok then warn("[TU Rava Hub] cleanup error: " .. tostring(err)) end
 	end
 	table.clear(cleanups)
 	pcall(UNLOAD.restoreLOS)
+	pcall(sweepHighlights)
 	task.spawn(function()
 		pcall(function() if UNLOAD.exporter then UNLOAD.exporter() end end)
-		pcall(sweepHighlights)
 	end)
 end
 function UNLOAD.request(source)
@@ -56,7 +55,7 @@ function UNLOAD.request(source)
 	if UNLOAD.handler then
 		local ok, err = pcall(UNLOAD.handler, source or "requested")
 		if ok then return end
-		warn("[TU - Rava Hub] unload handler failed; forcing shutdown: " .. tostring(err))
+		warn("[TU Rava Hub] unload handler failed; forcing shutdown: " .. tostring(err))
 	end
 	UNLOAD.force(source or "fallback")
 end
@@ -68,7 +67,7 @@ local OPTIONS = {
 	MovementMode = "Teleport", TweenDepth = -15, Disable3DRendering = false,
 }
 
-local BUILD = "2.6.7 Flood Loop Guard"
+local BUILD = "TU Rava Hub v2.6.11"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -84,10 +83,15 @@ local debugStats = {
 	finalSweepCollectionAttempts = 0, pickupChasesIgnored = 0,
 	pickupRepeatBlocks = 0, pickupCircuitTrips = 0, pickupCircuitResets = 0,
 	pickupFailedInteractions = 0, finalSweepStallExits = 0,
+	pickupContactRetries = 0, pickupContactRecovered = 0, pickupContactFailed = 0,
+	promptMovePulses = 0, promptMoveVerified = 0, promptMoveStationary = 0, promptMoveBlocked = 0,
+	machineNearFinishHeld = 0, machineChaseDeferred = 0, finalSafeMoves = 0, finalSafeFailures = 0,
 	pickupTweenUnsafe = 0, pickupTweenDistance = 0, pickupTravelMs = 0,
 	pickupAttempts = 0, pickupConfirmed = 0, pickupUnconfirmed = 0,
 	promptAttempts = 0, promptFailures = 0, machineTargetChanges = 0,
 	machineStalls = 0, skillcheckInputs = 0, skillcheckInputFailures = 0,
+	skillcheckDialEarly = 0, skillcheckBarEarly = 0, skillcheckRearms = 0,
+	skillcheckRebinds = 0, skillcheckInputVIM = 0, skillcheckInputFallback = 0,
 	chases = 0, workerErrors = 0, machineCompletions = 0,
 	machinePlacements = 0, machineDangers = 0, fuseAttempts = 0,
 	itemUseAttempts = 0, itemUseFailures = 0, itemUseObserved = 0, itemUseUnverified = 0,
@@ -200,7 +204,7 @@ end
 
 UNLOAD.fallbackReport = function()
 	local summary = {
-		"TU - Rava Hub | Startup / Fallback Diagnostic Report",
+		"TU Rava Hub | Startup / Fallback Diagnostic Report",
 		"Build=" .. BUILD,
 		"Exported=" .. os.date("%Y-%m-%d %H:%M:%S"),
 		"PlaceId=" .. tostring(game.PlaceId) .. " JobId=" .. tostring(game.JobId),
@@ -241,12 +245,20 @@ local function cancelMotion(owner)
 		activeMotion = nil
 		motion.cancelled = true
 		if motion.tween then pcall(function() motion.tween:Cancel() end) end
-		if not alive and motion.returnSurface then
+		local recoverySucceeded = nil
+		if motion.returnSurface then
 			motion.unloading = true
-			pcall(motion.returnSurface)
+			local ok, restored = pcall(motion.returnSurface)
+			recoverySucceeded = ok and restored == true
+			if not recoverySucceeded then
+				debugEvent("MOVE", "cancel_surface_recovery_failed", {
+					owner = motion.owner, phase = motion.phase or "unknown",
+				}, "WARN")
+			end
 		end
 		if motion.restore then pcall(motion.restore) end
-		debugEvent("MOVE", "cancel", { owner = motion.owner, phase = motion.phase or "unknown" })
+		debugEvent("MOVE", "cancel", { owner = motion.owner,
+			phase = motion.phase or "unknown", surfaced = recoverySucceeded })
 	end
 end
 UNLOAD.cancelMovement = cancelMotion
@@ -382,18 +394,21 @@ local function tweenUnderMap(destination, keepGoing, owner, mode)
 	end
 	local healthAtStart = health()
 	function motion.returnSurface()
-		if root.Parent and root.Anchored then
-			local ok, tween = pcall(function()
-				return TweenService:Create(root, TweenInfo.new(0.12, Enum.EasingStyle.Linear),
-					{ CFrame = CFrame.new(from) })
-			end)
-			if ok then
-				pcall(function() tween:Play() end)
-				local deadline = os.clock() + 0.22
-				while tween.PlaybackState == Enum.PlaybackState.Playing
-					and os.clock() < deadline do RunService.Heartbeat:Wait() end
-			end
+		if not root.Parent then return false end
+		if not root.Anchored then return (root.Position - from).Magnitude <= PICKUP_TRAVEL.ArriveTolerance end
+		local ok, tween = pcall(function()
+			return TweenService:Create(root, TweenInfo.new(0.12, Enum.EasingStyle.Linear),
+				{ CFrame = CFrame.new(from) })
+		end)
+		if not ok then return false end
+		local played = pcall(function() tween:Play() end)
+		if not played then return false end
+		local deadline = os.clock() + 0.23
+		while tween.PlaybackState == Enum.PlaybackState.Playing
+			and os.clock() < deadline and root.Parent do
+			RunService.Heartbeat:Wait()
 		end
+		return root.Parent ~= nil and (root.Position - from).Magnitude <= PICKUP_TRAVEL.ArriveTolerance
 	end
 	local function abort(reason)
 		local stillOwns = activeMotion == motion
@@ -499,7 +514,7 @@ local function supervise(label, isActive, fn)
 		while isActive() do
 			local ok, err = pcall(fn)
 			if ok then return end
-			warn("[TU - Rava Hub] " .. label .. " error: " .. tostring(err))
+			warn("[TU Rava Hub] " .. label .. " error: " .. tostring(err))
 			increment("workerErrors")
 			debugEvent("WORKER", "crashed", { worker = label, error = tostring(err), retry = "0.5s" }, "ERROR")
 			task.wait(0.5)
@@ -649,7 +664,7 @@ local mainArea = new("Frame", { Position = UDim2.fromOffset(158, 64),
 	Size = UDim2.new(1, -158, 1, -94), BackgroundTransparency = 1 }, main)
 local footer = new("Frame", { Position = UDim2.new(0, 0, 1, -30), Size = UDim2.new(1, 0, 0, 30),
 	BackgroundColor3 = UI.surface, BorderSizePixel = 0 }, main)
-local footerLabel = uiText(footer, "TU - Rava Hub", 11, false, UI.muted,
+local footerLabel = uiText(footer, "TU Rava Hub", 11, false, UI.muted,
 	{ Position = UDim2.fromOffset(17, 5), Size = UDim2.new(1, -30, 0, 21) })
 local diagnosticsDock = new("Frame", {
     Name = "DiagnosticsDock", Position = UDim2.new(0, 0, 1, -96),
@@ -1157,6 +1172,94 @@ local function getPromptPosition(prompt, fallbackPart)
 	return fallbackPart.Position
 end
 
+do
+	local binding = "TU_RavaHub_PromptMove"
+	local nudgeRunning = false
+	local nudgeHumanoid = nil
+	local function stopNudge()
+		pcall(function() RunService:UnbindFromRenderStep(binding) end)
+		if nudgeHumanoid and nudgeHumanoid.Parent then
+			pcall(function() nudgeHumanoid:Move(Vector3.zero, false) end)
+		end
+		nudgeHumanoid = nil
+		nudgeRunning = false
+	end
+	table.insert(cleanups, stopNudge)
+	UNLOAD.refreshPromptContact = function(prompt, part, keepGoing, reason)
+		if nudgeRunning or not alive or not keepGoing() then
+			increment("promptMoveBlocked")
+			return false, "busy_or_inactive"
+		end
+		local character = player.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if not root or not humanoid or root.Anchored or humanoid.Health <= 0
+			or not part or not prompt or not prompt.Enabled
+			or (skillcheckProtected and skillcheckProtected()) then
+			increment("promptMoveBlocked")
+			return false, "not_movable"
+		end
+		local start = root.Position
+		local promptPosition = getPromptPosition(prompt, part)
+		local flat = Vector3.new(promptPosition.X - start.X, 0, promptPosition.Z - start.Z)
+		local direction = flat.Magnitude > 1.2 and flat.Unit or Vector3.new(1, 0, 0)
+		local started = os.clock()
+		local function horizontalDistance()
+			local delta = root.Position - start
+			return Vector3.new(delta.X, 0, delta.Z).Magnitude
+		end
+		local function safe()
+			local ok, allowed = pcall(function()
+				return alive and player.Character == character and root.Parent ~= nil
+					and humanoid.Parent ~= nil and humanoid.Health > 0 and not root.Anchored
+					and prompt.Parent ~= nil and prompt.Enabled and keepGoing()
+					and not (skillcheckProtected and skillcheckProtected())
+					and not (infectedNear and (infectedNear(root.Position, 11)
+						or infectedNear(root.Position + direction * 0.55, 11)))
+			end)
+			return ok and allowed
+		end
+		if not safe() then
+			increment("promptMoveBlocked")
+			return false, "unsafe_or_interrupted"
+		end
+		nudgeRunning = true
+		nudgeHumanoid = humanoid
+		increment("promptMovePulses")
+		local movedOnce = false
+		local function pulse()
+			if not nudgeRunning then return end
+			if safe() and horizontalDistance() < 0.55 then
+				movedOnce = true
+				humanoid:Move(direction, false)
+			else
+				humanoid:Move(Vector3.zero, false)
+			end
+		end
+		local bound = pcall(function()
+			RunService:BindToRenderStep(binding, Enum.RenderPriority.Input.Value + 1, pulse)
+		end)
+		if not bound then
+			debugThrottled("prompt_nudge_bind", 5, "PROMPT", "move_bind_fallback", nil, "WARN")
+		end
+		while alive and os.clock() - started < 0.19 and safe() do
+			if horizontalDistance() >= 0.38 then break end
+			pulse()
+			RunService.Heartbeat:Wait()
+		end
+		local distance = root.Parent and horizontalDistance() or 0
+		local moved = root.Parent ~= nil and distance >= 0.075
+		stopNudge()
+		increment(moved and "promptMoveVerified" or "promptMoveStationary")
+		debugThrottled("prompt_move_" .. tostring(reason), moved and 3 or 1,
+			"PROMPT", moved and "movement_contact" or "movement_not_verified",
+			{ purpose = reason, distance = string.format("%.2f", distance),
+				method = bound and "humanoid_render" or "humanoid_heartbeat",
+				requested = movedOnce }, moved and "INFO" or "WARN")
+		return moved, moved and "moved" or "stationary"
+	end
+end
+
 local hasFirePrompt = typeof(fireproximityprompt) == "function"
 
 local function triggerPrompt(prompt, forceHold)
@@ -1281,8 +1384,8 @@ local function pickupEvidence(prompt, target, initialParent, confirmPickup, init
 	return false
 end
 
-local function spamPrompt(prompt, target, keepGoing, confirmPickup, initialHeld, initialParent)
-	local deadline = os.clock() + FARM.Dwell
+local function spamPrompt(prompt, target, keepGoing, confirmPickup, initialHeld, initialParent, duration)
+	local deadline = os.clock() + (duration or FARM.Dwell)
 	local attempts = 0
 	local holding, fallbackStarted, spamActive = false, false, true
 	local beganAt = os.clock()
@@ -1392,7 +1495,7 @@ end
 local chase = { pending = false, holdUntil = 0 }
 local finalSweepActive = false
 local pickupCircuit = {
-	paused = false,
+	paused = false, finalized = false,
 	failed = setmetatable({}, { __mode = "k" }),
 	blocked = setmetatable({}, { __mode = "k" }),
 	failedTargets = setmetatable({}, { __mode = "k" }),
@@ -1413,8 +1516,9 @@ function pickupCircuit.pause(reason)
 	}, "WARN")
 end
 function pickupCircuit.reset(reason)
-	if not pickupCircuit.paused then return end
+	if not pickupCircuit.paused and not pickupCircuit.finalized then return end
 	pickupCircuit.paused = false
+	pickupCircuit.finalized = false
 	pickupCircuit.failed = setmetatable({}, { __mode = "k" })
 	pickupCircuit.blocked = setmetatable({}, { __mode = "k" })
 	pickupCircuit.failedTargets = setmetatable({}, { __mode = "k" })
@@ -1458,7 +1562,8 @@ function pickupCircuit.record(target, folder, confirmed, reason, attempts)
 end
 
 track(workspace.ChildAdded:Connect(function(instance)
-	if instance.Name == "Map" or instance.Name == "Items" or instance.Name == "Capsules" then
+	if instance.Name == "Map" or ((instance.Name == "Items" or instance.Name == "Capsules")
+		and not pickupCircuit.finalized) then
 		pickupCircuit.reset("world_reloaded")
 	end
 end))
@@ -1476,7 +1581,7 @@ local function releasePickup(farm)
 end
 
 local function returnPickupHome(force, isBlocked)
-	if finalSweepActive or pickupCircuit.paused then return end
+	if finalSweepActive or pickupCircuit.paused or pickupCircuit.finalized then return end
 	if not pickupCoordinator.home or pickupCoordinator.owner then return end
 	if isBlocked and isBlocked() then
 		pickupCoordinator.home = nil -- Machine work supersedes the previous pickup origin.
@@ -1514,7 +1619,7 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 	local function loop(myId)
 		local function active() return alive and farm.enabled and runId == myId end
 		local function allowed()
-			return active() and not pickupCircuit.paused and (not gate or gate()) and not (isBlocked and isBlocked())
+			return active() and not pickupCircuit.paused and not pickupCircuit.finalized and (not gate or gate()) and not (isBlocked and isBlocked())
 				and (finalSweepActive or os.clock() >= motionPauseUntil)
 				and (finalSweepActive or not (OPTIONS.AutoHide and os.clock() < chase.holdUntil))
 		end
@@ -1574,7 +1679,11 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 									if isBlocked and isBlocked() then return false, "preempted_by_machine", 0 end
 									return false, "tween_" .. tostring(travelReason), 0
 								end
-								task.wait(OPTIONS.MovementMode == "Teleport" and FARM.TeleportSettle or FARM.Settle)
+								task.wait(0.04)
+								local contacted = UNLOAD.refreshPromptContact(prompt, part, function()
+									return stillPicking(true) and not infectedNear(promptPosition, FARM.InfectedClear)
+								end, "pickup_arrival")
+								task.wait(contacted and 0.06 or (OPTIONS.MovementMode == "Teleport" and FARM.TeleportSettle or FARM.Settle))
 								if isBlocked and isBlocked() then return false, "preempted_by_machine", 0 end
 								if infectedNear(root.Position, FARM.InfectedClear) then
 									return false, "enemy_after_arrival", 0
@@ -1592,6 +1701,26 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 									return false, (isBlocked and isBlocked()) and "preempted_by_machine" or "interrupted_after_arrival", 0
 								end
 								local success, why, fired = spamPrompt(prompt, target, stillPicking, confirmPickup, initialHeld, initialParent)
+								if not success and why == "confirmation_timeout" and (fired or 0) > 0
+									and stillPicking() and not pickupCircuit.paused then
+									increment("pickupContactRetries")
+									debugEvent("PICKUP", "contact_retry", { name = target.Name, folder = folder.Name,
+										mode = OPTIONS.MovementMode, attempts = fired })
+									local contactOk = UNLOAD.refreshPromptContact(prompt, part, function()
+										return stillPicking(true) and not infectedNear(promptPosition, FARM.InfectedClear)
+									end, "pickup_retry")
+									if contactOk and stillPicking() then
+										local retrySuccess, retryReason, retryFired = spamPrompt(prompt, target, stillPicking,
+											confirmPickup, initialHeld, initialParent, 0.65)
+										success, why, fired = retrySuccess, retryReason, fired + retryFired
+										increment(retrySuccess and "pickupContactRecovered" or "pickupContactFailed")
+										debugEvent("PICKUP", retrySuccess and "contact_recovered" or "contact_unconfirmed",
+											{ name = target.Name, folder = folder.Name, attempts = fired }, retrySuccess and "INFO" or "WARN")
+									else
+										why = "contact_reposition_interrupted"
+										increment("pickupContactFailed")
+									end
+								end
 								if not success and isBlocked and isBlocked() then return false, "preempted_by_machine", fired end
 								return success, why, fired
 							end)
@@ -1609,7 +1738,7 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 							end
 							if not ok then
 								debugLog("ERROR pickup " .. tostring(target.Name) .. ": " .. tostring(confirmed))
-								warn("[TU - Rava Hub] pickup error: " .. tostring(confirmed))
+								warn("[TU Rava Hub] pickup error: " .. tostring(confirmed))
 								confirmed, reason, attempts = false, "lua_error", 0
 							end
 							if reason == "preempted_by_machine" then
@@ -2259,9 +2388,9 @@ local MACHINE = {
 	Folders = { "OilMachines", "Computers" },  Range = 50,  Height = 3,
 	Elevator = "Map.SpecialFolder.ExitElevator",  ElevatorFallback = "Elevator",  ElevatorHeight = -20,
 	Tick = 0.03, Settle = 0.025, PromptRetry = 0.08,
-	RescanInterval = 0.12, StallTimeout = 3, UseTimeout = 8,
+	RescanInterval = 0.12, StallTimeout = 3, UseTimeout = 8, NearFinishAt = 90, NearFinishHold = 20,
 	ClearHold = 1.0, ItemWaitMax = 35, CollectWaitMax = 90, ItemIdle = 0.2,
-	FinalSweepPoll = 0.18, FinalSweepClearTime = 1.0,
+	FinalSweepPoll = 0.18, FinalSweepClearTime = 0.25,
 	EyeHeight = 3,  SkillcheckPause = 3,  SkillcheckStale = 6,
 	ChaseHold = 3,  DoneValue = 100,  FuseDwell = 1,
 	Fuseboxes = {
@@ -2883,19 +3012,20 @@ local function newMachineAutofarm()
 		return false
 	end
 	local function finishAtElevator(active)
-		local elevator = resolveWorkspacePath(MACHINE.ElevatorFallback)
-		local spot = elevator and targetPosition(elevator)
-		if spot and not move(spot + Vector3.new(0, MACHINE.ElevatorHeight, 0), active, "emergency") then return end
-		local deadline = os.clock() + 5
-		while active() and os.clock() < deadline do
-			if not resolveWorkspacePath(MACHINE.Elevator) then return end
-			task.wait(0.1)
+		for _, path in ipairs({ MACHINE.ElevatorFallback, MACHINE.Elevator }) do
+			local elevator = resolveWorkspacePath(path)
+			local spot = elevator and targetPosition(elevator)
+			if spot then
+				local arrived = move(spot + Vector3.new(0, MACHINE.ElevatorHeight, 0), active, "emergency")
+				increment(arrived and "finalSafeMoves" or "finalSafeFailures")
+				debugEvent("MACHINE", arrived and "final_safespot_arrived" or "final_safespot_failed", {
+					path = path, mode = OPTIONS.MovementMode,
+				}, arrived and "INFO" or "WARN")
+				if arrived then return true end
+			end
 		end
-		if active() then
-			local exitElevator = resolveWorkspacePath(MACHINE.Elevator)
-			local exitSpot = exitElevator and targetPosition(exitElevator)
-			if exitSpot then move(exitSpot + Vector3.new(0, MACHINE.ElevatorHeight, 0), active, "emergency") end
-		end
+		debugEvent("MACHINE", "final_safespot_unavailable", nil, "WARN")
+		return false
 	end
 	-- TODO (later): detect fusebox enable/completion events directly so the
 	local function checkFuseboxes(active)
@@ -2936,6 +3066,7 @@ local function newMachineAutofarm()
 		local activated, lockedOn = false, false
 		local lastProgressAt = os.clock()
 		local checkingSince
+		local lastContactAt = -math.huge
 		local clearSince = nil
 		local waitStart = nil
 		local lastBusyAt = os.clock()
@@ -2979,6 +3110,19 @@ local function newMachineAutofarm()
 				continue
 			end
 			if chase.pending and finalSweepActive then chase.pending = false end
+			if chase.pending and root and farm.target and farm.placed then
+				local remaining = getProgress(farm.target)
+				if remaining and remaining >= MACHINE.NearFinishAt and remaining < MACHINE.DoneValue then
+					local _, closest = nearestInfected(root.Position)
+					if not closest or closest > 24 then
+						chase.pending, chase.holdUntil = false, 0
+						motionPauseUntil = 0
+						increment("machineChaseDeferred")
+						debugThrottled("finish_chase_deferred", 3, "MACHINE", "near_finish_chase_held",
+							{ name = farm.target.Name, progress = remaining, nearest = closest or "none" })
+					end
+				end
+			end
 			if chase.pending then
 				chase.pending = false
 				chase.holdUntil = os.clock() + MACHINE.ChaseHold
@@ -3026,12 +3170,23 @@ local function newMachineAutofarm()
 					local scannedTarget, scannedStatus = pickMachine()
 					local currentPrompt = target and getPrompt(target)
 					if target and not isComplete(target) then abilityTriggeredFor[target] = nil end
+					local targetProgress = target and getProgress(target)
+					local nearFinish = targetProgress and targetProgress >= MACHINE.NearFinishAt
+						and targetProgress < MACHINE.DoneValue
+					local finishLocked = nearFinish and farm.placed
+						and now - lastProgressAt <= MACHINE.NearFinishHold
 					local currentUsable = target
 						and isLiveMachineObjective(target)
 						and not isComplete(target)
 						and currentPrompt ~= nil
 						and (currentPrompt.Enabled
-							or (farm.placed and now - lastProgressAt <= MACHINE.UseTimeout))
+							or (farm.placed and now - lastProgressAt <= MACHINE.UseTimeout)
+							or finishLocked)
+					if finishLocked and scannedTarget ~= target then
+						increment("machineNearFinishHeld")
+						debugThrottled("near_finish_" .. tostring(target), 4, "MACHINE", "near_finish_held",
+							{ name = target.Name, progress = targetProgress, candidate = scannedTarget and scannedTarget.Name or "none" })
+					end
 					if not currentUsable then
 						if target and scannedTarget ~= target then
 							local completed = isComplete(target)
@@ -3066,6 +3221,7 @@ local function newMachineAutofarm()
 				if not target then target, status = pickMachine() end
 				farm.target = target
 				if target ~= loggedTarget then
+					lastContactAt = -math.huge
 					loggedTarget = target
 					debugStatus.currentTarget = target and target.Name or "None"
 					increment("machineTargetChanges")
@@ -3074,7 +3230,7 @@ local function newMachineAutofarm()
 				local prompt = target and getPrompt(target)
 				local part = prompt and getPromptPart(prompt, target)
 				if part then
-					if (finished or finalSweep) and pickupCircuit.paused then
+					if (finished or finalSweep) and (pickupCircuit.paused or pickupCircuit.finalized) then
 						pickupCircuit.reset("new_objective")
 					end
 					if finalSweep then
@@ -3089,6 +3245,14 @@ local function newMachineAutofarm()
 					farm.finalizing = false
 					finished = false
 					local danger, dangerName, dangerDist = twistedNear(part.Position)
+					local progressNow = getProgress(target)
+					if danger and progressNow and progressNow >= MACHINE.NearFinishAt
+						and progressNow < MACHINE.DoneValue and dangerDist and dangerDist > 16 then
+						debugThrottled("near_finish_danger_" .. tostring(target), 4,
+							"MACHINE", "near_finish_danger_held", { name = target.Name,
+							progress = progressNow, enemy = dangerName, distance = dangerDist })
+						danger = false
+					end
 					if danger then
 						clearSince = nil
 					elseif not clearSince then
@@ -3145,6 +3309,11 @@ local function newMachineAutofarm()
 								continue
 							end
 							task.wait(MACHINE.Settle)
+							local contacted = UNLOAD.refreshPromptContact(prompt, part, function()
+								return active() and farm.target == target and not chase.pending
+									and target:IsDescendantOf(workspace) and not isComplete(target)
+							end, "machine_arrival")
+							if contacted then task.wait(0.06) end
 							local initialFireAt = os.clock()
 							local initialFired = triggerMachinePrompt(prompt)
 							debugEvent("PERF", "prompt_after_teleport", {
@@ -3223,6 +3392,27 @@ local function newMachineAutofarm()
 							checkingSince = nil
 						end
 						local paused = checking and os.clock() - checkingSince < MACHINE.SkillcheckPause
+						if prompt.Enabled and not activated and farm.placed and not checking
+							and os.clock() - placedAt >= 2.7
+							and os.clock() - lastProgressAt >= 2.7
+							and os.clock() - lastContactAt >= 4
+							and (root.Position - part.Position).Magnitude <= prompt.MaxActivationDistance + 3 then
+							lastContactAt = os.clock()
+							local currentProgress = getProgress(target)
+							local corrected = UNLOAD.refreshPromptContact(prompt, part, function()
+								return active() and farm.target == target and prompt.Enabled
+									and not chase.pending and not isComplete(target)
+							end, "machine_retry")
+							if corrected and active() and prompt.Enabled and not isComplete(target) then
+								lastFire = os.clock()
+								local dispatched = triggerMachinePrompt(prompt)
+								debugEvent("MACHINE", "contact_retry", { name = target.Name,
+									progress = tostring(currentProgress), mode = OPTIONS.MovementMode, dispatched = dispatched })
+							else
+								debugThrottled("machine_contact_failed_" .. tostring(target), 4,
+									"MACHINE", "contact_reposition_deferred", { name = target.Name }, "WARN")
+							end
+						end
 						if not activated and not paused and not isComplete(target) and prompt.Enabled
 							and os.clock() >= fireAfter and os.clock() - lastFire >= MACHINE.PromptRetry then
 							lastFire = os.clock()
@@ -3312,11 +3502,11 @@ local function newMachineAutofarm()
 										or timedOut and "timeout" or "verified_clear"
 									if circuitBroken then increment("finalSweepStallExits") end
 									farm.finalizing = OPTIONS.AutoElevator or OPTIONS.Fuseboxes
+									pickupCircuit.finalized = true
 									finalSweepActive = false
-									if farm.finalizing then
-										if activeMotion and activeMotion.owner == "pickup" then cancelMotion("pickup") end
-										pickupCoordinator.home = nil
-									end
+									if activeMotion and activeMotion.owner == "pickup" then cancelMotion("pickup") end
+									pickupCoordinator.home = nil
+									if pickupCoordinator.owner ~= nil then pickupCoordinator.owner = nil end
 									finished = true
 									if timedOut then
 										increment("finalSweepTimeouts")
@@ -3334,12 +3524,12 @@ local function newMachineAutofarm()
 										autoElevator = OPTIONS.AutoElevator, fuseboxes = OPTIONS.Fuseboxes,
 										finalSweep = sweepStatus,
 									})
-									if OPTIONS.Fuseboxes and not circuitBroken then checkFuseboxes(active) end
-									if OPTIONS.AutoElevator and active() then
-										finishAtElevator(active)
-									else
-										farm.finalizing = false
+									if OPTIONS.AutoElevator and active() then finishAtElevator(active) end
+									if OPTIONS.Fuseboxes and not circuitBroken and active() then
+										checkFuseboxes(active)
+										if OPTIONS.AutoElevator and active() then finishAtElevator(active) end
 									end
+									farm.finalizing = false
 								end
 							end
 						end
@@ -3433,23 +3623,35 @@ end
 local BUTTON_SIGNALS = { "MouseButton1Down", "Activated", "MouseButton1Click", "TouchTap" }
 
 local function tapGuiObject(obj)
-	return (pcall(function()
+	local ok = pcall(function()
 		local vim = game:GetService("VirtualInputManager")
-		local inset = game:GetService("GuiService"):GetGuiInset()
-		local pos = obj.AbsolutePosition + obj.AbsoluteSize / 2 + inset
-		vim:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
-		vim:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
-	end))
+		local position = obj.AbsolutePosition + obj.AbsoluteSize * 0.5
+		local screen = obj:FindFirstAncestorWhichIsA("ScreenGui")
+		if not screen or not screen.IgnoreGuiInset then
+			position += game:GetService("GuiService"):GetGuiInset()
+		end
+		if obj.AbsoluteSize.X <= 0 or obj.AbsoluteSize.Y <= 0 then error("zero_button_size") end
+		vim:SendMouseButtonEvent(position.X, position.Y, 0, true, game, 0)
+		task.delay(0.018, function()
+			pcall(function() vim:SendMouseButtonEvent(position.X, position.Y, 0, false, game, 0) end)
+		end)
+	end)
+	return ok
 end
 
 local function pressGuiButton(button)
-	for _, name in ipairs(BUTTON_SIGNALS) do
-		local ok, signal = pcall(function()
-			return button[name]
-		end)
-		if ok and signal and fireConnections(signal) then return true end
+	if tapGuiObject(button) then
+		increment("skillcheckInputVIM")
+		return true, "virtual_mouse"
 	end
-	return tapGuiObject(button)
+	for _, name in ipairs({ "Activated", "MouseButton1Click", "MouseButton1Down", "TouchTap" }) do
+		local ok, signal = pcall(function() return button[name] end)
+		if ok and signal and fireConnections(signal) then
+			increment("skillcheckInputFallback")
+			return true, "signal_" .. name
+		end
+	end
+	return false, "no_input_method"
 end
 
 local function normRot(r) return (r + 180) % 360 - 180 end
@@ -3457,92 +3659,187 @@ local function normRot(r) return (r + 180) % 360 - 180 end
 local function newAutoSkillcheck()
 	local feature = { enabled = false }
 	local runId = 0
-	local beats = {} -- Dictionary of currently connected Heartbeats only.
-	local function canAutoClick() return alive and feature.enabled end
+	local beats = {}
 	local function active(myId) return alive and feature.enabled and runId == myId end
 	local function stop()
-		for c in pairs(beats) do c:Disconnect() end
+		for connection in pairs(beats) do connection:Disconnect() end
 		table.clear(beats)
 	end
-	local function waitPath(root, names, myId)
-		local current = root
-		for _, name in ipairs(names) do
-			local found = current:FindFirstChild(name)
-			while not found do
-				if not active(myId) then return nil end
-				task.wait(0.25)
-				found = current:FindFirstChild(name)
-			end
-			current = found
+	local function findPath(parts)
+		local current = playerGui
+		for _, name in ipairs(parts) do
+			current = current and current:FindFirstChild(name)
+			if not current then return nil end
 		end
 		return current
 	end
+	local function awaitPath(parts, myId)
+		while active(myId) do
+			local found = findPath(parts)
+			if found then return found end
+			task.wait(0.05)
+		end
+	end
+	local function watchFrames(callback)
+		local heartbeat = RunService.Heartbeat:Connect(callback)
+		local render
+		local ok, connection = pcall(function() return RunService.PreRender:Connect(callback) end)
+		if ok then render = connection end
+		beats[heartbeat] = true
+		if render then beats[render] = true end
+		return function()
+			heartbeat:Disconnect()
+			if render then render:Disconnect() end
+			beats[heartbeat] = nil
+			if render then beats[render] = nil end
+		end
+	end
 	local function watchRound(myId)
 		while active(myId) do
-			local normal = waitPath(playerGui, { "RoundSkillcheck", "Container", "Normal" }, myId)
-			local aimImage = normal and waitPath(normal, { "AimImage" }, myId)
-			local target = normal and waitPath(normal, { "Target" }, myId)
-			local hit = normal and waitPath(normal, { "Hit" }, myId)
-			if not (aimImage and target and hit) then return end
-			local fired, lastV7, lastVisible = false, nil, effectivelyVisible(normal)
-			local beat = RunService.Heartbeat:Connect(function()
-				local visible = effectivelyVisible(normal)
+			local normal = awaitPath({ "RoundSkillcheck", "Container", "Normal" }, myId)
+			if not normal then break end
+			local aimImage = normal:FindFirstChild("AimImage")
+			local target = normal:FindFirstChild("Target")
+			local hit = normal:FindFirstChild("Hit")
+			if not (aimImage and target and hit) then
+				task.wait(0.05)
+				continue
+			end
+			local fired, lastV7, lastAt, firedAt = false, nil, nil, -math.huge
+			local lastVisible, lastTarget = false, nil
+			local function check()
+				if not active(myId) or not normal:IsDescendantOf(playerGui) then return end
+				local visible = skillcheckWidgetOnScreen(normal)
 				if visible ~= lastVisible then
-					if visible then fired, lastV7 = false, nil end
+					if visible then fired, lastV7, lastAt = false, nil, nil end
 					lastVisible = visible
 				end
-				if not visible or fired then return end
-				local aim = normRot(aimImage.Rotation + 180)
-				local zoneStart = normRot(target.Rotation - 30)
-				local v7 = math.abs(((aim - zoneStart) + 180) % 360 - 180) / 60
-				if lastV7 and lastV7 < 0.44 and v7 >= 0.44 and canAutoClick() then
-					fired = true
-					increment("skillcheckInputs")
-					local sent = pressGuiButton(hit)
-					if not sent then increment("skillcheckInputFailures") end
-					debugEvent("SKILLCHECK", "dial_input", { dispatched = sent,
-						position = string.format("%.3f", v7) }, sent and "INFO" or "WARN")
+				if not visible then return end
+				local now = os.clock()
+				local targetRotation = target.Rotation
+				if lastTarget and math.abs(normRot(targetRotation - lastTarget)) > 5 then
+					fired, lastV7, lastAt = false, nil, nil
+					increment("skillcheckRearms")
 				end
-				lastV7 = v7
-			end)
-			beats[beat] = true
-			while active(myId) and hit:IsDescendantOf(playerGui) do task.wait(0.5) end
-			beat:Disconnect()
-			beats[beat] = nil
+				lastTarget = targetRotation
+				local aim = normRot(aimImage.Rotation + 180)
+				local zoneStart = normRot(targetRotation - 30)
+				local v7 = math.abs(((aim - zoneStart) + 180) % 360 - 180) / 60
+				if fired then
+					if now - firedAt >= 0.75 and v7 > 1.2 then
+						fired = false
+						increment("skillcheckRearms")
+					else
+						lastV7, lastAt = v7, now
+						return
+					end
+				end
+				local deltaTime = lastAt and math.max(0.008, now - lastAt) or 0.016
+				local speed = lastV7 and (v7 - lastV7) / deltaTime or 0
+				local projected = v7 + math.clamp(speed * 0.016, 0, 0.055)
+				local firstFrame = lastV7 == nil and v7 >= 0.35 and v7 <= 0.54
+				local crossed = lastV7 and lastV7 < 0.40 and projected >= 0.40
+				local caught = lastV7 and v7 >= 0.40 and v7 <= 0.54 and speed >= 0
+				if v7 >= 0.28 and v7 <= 0.68 and (firstFrame or crossed or caught) then
+					local sent, method = pressGuiButton(hit)
+					if sent then
+						fired, firedAt = true, now
+						increment("skillcheckInputs")
+						if v7 < 0.44 then increment("skillcheckDialEarly") end
+					else
+						increment("skillcheckInputFailures")
+					end
+					debugEvent("SKILLCHECK", "dial_input", {
+						dispatched = sent, method = method,
+						position = string.format("%.3f", v7),
+						projected = string.format("%.3f", projected),
+					}, sent and "INFO" or "WARN")
+				end
+				lastV7, lastAt = v7, now
+			end
+			local disconnect = watchFrames(check)
+			increment("skillcheckRebinds")
+			while active(myId) and normal:IsDescendantOf(playerGui)
+				and findPath({ "RoundSkillcheck", "Container", "Normal" }) == normal
+				and aimImage.Parent == normal and target.Parent == normal and hit.Parent == normal do
+				task.wait(0.10)
+			end
+			disconnect()
 		end
 	end
 	local function watchLock(myId)
 		while active(myId) do
-			local main = waitPath(playerGui, { "LockUI", "HUD", "Skillcheck", "Main" }, myId)
-			local marker = main and waitPath(main, { "Marker" }, myId)
-			local objective = main and waitPath(main, { "Objective" }, myId)
-			local button = main and waitPath(main, { "MobileButtonClick" }, myId)
-			if not (marker and objective and button) then return end
-			local fired, lastDist, lastVisible = false, nil, effectivelyVisible(marker)
-			local beat = RunService.Heartbeat:Connect(function()
-				local visible = effectivelyVisible(marker)
+			local main = awaitPath({ "LockUI", "HUD", "Skillcheck", "Main" }, myId)
+			if not main then break end
+			local marker = main:FindFirstChild("Marker")
+			local objective = main:FindFirstChild("Objective")
+			local button = main:FindFirstChild("MobileButtonClick")
+			if not (marker and objective and button) then
+				task.wait(0.05)
+				continue
+			end
+			local fired, lastDist, lastAt, firedAt = false, nil, nil, -math.huge
+			local lastVisible, lastTargetX = false, nil
+			local function check()
+				if not active(myId) or not main:IsDescendantOf(playerGui) then return end
+				local visible = skillcheckWidgetOnScreen(marker)
 				if visible ~= lastVisible then
-					if visible then fired, lastDist = false, nil end
+					if visible then fired, lastDist, lastAt = false, nil, nil end
 					lastVisible = visible
 				end
-				if not visible or fired then return end
-				local markerCenter = marker.AbsolutePosition.X + marker.AbsoluteSize.X * 0.5
-				local objectiveCenter = objective.AbsolutePosition.X + objective.AbsoluteSize.X * 0.5
-				local dist = markerCenter - objectiveCenter
-				if lastDist and lastDist < -2 and dist >= -2 and canAutoClick() then
-					fired = true
-					increment("skillcheckInputs")
-					local sent = pressGuiButton(button)
-					if not sent then increment("skillcheckInputFailures") end
-					debugEvent("SKILLCHECK", "bar_input", { dispatched = sent,
-						distance = string.format("%.2f", dist) }, sent and "INFO" or "WARN")
+				if not visible then return end
+				local now = os.clock()
+				local targetCenter = objective.AbsolutePosition.X + objective.AbsoluteSize.X * 0.5
+				if lastTargetX and math.abs(targetCenter - lastTargetX) > 6 then
+					fired, lastDist, lastAt = false, nil, nil
+					increment("skillcheckRearms")
 				end
-				lastDist = dist
-			end)
-			beats[beat] = true
-			while active(myId) and button:IsDescendantOf(playerGui) do task.wait(0.5) end
-			beat:Disconnect()
-			beats[beat] = nil
+				lastTargetX = targetCenter
+				local markerCenter = marker.AbsolutePosition.X + marker.AbsoluteSize.X * 0.5
+				local dist = markerCenter - targetCenter
+				local half = math.max(3, objective.AbsoluteSize.X * 0.5 + marker.AbsoluteSize.X * 0.15)
+				if fired then
+					if now - firedAt >= 0.75 and math.abs(dist) > half * 2.5 then
+						fired = false
+						increment("skillcheckRearms")
+					else
+						lastDist, lastAt = dist, now
+						return
+					end
+				end
+				local deltaTime = lastAt and math.max(0.008, now - lastAt) or 0.016
+				local speed = lastDist and (dist - lastDist) / deltaTime or 0
+				local projected = dist + math.clamp(speed * 0.016, -half * 0.50, half * 0.50)
+				local towardLeft = speed > 0 and dist >= -half * 0.88
+					and projected >= -half * 0.26 and dist <= half * 0.50
+				local towardRight = speed < 0 and dist <= half * 0.88
+					and projected <= half * 0.26 and dist >= -half * 0.50
+				local centered = math.abs(dist) <= half * 0.28
+				if lastDist and (towardLeft or towardRight or centered) then
+					local sent, method = pressGuiButton(button)
+					if sent then
+						fired, firedAt = true, now
+						increment("skillcheckInputs")
+						if math.abs(dist) > 2 then increment("skillcheckBarEarly") end
+					else
+						increment("skillcheckInputFailures")
+					end
+					debugEvent("SKILLCHECK", "bar_input", {
+						dispatched = sent, method = method,
+						distance = string.format("%.2f", dist),
+						projected = string.format("%.2f", projected),
+					}, sent and "INFO" or "WARN")
+				end
+				lastDist, lastAt = dist, now
+			end
+			local disconnect = watchFrames(check)
+			increment("skillcheckRebinds")
+			while active(myId) and main:IsDescendantOf(playerGui)
+				and findPath({ "LockUI", "HUD", "Skillcheck", "Main" }) == main
+				and marker.Parent == main and objective.Parent == main and button.Parent == main do
+				task.wait(0.10)
+			end
+			disconnect()
 		end
 	end
 	function feature.enable()
@@ -3754,7 +4051,7 @@ end))
 
 local function debugReport()
 	local summary = {
-		"TU - Rava Hub | Diagnostic Report",
+		"TU Rava Hub | Diagnostic Report",
 		"Build=" .. BUILD,
 		"Exported=" .. os.date("%Y-%m-%d %H:%M:%S"),
 		string.format("SessionSeconds=%.2f PlaceId=%s JobId=%s",
@@ -3796,12 +4093,15 @@ local function debugReport()
 			debugStats.underMapTweens, debugStats.underMapAborts, debugStats.underMapHealthStops,
 			debugStats.underMapGuardBlocks, debugStats.pickupTweenDistance),
 		"PickupTiming=" .. (OPTIONS.CollectLast and "After" or "Before"),
-		"PickupGuard: " .. fieldString({ paused = pickupCircuit.paused, failures = pickupCircuit.consecutive,
+		"PickupGuard: " .. fieldString({ paused = pickupCircuit.paused, finalized = pickupCircuit.finalized,
+			contactRetries = debugStats.pickupContactRetries, contactRecovered = debugStats.pickupContactRecovered,
+			failures = pickupCircuit.consecutive,
 			failedTargets = pickupCircuit.distinctFailures, targetLimit = pickupCircuit.MaxTargetFailures,
 			noProgressSeconds = pickupCircuit.MaxStallSeconds }),
 		"Options: " .. fieldString(OPTIONS),
 		"FARM: " .. fieldString(FARM),
-		"MACHINE: " .. fieldString({ Range = MACHINE.Range, StallTimeout = MACHINE.StallTimeout,
+		"MACHINE: " .. fieldString({ Range = MACHINE.Range, NearFinishAt = MACHINE.NearFinishAt,
+			NearFinishHold = MACHINE.NearFinishHold, StallTimeout = MACHINE.StallTimeout,
 			UseTimeout = MACHINE.UseTimeout, ChaseHold = MACHINE.ChaseHold,
 			ItemWaitMax = MACHINE.ItemWaitMax, CollectWaitMax = MACHINE.CollectWaitMax, RescanInterval = MACHINE.RescanInterval,
 			FinalSweepPoll = MACHINE.FinalSweepPoll, FinalSweepClearTime = MACHINE.FinalSweepClearTime }),
@@ -3863,7 +4163,7 @@ supervise("diagnostic UI", function() return alive end, function()
 	while alive do
 		if main.Visible then for _, refresh in ipairs(toggleRefreshers) do refresh() end end
 		local working = (machineFarm.enabled and "MACHINE") or (pickupBusy() and "PICKUPS") or "IDLE"
-		headerStatus.Text = working .. "  •  v2.6.5"
+		headerStatus.Text = working .. "  •  v2.6.9"
 		headerStatus.TextColor3 = working == "IDLE" and UI.muted or UI.good
 		footerLabel.Text = string.format("%s   •   %s   •   %d moves", BUILD, OPTIONS.MovementMode,
 			debugStats.teleports + debugStats.underMapTweens)
@@ -3896,7 +4196,7 @@ debugEvent("SYSTEM", "initialized", { build = BUILD, place = game.PlaceId,
 	mode = OPTIONS.MovementMode, underMapDepth = OPTIONS.TweenDepth, selenaCamera = true,
 	lineOfSight = "disabled", abilityAuto = true, abilityTrigger = "F_after_machine_completion", sampleFarm = true, pickupSpeed = PICKUP_TRAVEL.Speed,
 	enemyClearance = PICKUP_TRAVEL.SafetyRadius, pickupSettle = FARM.Settle,
-	pickupDwell = FARM.Dwell, pickupRate = FARM.SpamRate, itemWaitMax = MACHINE.ItemWaitMax })
+	pickupDwell = FARM.Dwell, pickupRate = FARM.SpamRate, itemWaitMax = MACHINE.ItemWaitMax, promptMoveFix = true })
 task.spawn(function()
 	local previous = {}
 	while alive do
