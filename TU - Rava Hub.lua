@@ -66,7 +66,7 @@ local OPTIONS = {
 	MovementMode="Teleport",TweenDepth=-15,Disable3DRendering=false,
 }
 
-local BUILD = "TU Rava Hub v2.6.23"
+local BUILD = "TU Rava Hub v2.6.27"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -96,11 +96,18 @@ local debugStats = {
 	pickupOrbitRecoveries=0,machineOrbitRecoveries=0,
 	pickupPromptReplacements=0,machinePromptFallbacks=0,
 	pickupNearestRoutes=0,
+	pickupSnakeSkipped=0,pickupSnakeInterrupted=0,pickupSnakeEscapes=0,
 	elevatorHoldChecks=0,elevatorHoldUncertain=0,
 	elevatorAlternateAttempts=0,elevatorAlternateMoves=0,
 	elevatorAlternateUnavailable=0,elevatorStateConfirmed=0,
 	elevatorCandidateScans=0,elevatorGenericFloors=0,
 	elevatorFallbackVerified=0,elevatorFallbackUnverified=0,
+	elevatorMissingStatusRecovered=0,elevatorFastDispatch=0,
+	elevatorRoundResets=0,urgentMachineExits=0,
+	machineExitFlightWaits=0,damageRetreatTriggers=0,
+	autoHideExitRequests=0,autoHideExitSent=0,autoHideExitDuringSkillcheck=0,
+	autoHideExitQueued=0,autoHideExitEventFailures=0,
+	chaseThreatRetreats=0,survivalMilestones=0,
 	machineStalls=0,skillcheckInputs=0,skillcheckInputFailures=0,
 	skillcheckRebinds=0,skillcheckInputSignal=0,skillcheckInputVIM=0,
 	skillcheckRoundSeen=0,skillcheckBarSeen=0,skillcheckMissingParts=0,
@@ -249,8 +256,10 @@ local activeMotion
 local skillcheckProtected -- Initialized after GUI visibility helpers are defined.
 local infectedNear -- Assigned after monster-folder helpers are defined.
 local motionPauseUntil = 0
+UNLOAD.imminentEvacuationUntil = 0
+UNLOAD.damageRetreatSerial = 0
 local PICKUP_TRAVEL = {
-	Speed=300,ElevatorSpeed=900,SafetyRadius=24,ArriveTolerance=4.5,
+	Speed=360,ElevatorSpeed=900,SafetyRadius=24,ArriveTolerance=4.5,
 }
 local function cancelMotion(owner)
 	if UNLOAD.abortOrbit then UNLOAD.abortOrbit() end
@@ -281,7 +290,8 @@ local function instantTeleport(destination, keepGoing, owner, mode)
 	if not alive or not keepGoing() then return false end
 	local protected, checkType = false, "not_ready"
 	if skillcheckProtected then protected, checkType = skillcheckProtected() end
-	if protected then
+	if protected and not (emergency and owner == "machine"
+		and os.clock() <= (UNLOAD.imminentEvacuationUntil or 0)) then
 		increment("skillcheckMoveBlocked")
 		debugThrottled("skillcheck_teleport_block_" .. tostring(owner), 1.5,
 			"SKILLCHECK", "teleport_deferred", { owner=owner,mode=mode or "routine",ui=checkType }, "INFO")
@@ -342,7 +352,9 @@ end
 local function tweenUnderMap(destination, keepGoing, owner, mode)
 	local emergency = mode == "emergency" or mode == "elevator"
 	if not alive or not keepGoing() then return false, "inactive" end
-	if skillcheckProtected and skillcheckProtected() then
+	if skillcheckProtected and skillcheckProtected()
+		and not (emergency and owner == "machine"
+			and os.clock() <= (UNLOAD.imminentEvacuationUntil or 0)) then
 		increment("skillcheckMoveBlocked")
 		return false, "skillcheck_visible"
 	end
@@ -481,7 +493,11 @@ local function tweenUnderMap(destination, keepGoing, owner, mode)
 				RunService.Heartbeat:Wait()
 				if motion.cancelled or activeMotion ~= motion or player.Character ~= character
 					or not alive or not keepGoing() then return abort("interrupted") end
-				if skillcheckProtected and skillcheckProtected() then return abort("skillcheck_visible") end
+				if skillcheckProtected and skillcheckProtected()
+					and not (emergency and owner == "machine"
+						and os.clock() <= (UNLOAD.imminentEvacuationUntil or 0)) then
+					return abort("skillcheck_visible")
+				end
 				if os.clock() > deadline then return abort("tween_stalled") end
 				local currentHealth = health()
 				if healthAtStart and currentHealth and currentHealth < healthAtStart then
@@ -1127,10 +1143,10 @@ end
 
 local FARM = {
 	Height=3,Settle=0.08,Dwell=0.55,
-	Revisit=5,FailedRetry=1.1,Empty=0.10,
+	Revisit=5,FailedRetry=0.8,Empty=0.05,
 	Poll=0.04,IdleReturn=0.55,HeldLimit=3,
-	SpamRate=16,BetweenPickups=0.025,TeleportBetweenPickups=0.10,
-	TeleportSettle=0.16,InfectedClear=22,
+	SpamRate=16,BetweenPickups=0.012,TeleportBetweenPickups=0.020,
+	TeleportSettle=0.10,InfectedClear=22,
 }
 
 local PROMPT_HOLDERS = { "Prompt","PromptPart" }
@@ -1824,7 +1840,7 @@ local pickupCircuit = {
 	lastConfirmed=os.clock(),
 	MaxTargetFailures=3,
 	MaxConsecutiveFailures=6,
-	MaxStallSeconds=10,
+	MaxStallSeconds=8,
 }
 function pickupCircuit.pause(reason)
 	if pickupCircuit.paused then return end
@@ -1950,10 +1966,76 @@ track(player.CharacterAdded:Connect(function()
 	pickupCoordinator.owner, pickupCoordinator.home = nil, nil
 end))
 
+-- TSnakes may be attached to a pickup, or positioned above/below it outside
+-- MonsterFolder. Ordinary infected scanning does not reliably catch these traps.
+-- Index named traps on spawn instead of scanning the entire map for each item.
+do
+	local snakes = setmetatable({}, { __mode="k" })
+	local function register(inst)
+		if inst.Name == "TSnakes" and (inst:IsA("Model") or inst:IsA("BasePart") or inst:IsA("Folder")) then
+			snakes[inst] = true
+		end
+	end
+	for _, inst in ipairs(workspace:GetDescendants()) do register(inst) end
+	track(workspace.DescendantAdded:Connect(register))
+	track(workspace.DescendantRemoving:Connect(function(inst) snakes[inst] = nil end))
+	local function snakeBounds(inst)
+		if inst:IsA("BasePart") then return inst.Position, inst.Size end
+		if inst:IsA("Model") then
+			local ok, cf, size = pcall(function() return inst:GetBoundingBox() end)
+			if ok and cf and size then return cf.Position, size end
+		end
+		local part = getAdorneePart(inst)
+		return part and part.Position, part and part.Size
+	end
+	function UNLOAD.pickupSnakeUnsafe(target, partOrPosition)
+		if target and target.Parent then
+			-- A trap can be parented directly to the item; skip it regardless of offsets.
+			local current = target
+			while current and current ~= workspace do
+				if current.Name == "TSnakes" then return true, "nested_trap", 0 end
+				current = current.Parent
+			end
+			if target:FindFirstChild("TSnakes", true) then return true, "attached_trap", 0 end
+		end
+		local position
+		if typeof(partOrPosition) == "Vector3" then
+			position = partOrPosition
+		elseif typeof(partOrPosition) == "Instance" and partOrPosition:IsA("BasePart") then
+			position = partOrPosition.Position
+		elseif target and target.Parent then
+			local part = getAdorneePart(target)
+			position = part and part.Position
+		end
+		if not position then return false end
+		for snake in pairs(snakes) do
+			if snake.Parent and snake:IsDescendantOf(workspace) then
+				if target and (snake:IsDescendantOf(target) or target:IsDescendantOf(snake)) then
+					return true, "attached_trap", 0
+				end
+				local center, size = snakeBounds(snake)
+				if center and size then
+					local dx, dz = position.X - center.X, position.Z - center.Z
+					local flat = math.sqrt(dx*dx + dz*dz)
+					-- Require both horizontal overlap and vertical proximity; unrelated
+					-- traps on other parts of the map must not block pickups.
+					local radius = math.clamp(math.max(size.X, size.Z)*0.5 + 6, 12, 22)
+					local height = math.clamp(size.Y*0.5 + 12, 16, 26)
+					if flat <= radius and math.abs(position.Y - center.Y) <= height then
+						return true, snake:GetFullName(), flat
+					end
+				end
+			end
+		end
+		return false
+	end
+end
+
 local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 	local farm = { enabled=false,working=false,hasWork=false }
 	local runId = 0
 	local recent = setmetatable({}, { __mode="k" })
+	local snakeSkippedAt = setmetatable({}, { __mode="k" })
 	local function loop(myId)
 		local function active() return alive and farm.enabled and runId == myId end
 		local function allowed()
@@ -1998,8 +2080,19 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 						local fresh = not pickupCircuit.blocked[target] and (not filter or filter(target))
 							and (not recent[target] or os.clock() - recent[target] >= FARM.Revisit)
 						local part = fresh and root and prompt and prompt.Enabled and getPromptPart(prompt, target)
-						local unsafe = part and infectedNear(part.Position, FARM.InfectedClear)
-						if unsafe then
+						local snakeUnsafe, snakeSource, snakeDistance
+						if part then
+							snakeUnsafe, snakeSource, snakeDistance = UNLOAD.pickupSnakeUnsafe(target, part)
+						end
+						local unsafe = part and (snakeUnsafe or infectedNear(part.Position, FARM.InfectedClear))
+						if snakeUnsafe then
+							if not snakeSkippedAt[target] or os.clock() - snakeSkippedAt[target] >= 5 then
+								snakeSkippedAt[target] = os.clock()
+								increment("pickupSnakeSkipped")
+								debugEvent("SNAKES", "pickup_skipped", { folder=folder.Name,name=target.Name,
+									source=snakeSource or "unknown",distance=snakeDistance or "attached" }, "WARN")
+							end
+						elseif unsafe then
 							debugThrottled("pickup_unsafe_" .. tostring(target), 5, "PICKUP", "skipped_enemy_nearby",
 								{ folder=folder.Name,name=target.Name }, "WARN")
 						end
@@ -2019,6 +2112,7 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 								local function stillPicking(traveling)
 									return allowed() and pickupCoordinator.owner == farm
 										and part:IsDescendantOf(workspace) and prompt.Enabled
+										and not UNLOAD.pickupSnakeUnsafe(target, part)
 										and (traveling or not infectedNear(root.Position, FARM.InfectedClear))
 								end
 								local promptPosition = getPromptPosition(prompt, part)
@@ -2042,6 +2136,9 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 								end
 								task.wait(contacted and 0.05 or (OPTIONS.MovementMode == "Teleport" and FARM.TeleportSettle or FARM.Settle))
 								if isBlocked and isBlocked() then return false, "preempted_by_machine", 0 end
+								if UNLOAD.pickupSnakeUnsafe(target, part) then
+									return false, "snake_trap_after_arrival", 0
+								end
 								if infectedNear(root.Position, FARM.InfectedClear) then
 									return false, "enemy_after_arrival", 0
 								end
@@ -2119,6 +2216,17 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 								if not success and isBlocked and isBlocked() then return false, "preempted_by_machine", fired end
 								return success, why, fired
 							end)
+							if not confirmed and UNLOAD.pickupSnakeUnsafe(target, part) then
+								confirmed, reason = false, "snake_trap_appeared"
+								increment("pickupSnakeInterrupted")
+								local home = pickupCoordinator.home
+								if home and active() and not (isBlocked and isBlocked())
+									and not UNLOAD.pickupSnakeUnsafe(nil, home.Position) then
+									local escaped = teleportCharacter(home, function() return active() end,
+											"pickup_snake_escape", "emergency")
+									if escaped then increment("pickupSnakeEscapes") end
+								end
+							end
 							if active() and not (isBlocked and isBlocked()) and root.Parent
 								and infectedNear(root.Position, FARM.InfectedClear) then
 								local home = pickupCoordinator.home
@@ -2671,7 +2779,8 @@ local function scanFinalPickups()
 								and (not entry.filter or entry.filter(target))
 							if accepted then
 								result.eligible += 1
-								if infectedNear and infectedNear(part.Position, FARM.InfectedClear) then
+								if UNLOAD.pickupSnakeUnsafe(target, part)
+									or (infectedNear and infectedNear(part.Position, FARM.InfectedClear)) then
 									result.unsafe += 1
 								else
 									result.safe += 1
@@ -2730,10 +2839,10 @@ end
 local MACHINE = {
 	Folders={ "OilMachines","Computers" }, Range=50, Height=3,
 	Elevator="Map.SpecialFolder.ExitElevator", ElevatorFallback="Elevator", ElevatorHeight=-20,
-	Tick=0.03,Settle=0.025,PromptRetry=0.08,
-	RescanInterval=0.12,StallTimeout=3,UseTimeout=8,NearFinishAt=90,NearFinishHold=20,
-	ClearHold=1.0,ItemWaitMax=30,
-	SkillcheckPause=3, ChaseHold=3, DoneValue=100, FuseDwell=1,
+	Tick=0.020,Settle=0.02,PromptRetry=0.075,
+	RescanInterval=0.065,StallTimeout=2.7,UseTimeout=8,NearFinishAt=90,NearFinishHold=20,
+	ClearHold=0.50,ItemWaitMax=24,
+	SkillcheckPause=3, ChaseHold=2.5, DoneValue=100, FuseDwell=0.7,
 	Fuseboxes={
 		"Map.SpecialFolder.Fusebox.Handle.ProximityPrompt",
 		"Map.SpecialFolder.ExitFusebox.Handle.ProximityPrompt",
@@ -2973,6 +3082,9 @@ local function bindHealthSource()
 			if playerPos then name, distance = nearestInfected(playerPos) end
 			increment("hits")
 			increment("totalDamage", previous - newValue)
+			if newValue > 0 then
+				UNLOAD.damageRetreatSerial = (UNLOAD.damageRetreatSerial or 0) + 1
+			end
 			if not name then increment("nearestEnemyMissing") end
 			debugStatus.lastHit = string.format("%.1f -> %.1f | %s (%.1f studs)",
 				previous, newValue, name or "none", distance or -1)
@@ -3042,7 +3154,7 @@ task.spawn(function()
 					UNLOAD.selenaLook.chaseSeen = false
 					UNLOAD.selenaLook.stop("chase_ended")
 				end
-				if arg == "Started" and OPTIONS.AutoHide then
+				if arg == "Started" and OPTIONS.AutoHide and machineFarm and machineFarm.enabled then
 					increment("chases")
 					local pickupTravel = pickupCoordinator.owner ~= nil
 						or (activeMotion and activeMotion.owner == "pickup")
@@ -3055,7 +3167,25 @@ task.spawn(function()
 					end
 					debugEvent("DANGER", "chase_started", { autoHide=OPTIONS.AutoHide }, "WARN")
 					chase.pending = true
+					chase.serial = (chase.serial or 0) + 1
 					chase.holdUntil = math.max(chase.holdUntil, os.clock() + MACHINE.ChaseHold)
+					if machineFarm and machineFarm.target then
+						cancelMachinePromptHold(getPrompt(machineFarm.target))
+					end
+					-- Every accepted chase event gets its OWN exit attempt, even if the
+					-- skillcheck UI is open or an earlier InvokeServer is still pending.
+					-- Do not wait inside OnClientEvent: travel must be able to preempt.
+					if leaveObjective then
+						local ok, queued = pcall(leaveObjective, "auto_hide_chase_event", true, 0)
+						if ok and queued then
+							chase.exitRequestedSerial = chase.serial
+						else
+							increment("autoHideExitEventFailures")
+							debugEvent("MACHINE", "auto_hide_exit_event_failed", {
+								serial=chase.serial,error=not ok and tostring(queued) or "not_queued",
+							}, "ERROR")
+						end
+					end
 					motionPauseUntil = math.max(motionPauseUntil, chase.holdUntil)
 					cancelMotion()
 				end
@@ -3254,21 +3384,45 @@ end)
 leaveObjective = function(reason, force, waitSeconds)
 	reason = reason or "manual"
 	local protected, checkType = skillcheckProtected()
-	if protected then
+	local forced = force == true
+	local autoHide = reason:find("auto_hide", 1, true) ~= nil
+		or reason == "chase_escape" or reason == "infected_near_machine"
+	if protected and not forced then
 		increment("skillcheckLeaveDeferred")
 		debugThrottled("skillcheck_leave_" .. tostring(reason), 1,
 			"MACHINE", "leave_deferred_skillcheck", { reason=reason,
-				ui=checkType,forceRequested=force == true }, "INFO")
+				ui=checkType,forceRequested=false }, "INFO")
 		return false
+	end
+	if protected and forced then
+		increment("urgentMachineExits")
+		if autoHide then increment("autoHideExitDuringSkillcheck") end
+		debugEvent("MACHINE", "forced_leave_during_skillcheck", { reason=reason,ui=checkType }, "WARN")
+	end
+	if autoHide then increment("autoHideExitRequests") end
+	-- Never reuse a previous result for a new Auto Hide activation. Queue the
+	-- new request behind an in-flight request instead of silently dropping it.
+	local previous = UNLOAD.exitInFlight
+	if previous and not previous.finished then
+		increment("machineExitFlightWaits")
+		if autoHide then increment("autoHideExitQueued") end
 	end
 	increment("skillcheckExitAttempts")
 	machineExitBlockedUntil = math.max(machineExitBlockedUntil, os.clock() + 0.75)
-	local finished, successful = false, false
+	local flight = { finished=false,successful=false,startedAt=os.clock() }
+	UNLOAD.exitInFlight = flight
 	local begin = os.clock()
 	task.spawn(function()
+		if previous and not previous.finished then
+			local expiry = os.clock() + 0.45
+			while not previous.finished and os.clock() < expiry and alive do task.wait(0.01) end
+			if not previous.finished then
+				debugEvent("MACHINE", "leave_previous_response_pending", { reason=reason }, "WARN")
+			end
+		end
 		local reprotected, uiType = skillcheckProtected()
-		if reprotected then
-			finished, successful = true, false
+		if reprotected and not forced then
+			flight.finished = true
 			increment("skillcheckLeaveDeferred")
 			debugEvent("MACHINE", "leave_cancelled_ui_appeared", { reason=reason,ui=uiType }, "INFO")
 			return
@@ -3276,10 +3430,14 @@ leaveObjective = function(reason, force, waitSeconds)
 		local ok, response = pcall(function()
 			local remotes = game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
 			local remote = remotes and remotes:FindFirstChild("SkillCheck")
-			if not remote or not remote:IsA("RemoteFunction") then error("SkillCheck RemoteFunction unavailable") end
+			if not remote or not remote:IsA("RemoteFunction") then
+				error("SkillCheck RemoteFunction unavailable")
+			end
+			if autoHide then increment("autoHideExitSent") end
 			return remote:InvokeServer()
 		end)
-		finished, successful = true, ok and response ~= false
+		flight.successful = ok and response ~= false
+		flight.finished = true
 		if not ok or response == false then increment("skillcheckExitFailures") end
 		debugEvent("MACHINE",
 			(not ok and "leave_remote_failed") or (response == false and "leave_remote_rejected" or "leave_remote_complete"),
@@ -3288,22 +3446,74 @@ leaveObjective = function(reason, force, waitSeconds)
 				elapsedMs=math.floor((os.clock() - begin) * 1000 + 0.5) },
 			(not ok and "ERROR") or (response == false and "WARN" or "INFO"))
 	end)
-	local deadline = os.clock() + (waitSeconds or (force and 0.08 or 0.12))
-	while not finished and os.clock() < deadline do task.wait() end
-	if not finished then
+	local deadline = os.clock() + (waitSeconds or (forced and 0.18 or 0.12))
+	while not flight.finished and os.clock() < deadline do task.wait() end
+	if not flight.finished and waitSeconds ~= 0 then
 		debugThrottled("leave_remote_pending", 2, "MACHINE", "leave_remote_pending",
-			{ reason=reason,escapeContinues=force }, "WARN")
+			{ reason=reason,escapeContinues=forced }, "WARN")
 	end
-	return successful or (force and not finished)
+	-- Forced exits have been scheduled even if the RemoteFunction has not
+	-- returned. Server acceptance is never inferred from this value.
+	return forced or flight.successful
 end
 
-local doneAt, doneValue = 0, false
+UNLOAD.floorState = {
+	mapRef=workspace:FindFirstChild("Map"),seen=false,
+	completed=0,lastCompletion=-math.huge,noTargetsSince=nil,
+	finished=false,completionReason="none",
+}
+function UNLOAD.floorStatus(target, status)
+	local state = UNLOAD.floorState
+	local currentMap = workspace:FindFirstChild("Map")
+	if currentMap and currentMap ~= state.mapRef then
+		state.mapRef = currentMap
+		state.seen,state.completed,state.finished = false,0,false
+		state.noTargetsSince,state.lastCompletion = nil,-math.huge
+		state.completionReason = "none"
+		increment("elevatorRoundResets")
+	end
+	if target then
+		if state.finished then
+			state.completed,state.finished = 0,false
+			state.completionReason = "none"
+		end
+		state.seen,state.noTargetsSince = true,nil
+		return false
+	end
+	if status == "wait" or status == "work" then
+		state.noTargetsSince = nil
+		return false
+	end
+	if status == "done" and state.seen then
+		state.finished,state.completionReason = true,"all_completed"
+		return true
+	end
+	-- Many floors remove their completed machine models. A stable 'none'
+	-- after a confirmed completion must not erase the elevator deadline.
+	if status == "none" and state.seen and state.completed > 0 then
+		local now = os.clock()
+		state.noTargetsSince = state.noTargetsSince or now
+		if not state.finished and now - state.noTargetsSince >= 0.50
+			and now - state.lastCompletion >= 0.50 then
+			state.finished,state.completionReason = true,"completed_models_removed"
+			increment("elevatorMissingStatusRecovered")
+			debugEvent("MACHINE", "all_complete_models_removed", {
+				completed=state.completed,secondsWithoutTargets=string.format("%.2f",now-state.noTargetsSince),
+			})
+		end
+	else
+		state.noTargetsSince = nil
+	end
+	return state.finished and status ~= "wait" and status ~= "work"
+end
+
+local doneAt,doneValue = 0,false
 machinesDone = function()
 	local now = os.clock()
-	if now - doneAt >= 0.5 then
+	if now-doneAt >= 0.10 then
 		doneAt = now
-		local _, status = pickMachine()
-		doneValue = status == "done"
+		local nextTarget,status = pickMachine()
+		doneValue = UNLOAD.floorStatus(nextTarget,status)
 	end
 	return doneValue
 end
@@ -3476,6 +3686,14 @@ local function newMachineAutofarm()
 		local primary = { MACHINE.Elevator,MACHINE.ElevatorFallback }
 		local paths = alternative and { MACHINE.ElevatorFallback,MACHINE.Elevator } or primary
 		local chosen = chooseElevator(paths, alternative and previous or nil)
+		if alternative and chosen and previous and chosen.platform == nil
+			and (chosen.pos-previous).Magnitude > 180 then
+			-- Both endpoints are only guessed positions; a long cross-map hop is unsafe.
+			debugThrottled("elevator_long_alternate",4,"MACHINE","elevator_alternate_unverified_far",
+				{ from=farm.elevatorSource or "none",to=chosen.path,
+				  distance=string.format("%.1f",(chosen.pos-previous).Magnitude) },"WARN")
+			chosen = nil
+		end
 		if not chosen and alternative then
 			increment("elevatorAlternateUnavailable")
 			debugEvent("MACHINE", "elevator_alternate_missing", { previous=tostring(previous) }, "WARN")
@@ -3555,6 +3773,7 @@ local function newMachineAutofarm()
 		local clearSince = nil
 		local waitStart = nil
 		local startupPickupsDone = UNLOAD.pickupBefore.completed
+		local lastDamageRetreatSerial = UNLOAD.damageRetreatSerial or 0
 		local doneCandidateAt = nil
 		local emergencyNextMove = false
 		local handoffStartedAt, handoffFrom, handoffReason = nil, nil, nil
@@ -3563,6 +3782,16 @@ local function newMachineAutofarm()
 			if abilityTriggeredFor[machine] then return end
 			abilityTriggeredFor[machine] = true
 			increment("machineCompletions")
+			local state = UNLOAD.floorState
+			state.seen = true
+			state.completed += 1
+			state.lastCompletion = os.clock()
+			if debugStats.machineCompletions % 100 == 0 then
+				increment("survivalMilestones")
+				debugEvent("GOAL", "session_objective_milestone", {
+					completed=debugStats.machineCompletions,target=1000,
+				})
+			end
 			debugEvent("MACHINE", "completed", {
 				name=machine.Name,progress=tostring(getProgress(machine)),
 			})
@@ -3587,8 +3816,32 @@ local function newMachineAutofarm()
 			end
 			local root = getPlayerRoot()
 			local moved = false
+			local dangerAtRoot,dangerName,dangerDistance = false,nil,nil
+			if root and farm.placed and farm.target and OPTIONS.AutoHide then
+				dangerAtRoot,dangerName,dangerDistance = twistedNear(root.Position)
+				if dangerAtRoot and dangerDistance and dangerDistance <= 19 then
+					if not chase.pending then chase.serial = (chase.serial or 0) + 1 end
+					chase.pending = true
+					UNLOAD.imminentEvacuationUntil = os.clock() + 0.8
+					increment("chaseThreatRetreats")
+					debugThrottled("urgent_close_enemy",1,"DANGER","urgent_close_enemy",
+						{ enemy=dangerName,distance=string.format("%.1f",dangerDistance) },"WARN")
+				end
+			end
+			if (UNLOAD.damageRetreatSerial or 0) > lastDamageRetreatSerial then
+				lastDamageRetreatSerial = UNLOAD.damageRetreatSerial
+				if farm.placed then
+					if not chase.pending then chase.serial = (chase.serial or 0) + 1 end
+					chase.pending = true
+					UNLOAD.imminentEvacuationUntil = os.clock() + 0.8
+					increment("damageRetreatTriggers")
+					debugEvent("DANGER","damage_forces_machine_retreat", {
+						target=farm.target and farm.target.Name or "none" },"WARN")
+				end
+			end
 			local protected, checkType = skillcheckProtected()
-			if protected then
+			if protected and not chase.pending and not dangerAtRoot
+				and os.clock() > (UNLOAD.imminentEvacuationUntil or 0) then
 				if activeMotion and activeMotion.owner == "pickup" then cancelMotion("pickup") end
 				debugThrottled("machine_skillcheck_hold", 2, "SKILLCHECK", "holding_objective", {
 					ui=checkType,target=farm.target and farm.target.Name or "none",
@@ -3601,7 +3854,8 @@ local function newMachineAutofarm()
 				local remaining = getProgress(farm.target)
 				if remaining and remaining >= MACHINE.NearFinishAt and remaining < MACHINE.DoneValue then
 					local _, closest = nearestInfected(root.Position)
-					if not closest or closest > 24 then
+					if (not closest or closest > 40)
+						and os.clock() > (UNLOAD.imminentEvacuationUntil or 0) then
 						chase.pending, chase.holdUntil = false, 0
 						motionPauseUntil = 0
 						increment("machineChaseDeferred")
@@ -3621,8 +3875,23 @@ local function newMachineAutofarm()
 				lastPrompt = nil
 				lastProgress = nil
 				usedItem = false
+				-- Proximity/damage triggered hides do not have a Chase event; send
+				-- the same unconditional exit request for those as well. Chase events
+				-- already queued their own remote above, even during skillchecks.
+				if chase.exitRequestedSerial ~= chase.serial then
+					leaveObjective("auto_hide_chase_escape", true, 0.18)
+					chase.exitRequestedSerial = chase.serial
+				else
+					-- Chase event already sent the request; allow its short response
+					-- window before travelling. Retry if the server rejected it.
+					local flight = UNLOAD.exitInFlight
+					local untilAt = os.clock() + 0.14
+					while flight and not flight.finished and os.clock() < untilAt do task.wait(0.01) end
+					if flight and flight.finished and not flight.successful then
+						leaveObjective("auto_hide_chase_retry", true, 0.12)
+					end
+				end
 				if root then
-					leaveObjective("chase_escape", true)
 					hidden = goElevator(false, active)
 				else
 					hidden = false
@@ -3655,7 +3924,7 @@ local function newMachineAutofarm()
 					local snapshot = scanFinalPickups()
 					local collectorWorking = pickupBusy() or pickupCoordinator.owner ~= nil
 					local safePending = snapshot.safe > 0 or collectorWorking
-					local spawnGrace = elapsed < 1.5
+					local spawnGrace = elapsed < 0.7
 					local expired = elapsed >= MACHINE.ItemWaitMax
 					local stalled = elapsed > pickupCircuit.MaxStallSeconds
 						and debugStats.pickupAttempts > 0
@@ -3758,6 +4027,7 @@ local function newMachineAutofarm()
 				local prompt = target and getPrompt(target)
 				local part = prompt and getPromptPart(prompt, target)
 				if part then
+					UNLOAD.floorStatus(target, "work")
 					doneCandidateAt = nil
 					if finished and pickupCircuit.finalized and not UNLOAD.pickupBefore.completed then
 						pickupCircuit.reset("new_objective")
@@ -3767,7 +4037,7 @@ local function newMachineAutofarm()
 					local danger, dangerName, dangerDist = twistedNear(part.Position)
 					local progressNow = getProgress(target)
 					if danger and progressNow and progressNow >= MACHINE.NearFinishAt
-						and progressNow < MACHINE.DoneValue and dangerDist and dangerDist > 16 then
+						and progressNow < MACHINE.DoneValue and dangerDist and dangerDist > 34 then
 						debugThrottled("near_finish_danger_" .. tostring(target), 4,
 							"MACHINE", "near_finish_danger_held", { name=target.Name,
 							progress=progressNow,enemy=dangerName,distance=dangerDist })
@@ -3789,7 +4059,9 @@ local function newMachineAutofarm()
 							increment("machineDangers")
 							debugEvent("DANGER", "machine_threat", { enemy=tostring(dangerName),
 								distance=string.format("%.1f",dangerDist or 0),machine=target.Name }, "WARN")
-							leaveObjective("infected_near_machine", true)
+							leaveObjective("infected_near_machine", true, 0.18)
+							-- Escape follows the request; an unreturned response cannot
+							-- indefinitely hold the character near an infected.
 							local alternative = safeAlternative(target)
 							if alternative then
 								beginHandoff("danger_reroute", target)
@@ -3810,7 +4082,13 @@ local function newMachineAutofarm()
 						lastFire = 0
 						lastPrompt = nil
 						usedItem = false
-						if not hidden then hidden = goElevator(false, active) end
+						if not hidden then
+							if os.clock() - (chase.holdExitAt or -math.huge) > 0.5 then
+								chase.holdExitAt = os.clock()
+								leaveObjective("auto_hide_hold_retry", true, 0.10)
+							end
+							hidden = goElevator(false, active)
+						end
 					else
 						hidden = false
 						if farm.placed and prompt.Enabled and (root.Position - part.Position).Magnitude > prompt.MaxActivationDistance then
@@ -3931,9 +4209,9 @@ local function newMachineAutofarm()
 						end
 						local paused = checking and os.clock() - checkingSince < MACHINE.SkillcheckPause
 						if prompt.Enabled and not activated and farm.placed and not checking
-							and os.clock() - placedAt >= 1.65
-							and os.clock() - lastProgressAt >= 1.65
-							and os.clock() - lastContactAt >= 3.2
+							and os.clock() - placedAt >= 1.35
+							and os.clock() - lastProgressAt >= 1.35
+							and os.clock() - lastContactAt >= 2.8
 							and (root.Position - part.Position).Magnitude <= prompt.MaxActivationDistance + 3 then
 							lastContactAt = os.clock()
 							local currentProgress = getProgress(target)
@@ -3998,12 +4276,12 @@ local function newMachineAutofarm()
 							usedItem = useForMachine(target)
 						end
 					end
-				elseif status == "done" then
+				elseif UNLOAD.floorStatus(target, status) then
 					local now = os.clock()
 					doneCandidateAt = doneCandidateAt or now
-					if not finished and now - doneCandidateAt >= 0.18 then
+					if not finished and now - doneCandidateAt >= 0.11 then
 						local verifyTarget, verifyStatus = pickMachine()
-						if not verifyTarget and verifyStatus == "done" then
+						if not verifyTarget and UNLOAD.floorStatus(verifyTarget, verifyStatus) then
 							finished = true
 							UNLOAD.pickupBefore.completed = true
 							pickupCircuit.finalized = true
@@ -4038,12 +4316,12 @@ local function newMachineAutofarm()
 							}, "WARN")
 						end
 					end
-					task.wait(0.08)
+					task.wait(0.04)
 				elseif not part and (status == "wait" or status == "none") then
 					debugThrottled("machine_wait_" .. status, 5, "MACHINE", "waiting_for_objective", {
 						status=status,pending=debugStatus.handoffPending,
 					}, "WARN")
-					task.wait(0.15)
+					task.wait(0.08)
 				end
 			end
 			task.wait(moved and 0 or MACHINE.Tick)
@@ -4055,7 +4333,11 @@ local function newMachineAutofarm()
 		farm.allDoneSince = nil
 		farm.elevatorWatchFired = false
 		farm.elevatorEmergencyLocked = false
+		UNLOAD.imminentEvacuationUntil = 0
 		chase.pending = false
+		chase.serial = (chase.serial or 0) + 1
+		chase.exitRequestedSerial = nil
+		chase.holdExitAt = nil
 		runId += 1
 		local myId = runId
 		supervise("machine autofarm", function()
@@ -4078,6 +4360,15 @@ local function newMachineAutofarm()
 							farm.lastElevatorInside = nil
 							increment("elevatorWatchStarts")
 							debugEvent("MACHINE", "elevator_watch_started", { deadlineSeconds=15 })
+						end
+						if not farm.elevatorTarget and not farm.finalizing
+							and not farm.elevatorTransit and not farm.elevatorEmergencyLocked
+							and os.clock()-farm.allDoneSince >= 0.20
+							and not (skillcheckProtected and skillcheckProtected()) then
+							increment("elevatorFastDispatch")
+							debugEvent("MACHINE","elevator_fast_dispatch", {
+								reason=UNLOAD.floorState.completionReason },"WARN")
+							finishAtElevator(active)
 						end
 						if farm.elevatorTarget and farm.elevatorPlatform and not farm.elevatorTransit then
 							local near, inside = verifyElevatorPosition()
@@ -4148,7 +4439,9 @@ local function newMachineAutofarm()
 							}, verified and "INFO" or "WARN")
 						end
 					else
-						if farm.allDoneSince then
+						local nextObjective,nextStatus = pickMachine()
+						local newWork = nextObjective ~= nil and nextStatus == "work"
+						if farm.allDoneSince and newWork then
 							farm.allDoneSince = nil
 							farm.elevatorWatchFired = false
 							if farm.elevatorEmergencyLocked then
@@ -4167,7 +4460,7 @@ local function newMachineAutofarm()
 						pickupCircuit.reset("auto_elevator_disabled")
 					end
 				end
-				task.wait(0.1)
+				task.wait(0.06)
 			end
 		end)
 	end
@@ -4732,18 +5025,23 @@ local function debugReport()
 		"LOS=disabled for prompts and infected detection (client-side; server checks may differ)",
 		"Hit attribution=nearest infected only (not confirmed attacker)",
 		"Selena camera=look after Chase Started when TSelena is loaded; stops when unloaded/toggle off",
-		"Machine exit=SkillCheck:InvokeServer() with no arguments; ALL exits deferred while skillcheck UI is visible",
-		"Skillcheck protection=defer exits and travel until UI disappears",
+		"Machine exit=SkillCheck:InvokeServer() with no arguments on each Auto Hide; never skipped for visible UI or earlier in-flight request",
+		"Skillcheck protection=normally defer exits and travel; immediate danger or health loss permits urgent escape",
 		"Elevator check=platform, alternative elevator position, and optional replicated state; no server entry guarantee",
-		"Pickups=before machines only; 30s phase budget and 10s no-progress cutoff",
-		"Elevator fallback=15s after all objectives complete; retry distinct elevator positions if unverified",
+		"Pickups=before machines only; 24s phase budget and 8s no-progress cutoff",
+		"Elevator fallback=fast 0.35s dispatch for confirmed completion, 15s hard fallback, avoid far unverified alternates",
 		"Ability=press F once per detected machine completion; no cooldown HUD polling or Ability remote",
 		"Ability input dispatched is not proof the game accepted it; active skillchecks block completion handling",
 		"Prompts=enabled-aware lookup, visibility events, Humanoid move and single mode-specific correction; dispatched is not confirmed",
+		"Snake safety=skip all pickup types when TSnakes is attached or directly above/below; recheck en route and before activation",
 		"Item hotkeys=executor keypress preferred, VIM fallback; input success does not prove item effect",
 		"AbilityConfig: " .. fieldString(ABILITY),
 		"Death export=automatic when observed health <= 0 (once per life)",
 		"Handoff timing=objective completion/unavailable to first prompt dispatch at next target",
+		"Session objective target=1000 completed without death is a goal, not a guaranteed outcome",
+		"FloorState: " .. fieldString({ observed=UNLOAD.floorState.seen,
+			completed=UNLOAD.floorState.completed,finished=UNLOAD.floorState.finished,
+			reason=UNLOAD.floorState.completionReason }),
 		string.format("Client touch=%s promptFire=%s virtualInput=%s clipboard=%s writefile=%s",
 			tostring(UserInputService.TouchEnabled),tostring(hasFirePrompt),
 			tostring(pcall(function() return game:GetService("VirtualInputManager") end)),
@@ -4836,7 +5134,7 @@ supervise("diagnostic UI", function() return alive end, function()
 	while alive do
 		if main.Visible then for _, refresh in ipairs(toggleRefreshers) do refresh() end end
 		local working = (machineFarm.enabled and "MACHINE") or (pickupBusy() and "PICKUPS") or "IDLE"
-		headerStatus.Text = working .. "  •  v2.6.21"
+		headerStatus.Text = working .. "  •  v2.6.24"
 		headerStatus.TextColor3 = working == "IDLE" and UI.muted or UI.good
 		footerLabel.Text = string.format("%s   •   %s   •   %d moves", BUILD, OPTIONS.MovementMode,
 			debugStats.teleports + debugStats.underMapTweens)
