@@ -68,7 +68,7 @@ local OPTIONS = {
 	MovementMode="Teleport",TweenDepth=-15,Disable3DRendering=false,
 }
 
-local BUILD = "TU Rava Hub v2.6.30"
+local BUILD = "TU Rava Hub v2.6.31"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -109,7 +109,8 @@ local debugStats = {
 	elevatorWideScans=0,elevatorFarAlternateAttempts=0,
 	elevatorAlternateCommitted=0,elevatorServerRelocations=0,
 	elevatorTransitionHolds=0,elevatorLastResortRetries=0,
-	elevatorBackupRejected=0,elevatorEntryMoves=0,elevatorEntryMoved=0,
+	elevatorBackupRejected=0,elevatorUnverifiedBackupUsed=0,
+	elevatorEntryMoves=0,elevatorEntryMoved=0,elevatorEntryUnsafeSkipped=0,
 	fuseLocatedDisabled=0,fuseDynamicFound=0,fuseActivationUnverified=0,
 	machineExitFlightWaits=0,damageRetreatTriggers=0,
 	autoHideExitRequests=0,autoHideExitSent=0,autoHideExitDuringSkillcheck=0,
@@ -3754,6 +3755,26 @@ local function newMachineAutofarm()
 			or twistedNear(root.Position) or (skillcheckProtected and skillcheckProtected()) then return end
 		local _, within, signal = verifyElevatorPosition()
 		if within or signal then return end
+		-- Never step into the void from an unverified offset. The exit model
+		-- can be much larger than its pivot; a blind MoveTo is not a safe
+		-- substitute for finding real floor geometry.
+		local hit
+		local rayOK = pcall(function()
+			local params = RaycastParams.new()
+			params.FilterType = Enum.RaycastFilterType.Exclude
+			params.FilterDescendantsInstances = { character }
+			hit = workspace:Raycast(root.Position, Vector3.new(0, -6, 0), params)
+		end)
+		if not rayOK or not hit or not hit.Instance or not hit.Instance.CanCollide
+			or (root.Position.Y-hit.Position.Y) > 5.0 then
+			farm.elevatorEntryTouched = true
+			increment("elevatorEntryUnsafeSkipped")
+			debugEvent("MACHINE", "elevator_touch_skipped_no_floor", {
+				source=farm.elevatorSource or "none",
+				root=root and tostring(root.Position) or "missing",
+			}, "WARN")
+			return
+		end
 		farm.elevatorEntryTouched = true
 		local start = root.Position
 		local ok = pcall(function()
@@ -3837,16 +3858,17 @@ local function newMachineAutofarm()
 				},"WARN")
 			end
 		end
-		-- The generic 'Elevator' path can be an entrance rather than the
-		-- exit. Do not abandon an existing exit for another guessed offset.
+		-- A first-floor death in v2.6.30 proved that refusing this
+		-- distinct fallback strands the player on an unverified exit offset.
+		-- Try the fallback ONCE when the primary has not produced a server
+		-- transition. This is a recovery attempt, not verified elevator entry.
 		if alternative and chosen and chosen.path == MACHINE.ElevatorFallback
 			and chosen.platform == nil and resolveWorkspacePath(MACHINE.Elevator) then
-			increment("elevatorBackupRejected")
-			debugEvent("MACHINE", "elevator_backup_unverified_rejected", {
-				from=farm.elevatorSource or "none",to=chosen.path,
-				detection=chosen.detection,reason="no_platform_or_state_proof",
+			increment("elevatorUnverifiedBackupUsed")
+			debugEvent("MACHINE", "elevator_backup_recovery_attempt", {
+				from=farm.elevatorSource or "none", to=chosen.path,
+				detection=chosen.detection, reason="primary_unverified",
 			}, "WARN")
-			chosen = nil
 		end
 		if not chosen and alternative then
 			increment("elevatorAlternateUnavailable")
@@ -4663,12 +4685,18 @@ local function newMachineAutofarm()
 							and not farm.finalizing and not farm.elevatorEmergencyLocked
 							and not holdForTransition and not farm.elevatorAlternateCommitted
 							and not farm.elevatorAlternateTried
-							and os.clock() - farm.allDoneSince >= 3.5
+							and os.clock() - farm.allDoneSince >= (farm.elevatorPlatform and 5.0 or 3.5)
 							and not (skillcheckProtected and skillcheckProtected()) then
 							farm.elevatorAlternateTried = true
 							local near, within, signal = verifyElevatorPosition()
-							if not (near and (within or signal)) then
+							-- An ordinary collidable floor is not proof that the game
+							-- accepted elevator entry. Only a replicated entry signal or
+							-- a new-round/server-relocation observation can justify staying.
+							if not signal then
 								increment("elevatorLastResortRetries")
+								debugEvent("MACHINE", "elevator_primary_unverified_recover", {
+									near=near,platform=within,reason="no_server_entry_signal",
+								}, "WARN")
 								finishAtElevator(active, true)
 							end
 						end
@@ -5324,7 +5352,7 @@ local function debugReport()
 		"Skillcheck protection=normally defer exits and travel; immediate danger or health loss permits urgent escape",
 		"Elevator check=platform, alternative elevator position, and optional replicated state; no server entry guarantee",
 		"Pickups=before machines only; 24s phase budget and 8s no-progress cutoff",
-				"Elevator fallback=fast dispatch, 15s emergency; never replace exit with unverified entrance; touch contact recovery",
+				"Elevator fallback=fast dispatch; distinct backup after 3.5s if primary has no entry proof; 15s watchdog; no blind floor steps",
 		"Ability=press F once per detected machine completion; no cooldown HUD polling or Ability remote",
 		"Ability input dispatched is not proof the game accepted it; active skillchecks block completion handling",
 		"Prompts=enabled-aware lookup, visibility events, Humanoid move and single mode-specific correction; dispatched is not confirmed",
