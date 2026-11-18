@@ -68,7 +68,7 @@ local OPTIONS = {
 	MovementMode="Teleport",TweenDepth=-15,Disable3DRendering=false,
 }
 
-local BUILD = "TU Rava Hub v2.6.29"
+local BUILD = "TU Rava Hub v2.6.30"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -109,6 +109,8 @@ local debugStats = {
 	elevatorWideScans=0,elevatorFarAlternateAttempts=0,
 	elevatorAlternateCommitted=0,elevatorServerRelocations=0,
 	elevatorTransitionHolds=0,elevatorLastResortRetries=0,
+	elevatorBackupRejected=0,elevatorEntryMoves=0,elevatorEntryMoved=0,
+	fuseLocatedDisabled=0,fuseDynamicFound=0,fuseActivationUnverified=0,
 	machineExitFlightWaits=0,damageRetreatTriggers=0,
 	autoHideExitRequests=0,autoHideExitSent=0,autoHideExitDuringSkillcheck=0,
 	autoHideExitQueued=0,autoHideExitEventFailures=0,
@@ -3591,7 +3593,7 @@ local function newMachineAutofarm()
 		elevatorHoldCorrections=0,lastElevatorHoldAt=0,
 		elevatorAlternateCommitted=false,elevatorAlternateTried=false,
 		elevatorServerRelocated=false,elevatorServerRelocatedAt=nil,
-		lastElevatorMoveAt=nil }
+		lastElevatorMoveAt=nil,elevatorProfiled=false,elevatorEntryTouched=false }
 	local runId = 0
 	local elevatorPreference = 1
 	local function move(position, keepGoing, mode)
@@ -3714,6 +3716,60 @@ local function newMachineAutofarm()
 		local signal = inElevatorSignal()
 		return near == true, geometry == true, signal
 	end
+	local function profileElevators()
+		if farm.elevatorProfiled then return end
+		farm.elevatorProfiled = true
+		for _, path in ipairs({ MACHINE.Elevator, MACHINE.ElevatorFallback }) do
+			local instance = resolveWorkspacePath(path)
+			local sample, total = {}, 0
+			if instance then
+				local function samplePart(part)
+					if not part:IsA("BasePart") then return end
+					total += 1
+					if #sample < 14 then
+						table.insert(sample, part.Name .. ":" .. tostring(part.Size)
+							.. ":collide=" .. tostring(part.CanCollide)
+							.. ":touch=" .. tostring(part.CanTouch))
+					end
+				end
+				samplePart(instance)
+				for _, part in ipairs(instance:GetDescendants()) do samplePart(part) end
+			end
+			debugEvent("MACHINE", "elevator_geometry_profile", {
+				path=path, class=instance and instance.ClassName or "missing",
+				parts=total, sample=table.concat(sample, " | "),
+			})
+		end
+	end
+	-- A small physical step can activate a touch-based exit region when a
+	-- CFrame teleport by itself does not. Never perform it during danger.
+	local function touchElevatorEntrance(active)
+		if farm.elevatorEntryTouched or not farm.elevatorTarget
+			or farm.elevatorTransit or farm.elevatorServerRelocated then return end
+		local root = getPlayerRoot()
+		local character = player.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if not root or not humanoid or not active() then return end
+		if (root.Position - farm.elevatorTarget).Magnitude > 7
+			or twistedNear(root.Position) or (skillcheckProtected and skillcheckProtected()) then return end
+		local _, within, signal = verifyElevatorPosition()
+		if within or signal then return end
+		farm.elevatorEntryTouched = true
+		local start = root.Position
+		local ok = pcall(function()
+			humanoid:MoveTo(start + Vector3.new(1.5, 0, 0))
+		end)
+		if ok then task.wait(0.17) end
+		pcall(function() humanoid:Move(Vector3.zero, false) end)
+		local distance = root.Parent and (root.Position - start).Magnitude or 0
+		increment("elevatorEntryMoves")
+		if distance > 0.10 then increment("elevatorEntryMoved") end
+		debugEvent("MACHINE", "elevator_touch_contact", {
+			requested=ok, distance=string.format("%.2f", distance),
+			source=farm.elevatorSource or "none",
+			confirmed=select(3, verifyElevatorPosition()) or "none",
+		})
+	end
 	local function chooseElevator(paths, avoid)
 		local fallback
 		for _, path in ipairs(paths) do
@@ -3751,6 +3807,7 @@ local function newMachineAutofarm()
 		return arrived
 	end
 	local function finishAtElevator(active, alternative)
+		profileElevators()
 		local previous = farm.elevatorTarget
 		local primary = { MACHINE.Elevator,MACHINE.ElevatorFallback }
 		local paths = alternative and { MACHINE.ElevatorFallback,MACHINE.Elevator } or primary
@@ -3779,6 +3836,17 @@ local function newMachineAutofarm()
 					distance=string.format("%.1f",(chosen.pos-previous).Magnitude),
 				},"WARN")
 			end
+		end
+		-- The generic 'Elevator' path can be an entrance rather than the
+		-- exit. Do not abandon an existing exit for another guessed offset.
+		if alternative and chosen and chosen.path == MACHINE.ElevatorFallback
+			and chosen.platform == nil and resolveWorkspacePath(MACHINE.Elevator) then
+			increment("elevatorBackupRejected")
+			debugEvent("MACHINE", "elevator_backup_unverified_rejected", {
+				from=farm.elevatorSource or "none",to=chosen.path,
+				detection=chosen.detection,reason="no_platform_or_state_proof",
+			}, "WARN")
+			chosen = nil
 		end
 		if not chosen and alternative then
 			increment("elevatorAlternateUnavailable")
@@ -3822,22 +3890,83 @@ local function newMachineAutofarm()
 		return arrived
 	end
 	local function checkFuseboxes(active)
+		local candidates, found = {}, {}
+		local function register(prompt, path)
+			if prompt and prompt:IsA("ProximityPrompt") and not found[prompt] then
+				found[prompt] = true
+				table.insert(candidates, { prompt=prompt, path=path })
+			end
+		end
 		for _, path in ipairs(MACHINE.Fuseboxes) do
-			if not active() then return end
 			local prompt = resolveWorkspacePath(path)
-			local part = prompt and prompt:IsA("ProximityPrompt") and getPromptPart(prompt, prompt.Parent)
-			debugEvent("FUSE", "located", { path=path,found=part ~= nil,enabled=part and prompt.Enabled or false })
-			if part and prompt.Enabled then
-				increment("fuseAttempts")
-				if not move(part.Position + Vector3.new(0, MACHINE.Height, 0), active) then return end
-				task.wait(MACHINE.Settle)
-				local deadline = os.clock() + MACHINE.FuseDwell
-				while active() and os.clock() < deadline and prompt.Parent and prompt.Enabled do
-					triggerPrompt(prompt)
-					task.wait(MACHINE.PromptRetry)
+			if not prompt then
+				debugEvent("FUSE", "known_path_missing", { path=path }, "WARN")
+			end
+			register(prompt, path)
+		end
+		-- Some rounds rename breaker objects. Discover their prompts only
+		-- under SpecialFolder, never press arbitrary workspace prompts.
+		local special = resolveWorkspacePath("Map.SpecialFolder")
+		if special then
+			for _, descendant in ipairs(special:GetDescendants()) do
+				if descendant:IsA("ProximityPrompt") and not found[descendant] then
+					local ancestor = descendant.Parent
+					for _ = 1, 5 do
+						if not ancestor or ancestor == special then break end
+						local name = ancestor.Name:lower():gsub("[%s_%-]", "")
+						if name:find("fusebox", 1, true)
+							or name:find("breaker", 1, true) then
+							register(descendant, descendant:GetFullName())
+							increment("fuseDynamicFound")
+							break
+						end
+						ancestor = ancestor.Parent
+					end
 				end
-				debugEvent("FUSE", "result", { path=path,promptEnabled=prompt.Enabled,
-					elapsed=string.format("%.2f",MACHINE.FuseDwell) })
+			end
+		end
+		for _, entry in ipairs(candidates) do
+			if not active() then return end
+			local prompt = entry.prompt
+			local part = prompt.Parent and getPromptPart(prompt, prompt.Parent)
+			local root = getPlayerRoot()
+			debugEvent("FUSE", "located", {
+				path=entry.path,found=part ~= nil,enabled=prompt.Enabled,
+				parent=prompt.Parent and prompt.Parent.Name or "missing",
+				action=prompt.ActionText,object=prompt.ObjectText,
+				hold=prompt.HoldDuration,maxDistance=prompt.MaxActivationDistance,
+				distance=part and root and string.format("%.1f", (part.Position - root.Position).Magnitude) or "unknown",
+			})
+			if not prompt.Enabled then
+				increment("fuseLocatedDisabled")
+			elseif part and not twistedNear(part.Position) then
+				if not move(part.Position + Vector3.new(0, MACHINE.Height, 0), active) then
+					debugEvent("FUSE", "approach_failed", { path=entry.path }, "WARN")
+					return
+				end
+				task.wait(MACHINE.Settle)
+				if prompt.Parent and prompt.Enabled and active() then
+					UNLOAD.refreshPromptContact(prompt, part, function()
+						return active() and prompt.Parent and prompt.Enabled and not twistedNear(part.Position)
+					end, "fusebox_arrival")
+					local deadline = os.clock() + math.max(0.7, math.min(2, prompt.HoldDuration + 0.3))
+					local fires = 0
+					while active() and prompt.Parent and prompt.Enabled and os.clock() < deadline do
+						if twistedNear(part.Position) then break end
+						if triggerPrompt(prompt) then fires += 1 end
+						task.wait(MACHINE.PromptRetry)
+					end
+					increment("fuseAttempts")
+					if prompt.Enabled then increment("fuseActivationUnverified") end
+					debugEvent("FUSE", "interaction_result", {
+						path=entry.path,fires=fires,promptEnabled=prompt.Enabled,
+						acceptedByServer="unknown",
+					}, prompt.Enabled and "WARN" or "INFO")
+				end
+			else
+				debugEvent("FUSE", "unsafe_or_missing", {
+					path=entry.path,partFound=part ~= nil,
+				}, "WARN")
 			end
 		end
 	end
@@ -4388,15 +4517,15 @@ local function newMachineAutofarm()
 							end
 							debugEvent("MACHINE", "all_complete", { autoElevator=OPTIONS.AutoElevator,
 								fuseboxes=OPTIONS.Fuseboxes,pickupTiming="before" })
+							-- Breakers must be handled before committing to the exit.
+							-- Otherwise touching a breaker may pull the player out of
+							-- the elevator after a valid transfer has begun.
 							farm.finalizing = OPTIONS.AutoElevator or OPTIONS.Fuseboxes
-							if OPTIONS.AutoElevator and active() and not farm.elevatorEmergencyLocked then
-								finishAtElevator(active)
-							end
 							if OPTIONS.Fuseboxes and active() and not farm.elevatorEmergencyLocked then
 								checkFuseboxes(active)
-								if OPTIONS.AutoElevator and active() and not farm.elevatorEmergencyLocked then
-									finishAtElevator(active)
-								end
+							end
+							if OPTIONS.AutoElevator and active() and not farm.elevatorEmergencyLocked then
+								finishAtElevator(active)
 							end
 							if not farm.elevatorEmergencyLocked then farm.finalizing = false end
 						else
@@ -4431,6 +4560,8 @@ local function newMachineAutofarm()
 		farm.elevatorServerRelocated = false
 		farm.elevatorServerRelocatedAt = nil
 		farm.lastElevatorMoveAt = nil
+		farm.elevatorProfiled = false
+		farm.elevatorEntryTouched = false
 		UNLOAD.imminentEvacuationUntil = 0
 		chase.pending = false
 		chase.serial = (chase.serial or 0) + 1
@@ -4460,6 +4591,8 @@ local function newMachineAutofarm()
 							farm.elevatorAlternateCommitted = false
 							farm.elevatorServerRelocated = false
 							farm.elevatorServerRelocatedAt = nil
+							farm.elevatorProfiled = false
+							farm.elevatorEntryTouched = false
 							increment("elevatorWatchStarts")
 							debugEvent("MACHINE", "elevator_watch_started", { deadlineSeconds=15 })
 						end
@@ -4500,6 +4633,12 @@ local function newMachineAutofarm()
 						end
 						local holdForTransition = farm.elevatorServerRelocated and
 							(os.clock() - (farm.elevatorServerRelocatedAt or 0) < 48)
+						if farm.elevatorTarget and not farm.elevatorEntryTouched
+							and not farm.finalizing and not farm.elevatorTransit
+							and not farm.elevatorEmergencyLocked and not holdForTransition
+							and os.clock() - farm.allDoneSince >= 2.0 then
+							touchElevatorEntrance(active)
+						end
 						if farm.elevatorTarget and not farm.finalizing and not farm.elevatorTransit
 							and not farm.elevatorEmergencyLocked and not holdForTransition
 							and farm.elevatorHoldCorrections < 3
@@ -4566,6 +4705,12 @@ local function newMachineAutofarm()
 							increment(verified and "elevatorFallbackSuccess" or "elevatorFallbackFailures")
 							increment(verified and "elevatorFallbackVerified" or "elevatorFallbackUnverified")
 							local root = getPlayerRoot()
+							if not verified then
+								debugEvent("MACHINE", "elevator_exit_not_confirmed", {
+									primaryPresent=resolveWorkspacePath(MACHINE.Elevator) ~= nil,
+									backupRejected=debugStats.elevatorBackupRejected,
+								}, "WARN")
+							end
 							debugEvent("MACHINE", verified and "elevator_fallback_geometry" or "elevator_fallback_unverified", {
 								mode=OPTIONS.MovementMode,nearTarget=reached,platformVerified=geometry,
 								stateSignal=state or "none",elevator=farm.elevatorSource or "none",
@@ -4586,6 +4731,8 @@ local function newMachineAutofarm()
 							farm.elevatorAlternateTried = false
 							farm.elevatorServerRelocated = false
 							farm.elevatorServerRelocatedAt = nil
+							farm.elevatorProfiled = false
+							farm.elevatorEntryTouched = false
 							if farm.elevatorEmergencyLocked then
 								farm.elevatorEmergencyLocked = false
 								farm.finalizing = false
@@ -5177,7 +5324,7 @@ local function debugReport()
 		"Skillcheck protection=normally defer exits and travel; immediate danger or health loss permits urgent escape",
 		"Elevator check=platform, alternative elevator position, and optional replicated state; no server entry guarantee",
 		"Pickups=before machines only; 24s phase budget and 8s no-progress cutoff",
-				"Elevator fallback=fast dispatch, distinct backup after 3.5s if unverified, 15s emergency, avoid repeated long-distance bouncing",
+				"Elevator fallback=fast dispatch, 15s emergency; never replace exit with unverified entrance; touch contact recovery",
 		"Ability=press F once per detected machine completion; no cooldown HUD polling or Ability remote",
 		"Ability input dispatched is not proof the game accepted it; active skillchecks block completion handling",
 		"Prompts=enabled-aware lookup, visibility events, Humanoid move and single mode-specific correction; dispatched is not confirmed",
