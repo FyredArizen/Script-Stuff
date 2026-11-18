@@ -66,7 +66,7 @@ local OPTIONS = {
 	MovementMode="Teleport",TweenDepth=-15,Disable3DRendering=false,
 }
 
-local BUILD = "TU Rava Hub v2.6.27"
+local BUILD = "TU Rava Hub v2.6.28"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -104,6 +104,9 @@ local debugStats = {
 	elevatorFallbackVerified=0,elevatorFallbackUnverified=0,
 	elevatorMissingStatusRecovered=0,elevatorFastDispatch=0,
 	elevatorRoundResets=0,urgentMachineExits=0,
+	elevatorWideScans=0,elevatorFarAlternateAttempts=0,
+	elevatorAlternateCommitted=0,elevatorServerRelocations=0,
+	elevatorTransitionHolds=0,elevatorLastResortRetries=0,
 	machineExitFlightWaits=0,damageRetreatTriggers=0,
 	autoHideExitRequests=0,autoHideExitSent=0,autoHideExitDuringSkillcheck=0,
 	autoHideExitQueued=0,autoHideExitEventFailures=0,
@@ -3544,7 +3547,10 @@ local function newMachineAutofarm()
 	local farm = { enabled=false,target=nil,finalizing=false,
 		elevatorTransit=false,elevatorTarget=nil,allDoneSince=nil,
 		elevatorEmergencyLocked=false,elevatorWatchFired=false,
-		elevatorHoldCorrections=0,lastElevatorHoldAt=0 }
+		elevatorHoldCorrections=0,lastElevatorHoldAt=0,
+		elevatorAlternateCommitted=false,elevatorAlternateTried=false,
+		elevatorServerRelocated=false,elevatorServerRelocatedAt=nil,
+		lastElevatorMoveAt=nil }
 	local runId = 0
 	local elevatorPreference = 1
 	local function move(position, keepGoing, mode)
@@ -3559,6 +3565,7 @@ local function newMachineAutofarm()
 		farm.elevatorTarget = position
 		local ok, arrived = pcall(move, position, keepGoing, "elevator")
 		farm.elevatorTransit = false
+		if ok and arrived == true then farm.lastElevatorMoveAt = os.clock() end
 		if not ok then
 			farm.moving = false
 			debugEvent("MACHINE", "elevator_move_error", { error=tostring(arrived) }, "ERROR")
@@ -3579,7 +3586,7 @@ local function newMachineAutofarm()
 				or part.CFrame.UpVector.Y < 0.8 then return end
 			local gap = Vector3.new(part.Position.X - fallback.X, 0,
 				part.Position.Z - fallback.Z).Magnitude
-			if gap > 19 or math.abs(part.Position.Y - fallback.Y) > 12 then return end
+			if gap > 23 or math.abs(part.Position.Y - fallback.Y) > 32 then return end
 			local name = part.Name:lower()
 			if name:find("door") or name:find("wall") or name:find("glass")
 				or name:find("ceiling") or name:find("roof") then return end
@@ -3594,8 +3601,15 @@ local function newMachineAutofarm()
 			if not part.CanCollide and kind == "generic_floor" then return end
 			if exterior then
 				local ancestor = part.Parent and part.Parent.Name:lower() or ""
-				if not (name:find("elevator") or name:find("exit") or ancestor:find("elevator")) then return end
-				strength -= 4
+				if name:find("elevator") or name:find("exit") or ancestor:find("elevator") then
+					strength -= 4
+				else
+					-- A nearby unnamed floor may help select a position, but it is
+					-- NOT proof of elevator entry.
+					if not part.Anchored or not part.CanCollide or gap > 9 or part.Size.Y > 8 then return end
+					strength -= 7
+					kind = "nearby_floor_unverified"
+				end
 			end
 			strength += part.CanCollide and 2 or 0
 			strength -= gap * 0.07 + math.abs(part.Position.Y - fallback.Y) * 0.16
@@ -3605,7 +3619,18 @@ local function newMachineAutofarm()
 		if elevator:IsA("BasePart") then consider(elevator, false) end
 		for _, part in ipairs(elevator:GetDescendants()) do consider(part, false) end
 		if not best then
-			local ok, nearby = pcall(function() return workspace:GetPartBoundsInRadius(fallback, 20) end)
+			increment("elevatorWideScans")
+			local ok, nearby = pcall(function()
+				return workspace:GetPartBoundsInBox(
+					CFrame.new(reference + Vector3.new(0, -10, 0)),
+					Vector3.new(46, 72, 46))
+			end)
+			if ok then for _, part in ipairs(nearby) do
+				if not part:IsDescendantOf(elevator) then consider(part, true) end
+			end end
+		end
+		if not best then
+			local ok, nearby = pcall(function() return workspace:GetPartBoundsInRadius(fallback, 23) end)
 			if ok then for _, part in ipairs(nearby) do
 				if not part:IsDescendantOf(elevator) then consider(part, true) end
 			end end
@@ -3614,6 +3639,9 @@ local function newMachineAutofarm()
 		if best and score >= 5 then
 			if bestKind == "generic_floor" then increment("elevatorGenericFloors") end
 			local pos = best.Position + best.CFrame.UpVector * (best.Size.Y * 0.5 + 2.75)
+			if bestKind == "nearby_floor_unverified" or not best.CanCollide then
+				return pos, nil, bestKind .. "_position_only", scanned
+			end
 			return pos, best, bestKind, scanned
 		end
 		return fallback, nil, "unverified_offset", scanned
@@ -3685,14 +3713,31 @@ local function newMachineAutofarm()
 		local previous = farm.elevatorTarget
 		local primary = { MACHINE.Elevator,MACHINE.ElevatorFallback }
 		local paths = alternative and { MACHINE.ElevatorFallback,MACHINE.Elevator } or primary
+		if farm.elevatorAlternateCommitted and farm.elevatorSource then
+			-- Never bounce back to the first unverified elevator after committing
+			-- to the backup for the current floor.
+			paths = { farm.elevatorSource }
+			alternative = false
+		end
 		local chosen = chooseElevator(paths, alternative and previous or nil)
 		if alternative and chosen and previous and chosen.platform == nil
 			and (chosen.pos-previous).Magnitude > 180 then
-			-- Both endpoints are only guessed positions; a long cross-map hop is unsafe.
-			debugThrottled("elevator_long_alternate",4,"MACHINE","elevator_alternate_unverified_far",
-				{ from=farm.elevatorSource or "none",to=chosen.path,
-				  distance=string.format("%.1f",(chosen.pos-previous).Magnitude) },"WARN")
-			chosen = nil
+			-- A cross-map alternate is useful ONLY after the first elevator has
+			-- failed to verify for a few seconds; do not blindly reject it forever.
+			local elapsed = os.clock() - (farm.allDoneSince or os.clock())
+			if elapsed < 3.5 then
+				debugThrottled("elevator_long_alternate",4,"MACHINE","elevator_alternate_waiting",
+					{ from=farm.elevatorSource or "none",to=chosen.path,
+					  seconds=string.format("%.1f",elapsed),
+					  distance=string.format("%.1f",(chosen.pos-previous).Magnitude) },"WARN")
+				chosen = nil
+			else
+				increment("elevatorFarAlternateAttempts")
+				debugEvent("MACHINE", "elevator_far_alternate_attempt", {
+					from=farm.elevatorSource or "none",to=chosen.path,
+					distance=string.format("%.1f",(chosen.pos-previous).Magnitude),
+				},"WARN")
+			end
 		end
 		if not chosen and alternative then
 			increment("elevatorAlternateUnavailable")
@@ -3712,6 +3757,10 @@ local function newMachineAutofarm()
 			})
 		end
 		local arrived = applyElevatorChoice(chosen, active)
+		if arrived and alternative then
+			farm.elevatorAlternateCommitted = true
+			increment("elevatorAlternateCommitted")
+		end
 		if arrived then RunService.Heartbeat:Wait() end
 		local near, geometry, signal = verifyElevatorPosition()
 		if arrived then
@@ -4333,6 +4382,14 @@ local function newMachineAutofarm()
 		farm.allDoneSince = nil
 		farm.elevatorWatchFired = false
 		farm.elevatorEmergencyLocked = false
+		farm.elevatorTarget = nil
+		farm.elevatorPlatform = nil
+		farm.elevatorSource = nil
+		farm.elevatorAlternateCommitted = false
+		farm.elevatorAlternateTried = false
+		farm.elevatorServerRelocated = false
+		farm.elevatorServerRelocatedAt = nil
+		farm.lastElevatorMoveAt = nil
 		UNLOAD.imminentEvacuationUntil = 0
 		chase.pending = false
 		chase.serial = (chase.serial or 0) + 1
@@ -4358,6 +4415,10 @@ local function newMachineAutofarm()
 							farm.elevatorWatchFired = false
 							farm.elevatorHoldCorrections = 0
 							farm.lastElevatorInside = nil
+							farm.elevatorAlternateTried = false
+							farm.elevatorAlternateCommitted = false
+							farm.elevatorServerRelocated = false
+							farm.elevatorServerRelocatedAt = nil
 							increment("elevatorWatchStarts")
 							debugEvent("MACHINE", "elevator_watch_started", { deadlineSeconds=15 })
 						end
@@ -4379,13 +4440,33 @@ local function newMachineAutofarm()
 								farm.lastElevatorInside = nil
 							end
 						end
+						-- When the game moves the character a whole room away shortly
+						-- after arrival, suspect a server-controlled floor transition.
+						-- Do not yank the player straight back to the completed floor.
+						if farm.elevatorTarget and farm.lastElevatorMoveAt
+							and not farm.elevatorServerRelocated then
+							local root = getPlayerRoot()
+							local age = os.clock() - farm.lastElevatorMoveAt
+							local dist = root and (root.Position - farm.elevatorTarget).Magnitude or 0
+							if age >= 0.35 and age <= 8 and dist > 80 then
+								farm.elevatorServerRelocated = true
+								farm.elevatorServerRelocatedAt = os.clock()
+								increment("elevatorServerRelocations")
+								debugEvent("MACHINE", "elevator_server_relocation_suspected", {
+									distance=string.format("%.1f", dist),age=string.format("%.1f",age),
+								},"WARN")
+							end
+						end
+						local holdForTransition = farm.elevatorServerRelocated and
+							(os.clock() - (farm.elevatorServerRelocatedAt or 0) < 48)
 						if farm.elevatorTarget and not farm.finalizing and not farm.elevatorTransit
-							and not farm.elevatorEmergencyLocked and farm.elevatorHoldCorrections < 3
+							and not farm.elevatorEmergencyLocked and not holdForTransition
+							and farm.elevatorHoldCorrections < 3
 							and os.clock() - farm.allDoneSince >= 0.65
 							and os.clock() - farm.lastElevatorHoldAt >= 1.0
 							and not (skillcheckProtected and skillcheckProtected()) then
 							local near, within, signal = verifyElevatorPosition()
-							if not near or (not within and not signal and farm.elevatorHoldCorrections == 0) then
+							if not near or (farm.elevatorPlatform and not within and not signal) then
 								farm.elevatorHoldCorrections += 1
 								farm.lastElevatorHoldAt = os.clock()
 								increment("elevatorHoldCorrections")
@@ -4393,15 +4474,27 @@ local function newMachineAutofarm()
 									near=near,platformVerified=within,stateSignal=signal or "none",
 									attempt=farm.elevatorHoldCorrections,
 								}, "WARN")
-								if near and not within and not signal then
-									finishAtElevator(active, true)
-								else
-									finishAtElevator(active)
-								end
+								finishAtElevator(active)
+							end
+						end
+						-- If the first position remains unverified, try ONE distinct
+						-- fallback at 3.5 seconds instead of waiting for death at 15s.
+						if farm.elevatorTarget and not farm.elevatorTransit
+							and not farm.finalizing and not farm.elevatorEmergencyLocked
+							and not holdForTransition and not farm.elevatorAlternateCommitted
+							and not farm.elevatorAlternateTried
+							and os.clock() - farm.allDoneSince >= 3.5
+							and not (skillcheckProtected and skillcheckProtected()) then
+							farm.elevatorAlternateTried = true
+							local near, within, signal = verifyElevatorPosition()
+							if not (near and (within or signal)) then
+								increment("elevatorLastResortRetries")
+								finishAtElevator(active, true)
 							end
 						end
 						if not farm.elevatorWatchFired and os.clock() - farm.allDoneSince >= 15
-							and not farm.elevatorTransit and not (skillcheckProtected and skillcheckProtected()) then
+							and not holdForTransition and not farm.elevatorTransit
+							and not (skillcheckProtected and skillcheckProtected()) then
 							farm.elevatorWatchFired = true
 							farm.elevatorEmergencyLocked = true
 							farm.finalizing = true
@@ -4419,7 +4512,8 @@ local function newMachineAutofarm()
 							local reached, geometry, state = false, false, nil
 							for attempt = 1, 2 do
 								if not active() then break end
-								local moved = finishAtElevator(active, attempt == 1)
+								local moved = finishAtElevator(active,
+								attempt == 1 and not farm.elevatorAlternateCommitted)
 								if moved then
 									task.wait(0.05)
 									reached, geometry, state = verifyElevatorPosition()
@@ -4444,6 +4538,13 @@ local function newMachineAutofarm()
 						if farm.allDoneSince and newWork then
 							farm.allDoneSince = nil
 							farm.elevatorWatchFired = false
+							farm.elevatorTarget = nil
+							farm.elevatorPlatform = nil
+							farm.elevatorSource = nil
+							farm.elevatorAlternateCommitted = false
+							farm.elevatorAlternateTried = false
+							farm.elevatorServerRelocated = false
+							farm.elevatorServerRelocatedAt = nil
 							if farm.elevatorEmergencyLocked then
 								farm.elevatorEmergencyLocked = false
 								farm.finalizing = false
@@ -4470,6 +4571,12 @@ local function newMachineAutofarm()
 		farm.allDoneSince = nil
 		farm.elevatorWatchFired = false
 		farm.elevatorEmergencyLocked = false
+		farm.elevatorTarget = nil
+		farm.elevatorPlatform = nil
+		farm.elevatorSource = nil
+		farm.elevatorAlternateCommitted = false
+		farm.elevatorAlternateTried = false
+		farm.elevatorServerRelocated = false
 		runId += 1
 		farm.target, farm.placed, farm.moving, farm.finalizing = nil, false, false, false
 		cancelMotion("machine")
@@ -5029,7 +5136,7 @@ local function debugReport()
 		"Skillcheck protection=normally defer exits and travel; immediate danger or health loss permits urgent escape",
 		"Elevator check=platform, alternative elevator position, and optional replicated state; no server entry guarantee",
 		"Pickups=before machines only; 24s phase budget and 8s no-progress cutoff",
-		"Elevator fallback=fast 0.35s dispatch for confirmed completion, 15s hard fallback, avoid far unverified alternates",
+				"Elevator fallback=fast dispatch, distinct backup after 3.5s if unverified, 15s emergency, avoid repeated long-distance bouncing",
 		"Ability=press F once per detected machine completion; no cooldown HUD polling or Ability remote",
 		"Ability input dispatched is not proof the game accepted it; active skillchecks block completion handling",
 		"Prompts=enabled-aware lookup, visibility events, Humanoid move and single mode-specific correction; dispatched is not confirmed",
