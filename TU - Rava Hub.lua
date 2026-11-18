@@ -16,6 +16,8 @@ if _G.TURavaHubUnload then pcall(_G.TURavaHubUnload) end
 
 local old = playerGui:FindFirstChild("TURavaHubGUI")
 if old then old:Destroy() end
+local staleBlackout = playerGui:FindFirstChild("TURavaHubBlackout")
+if staleBlackout then staleBlackout:Destroy() end
 sweepHighlights()
 
 local connections = {}
@@ -66,7 +68,7 @@ local OPTIONS = {
 	MovementMode="Teleport",TweenDepth=-15,Disable3DRendering=false,
 }
 
-local BUILD = "TU Rava Hub v2.6.28"
+local BUILD = "TU Rava Hub v2.6.29"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -170,9 +172,43 @@ local function debugThrottled(key, interval, category, event, fields, level)
 	debugLast[key] = now
 	debugEvent(category, event, fields, level)
 end
+-- Draw black behind the game's 2D UI while the 3D scene is disabled.
+-- A separate low-DisplayOrder ScreenGui keeps the hub and skillchecks visible.
+function UNLOAD.render3d.removeBlackout()
+	local overlay = UNLOAD.render3d.blackout
+	UNLOAD.render3d.blackout = nil
+	if overlay then pcall(function() overlay:Destroy() end) end
+	local leftover = playerGui:FindFirstChild("TURavaHubBlackout")
+	if leftover then pcall(function() leftover:Destroy() end) end
+end
+function UNLOAD.render3d.createBlackout()
+	local overlay = Instance.new("ScreenGui")
+	overlay.Name = "TURavaHubBlackout"
+	overlay.ResetOnSpawn = false
+	overlay.IgnoreGuiInset = true
+	overlay.DisplayOrder = -1000
+	overlay.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	pcall(function() overlay.ScreenInsets = Enum.ScreenInsets.None end)
+	local background = Instance.new("Frame")
+	background.Name = "BlackBackground"
+	background.Size = UDim2.fromScale(1, 1)
+	background.Position = UDim2.fromScale(0, 0)
+	background.BackgroundColor3 = Color3.new(0, 0, 0)
+	background.BackgroundTransparency = 0
+	background.BorderSizePixel = 0
+	background.Active = false
+	background.Parent = overlay
+	overlay.Parent = playerGui
+	return overlay
+end
 function UNLOAD.render3d.enable()
-	local ok, err = pcall(function() RunService:Set3dRenderingEnabled(false) end)
+	local ok, err = pcall(function()
+		UNLOAD.render3d.removeBlackout()
+		UNLOAD.render3d.blackout = UNLOAD.render3d.createBlackout()
+		RunService:Set3dRenderingEnabled(false)
+	end)
 	if not ok then
+		UNLOAD.render3d.removeBlackout()
 		increment("renderErrors")
 		debugEvent("RENDER", "disable_failed", { error=tostring(err) }, "ERROR")
 		error(err, 0)
@@ -180,7 +216,7 @@ function UNLOAD.render3d.enable()
 	UNLOAD.render3d.enabled = true
 	OPTIONS.Disable3DRendering = true
 	increment("renderToggles")
-	debugEvent("RENDER", "disabled_3d")
+	debugEvent("RENDER", "disabled_3d", { background="black" })
 end
 function UNLOAD.render3d.disable()
 	local ok, err = pcall(function() RunService:Set3dRenderingEnabled(true) end)
@@ -189,13 +225,18 @@ function UNLOAD.render3d.disable()
 		debugEvent("RENDER", "restore_failed", { error=tostring(err) }, "ERROR")
 		error(err, 0)
 	end
+	UNLOAD.render3d.removeBlackout()
 	UNLOAD.render3d.enabled = false
 	OPTIONS.Disable3DRendering = false
 	increment("renderToggles")
 	debugEvent("RENDER", "enabled_3d")
 end
 UNLOAD.restoreRendering = function()
-	if UNLOAD.render3d.enabled then UNLOAD.render3d.disable() end
+	if UNLOAD.render3d.enabled then
+		UNLOAD.render3d.disable()
+	else
+		UNLOAD.render3d.removeBlackout()
+	end
 end
 
 local function debugLog(message)
