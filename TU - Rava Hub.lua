@@ -68,7 +68,7 @@ local OPTIONS = {
 	MovementMode="Teleport",TweenDepth=-15,Disable3DRendering=false,
 }
 
-local BUILD = "TU Rava Hub v2.6.31"
+local BUILD = "TU Rava Hub v2.6.32"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -111,6 +111,8 @@ local debugStats = {
 	elevatorTransitionHolds=0,elevatorLastResortRetries=0,
 	elevatorBackupRejected=0,elevatorUnverifiedBackupUsed=0,
 	elevatorEntryMoves=0,elevatorEntryMoved=0,elevatorEntryUnsafeSkipped=0,
+	elevatorContactWalks=0,elevatorContactWalkSteps=0,elevatorContactWalkMoved=0,
+	elevatorRecoveryScheduled=0,elevatorRecoveryDispatched=0,elevatorRecoveryExhausted=0,
 	fuseLocatedDisabled=0,fuseDynamicFound=0,fuseActivationUnverified=0,
 	machineExitFlightWaits=0,damageRetreatTriggers=0,
 	autoHideExitRequests=0,autoHideExitSent=0,autoHideExitDuringSkillcheck=0,
@@ -3594,7 +3596,9 @@ local function newMachineAutofarm()
 		elevatorHoldCorrections=0,lastElevatorHoldAt=0,
 		elevatorAlternateCommitted=false,elevatorAlternateTried=false,
 		elevatorServerRelocated=false,elevatorServerRelocatedAt=nil,
-		lastElevatorMoveAt=nil,elevatorProfiled=false,elevatorEntryTouched=false }
+		lastElevatorMoveAt=nil,elevatorProfiled=false,elevatorEntryTouched=false,
+		elevatorEntryAttempts=0,elevatorContactRetryAt=0,
+		elevatorRecoveryAt=nil,elevatorRecoveryCount=0 }
 	local runId = 0
 	local elevatorPreference = 1
 	local function move(position, keepGoing, mode)
@@ -3742,54 +3746,114 @@ local function newMachineAutofarm()
 			})
 		end
 	end
-	-- A small physical step can activate a touch-based exit region when a
-	-- CFrame teleport by itself does not. Never perform it during danger.
+	-- CFrame arrival and standing on a collidable elevator floor are NOT
+	-- proof that a Touched/zone entry registered on the server. In previous
+	-- builds a generic floor caused this function to return without walking.
+	-- Use a few short, raycast-supported Humanoid steps instead.
 	local function touchElevatorEntrance(active)
-		if farm.elevatorEntryTouched or not farm.elevatorTarget
-			or farm.elevatorTransit or farm.elevatorServerRelocated then return end
+		if not farm.elevatorTarget or farm.elevatorTransit or farm.elevatorServerRelocated
+			or farm.elevatorEntryAttempts >= 3
+			or os.clock() < (farm.elevatorContactRetryAt or 0) then return end
 		local root = getPlayerRoot()
 		local character = player.Character
 		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-		if not root or not humanoid or not active() then return end
+		if not root or not humanoid or not active() or (getHealth() or 0) <= 0 then return end
 		if (root.Position - farm.elevatorTarget).Magnitude > 7
 			or twistedNear(root.Position) or (skillcheckProtected and skillcheckProtected()) then return end
-		local _, within, signal = verifyElevatorPosition()
-		if within or signal then return end
-		-- Never step into the void from an unverified offset. The exit model
-		-- can be much larger than its pivot; a blind MoveTo is not a safe
-		-- substitute for finding real floor geometry.
-		local hit
-		local rayOK = pcall(function()
-			local params = RaycastParams.new()
-			params.FilterType = Enum.RaycastFilterType.Exclude
-			params.FilterDescendantsInstances = { character }
-			hit = workspace:Raycast(root.Position, Vector3.new(0, -6, 0), params)
-		end)
-		if not rayOK or not hit or not hit.Instance or not hit.Instance.CanCollide
-			or (root.Position.Y-hit.Position.Y) > 5.0 then
-			farm.elevatorEntryTouched = true
+		local _, geometry, signal = verifyElevatorPosition()
+		if signal then farm.elevatorEntryTouched = true return end
+		farm.elevatorEntryAttempts += 1
+		farm.elevatorContactRetryAt = os.clock() + 1.6
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = { character }
+		local function supported(position)
+			local ok, hit = pcall(function()
+				return workspace:Raycast(position + Vector3.new(0, 2, 0),
+					Vector3.new(0, -7.5, 0), params)
+			end)
+			return ok and hit and hit.Instance and hit.Instance.CanCollide
+				and hit.Normal.Y > 0.70
+				and position.Y - hit.Position.Y >= 1.0
+				and position.Y - hit.Position.Y <= 5.0
+				and (not farm.elevatorPlatform or platformContains(farm.elevatorPlatform,position))
+		end
+		local start = root.Position
+		if not supported(start) then
 			increment("elevatorEntryUnsafeSkipped")
-			debugEvent("MACHINE", "elevator_touch_skipped_no_floor", {
-				source=farm.elevatorSource or "none",
-				root=root and tostring(root.Position) or "missing",
+			debugEvent("MACHINE", "elevator_walk_unsafe_floor", {
+				source=farm.elevatorSource or "none",attempt=farm.elevatorEntryAttempts,
+				geometry=geometry,position=tostring(start),
 			}, "WARN")
 			return
 		end
-		farm.elevatorEntryTouched = true
-		local start = root.Position
-		local ok = pcall(function()
-			humanoid:MoveTo(start + Vector3.new(1.5, 0, 0))
-		end)
-		if ok then task.wait(0.17) end
+		-- Prefer a named invisible touch zone near the player when present;
+		-- otherwise walk across the confirmed standing surface, not into void.
+		local candidates = {}
+		local instance = farm.elevatorSource and resolveWorkspacePath(farm.elevatorSource)
+		if instance then
+			for _, part in ipairs(instance:GetDescendants()) do
+				if part:IsA("BasePart") and part.CanTouch and not part.CanCollide then
+					local name = part.Name:lower()
+					if name:find("trigger") or name:find("hitbox")
+						or name:find("touch") or name:find("zone") then
+						local flat = Vector3.new(part.Position.X-start.X, 0, part.Position.Z-start.Z)
+						if flat.Magnitude > 0.5 and flat.Magnitude <= 9
+							and math.abs(part.Position.Y-start.Y) < 6 then
+							table.insert(candidates,{ pos=part.Position,name=part.Name,d=flat.Magnitude })
+						end
+					end
+				end
+			end
+			table.sort(candidates,function(a,b) return a.d < b.d end)
+		end
+		local towards = farm.elevatorPlatform and
+			Vector3.new(farm.elevatorPlatform.Position.X-start.X,0,
+				farm.elevatorPlatform.Position.Z-start.Z) or Vector3.zero
+		if #candidates > 0 then
+			towards = Vector3.new(candidates[1].pos.X-start.X,0,candidates[1].pos.Z-start.Z)
+		end
+		if towards.Magnitude < 0.5 then
+			towards = Vector3.new(root.CFrame.LookVector.X,0,root.CFrame.LookVector.Z)
+		end
+		if towards.Magnitude < 0.1 then towards = Vector3.new(1,0,0) end
+		local forward = towards.Unit
+		local sideways = Vector3.new(-forward.Z,0,forward.X)
+		local directions = { forward, sideways, -sideways, -forward }
+		local steps = 0
+		local moved = 0
+		increment("elevatorContactWalks")
+		for _, dir in ipairs(directions) do
+			if steps >= 3 or not active() or not farm.elevatorTarget
+				or (root.Position - farm.elevatorTarget).Magnitude > 9
+				or twistedNear(root.Position)
+				or (skillcheckProtected and skillcheckProtected()) then break end
+			local here = root.Position
+			if (here-start).Magnitude > 12 then break end -- possible server transition
+			local nextPos = here + dir * 1.65
+			if supported(nextPos) then
+				local ok = pcall(function() humanoid:MoveTo(nextPos) end)
+				if ok then
+					steps += 1
+					task.wait(0.18)
+					moved += (root.Position-here).Magnitude
+					if select(3,verifyElevatorPosition()) then break end
+				end
+			end
+		end
 		pcall(function() humanoid:Move(Vector3.zero, false) end)
-		local distance = root.Parent and (root.Position - start).Magnitude or 0
+		farm.elevatorEntryTouched = steps > 0
+		increment("elevatorContactWalkSteps",steps)
+		if moved > 0.15 then increment("elevatorContactWalkMoved") end
 		increment("elevatorEntryMoves")
-		if distance > 0.10 then increment("elevatorEntryMoved") end
-		debugEvent("MACHINE", "elevator_touch_contact", {
-			requested=ok, distance=string.format("%.2f", distance),
+		if moved > 0.15 then increment("elevatorEntryMoved") end
+		debugEvent("MACHINE", "elevator_entry_walk", {
+			attempt=farm.elevatorEntryAttempts,steps=steps,
+			moved=string.format("%.2f",moved),platform=geometry,
 			source=farm.elevatorSource or "none",
-			confirmed=select(3, verifyElevatorPosition()) or "none",
-		})
+			triggerCandidate=#candidates>0 and candidates[1].name or "none",
+			serverSignal=select(3,verifyElevatorPosition()) or "none",
+		}, steps>0 and "INFO" or "WARN")
 	end
 	local function chooseElevator(paths, avoid)
 		local fallback
@@ -3809,6 +3873,14 @@ local function newMachineAutofarm()
 		return fallback
 	end
 	local function applyElevatorChoice(chosen, keepGoing)
+		-- A new destination must rearm physical contact, even when a previous
+		-- position was marked as reached without server-confirmed entry.
+		if farm.elevatorSource ~= chosen.path or not farm.elevatorTarget
+			or (farm.elevatorTarget - chosen.pos).Magnitude > 5 then
+			farm.elevatorEntryTouched = false
+			farm.elevatorEntryAttempts = 0
+			farm.elevatorContactRetryAt = 0
+		end
 		farm.elevatorPlatform = chosen.platform
 		farm.elevatorSource = chosen.path
 		farm.elevatorDetection = chosen.detection
@@ -4615,6 +4687,10 @@ local function newMachineAutofarm()
 							farm.elevatorServerRelocatedAt = nil
 							farm.elevatorProfiled = false
 							farm.elevatorEntryTouched = false
+							farm.elevatorEntryAttempts = 0
+							farm.elevatorContactRetryAt = 0
+							farm.elevatorRecoveryAt = nil
+							farm.elevatorRecoveryCount = 0
 							increment("elevatorWatchStarts")
 							debugEvent("MACHINE", "elevator_watch_started", { deadlineSeconds=15 })
 						end
@@ -4655,10 +4731,11 @@ local function newMachineAutofarm()
 						end
 						local holdForTransition = farm.elevatorServerRelocated and
 							(os.clock() - (farm.elevatorServerRelocatedAt or 0) < 48)
-						if farm.elevatorTarget and not farm.elevatorEntryTouched
+						if farm.elevatorTarget and farm.elevatorEntryAttempts < 3
 							and not farm.finalizing and not farm.elevatorTransit
 							and not farm.elevatorEmergencyLocked and not holdForTransition
-							and os.clock() - farm.allDoneSince >= 2.0 then
+							and os.clock() >= (farm.elevatorContactRetryAt or 0)
+							and os.clock() - farm.allDoneSince >= 1.2 then
 							touchElevatorEntrance(active)
 						end
 						if farm.elevatorTarget and not farm.finalizing and not farm.elevatorTransit
@@ -4679,13 +4756,15 @@ local function newMachineAutofarm()
 								finishAtElevator(active)
 							end
 						end
-						-- If the first position remains unverified, try ONE distinct
-						-- fallback at 3.5 seconds instead of waiting for death at 15s.
+						-- If the primary still has no server entry signal after physical
+						-- contact attempts, try one distinct backup. Real floor support
+						-- gets a longer window so that we do not abandon it prematurely.
 						if farm.elevatorTarget and not farm.elevatorTransit
 							and not farm.finalizing and not farm.elevatorEmergencyLocked
 							and not holdForTransition and not farm.elevatorAlternateCommitted
 							and not farm.elevatorAlternateTried
-							and os.clock() - farm.allDoneSince >= (farm.elevatorPlatform and 5.0 or 3.5)
+							and os.clock() - farm.allDoneSince >= (farm.elevatorPlatform and 11.0 or 3.5)
+							and (not farm.elevatorPlatform or farm.elevatorEntryAttempts >= 2)
 							and not (skillcheckProtected and skillcheckProtected()) then
 							farm.elevatorAlternateTried = true
 							local near, within, signal = verifyElevatorPosition()
@@ -4699,6 +4778,31 @@ local function newMachineAutofarm()
 								}, "WARN")
 								finishAtElevator(active, true)
 							end
+						end
+						-- The old 15-second fallback permanently locked the character at an
+						-- unverified location. Revisit the supported primary exit after a
+						-- bounded cooling period, unless a server transition is in progress.
+						if farm.elevatorRecoveryAt and os.clock() >= farm.elevatorRecoveryAt
+							and not holdForTransition and not farm.elevatorTransit
+							and not farm.finalizing and not farm.elevatorEmergencyLocked
+							and not (skillcheckProtected and skillcheckProtected()) then
+							farm.elevatorRecoveryAt = nil
+							farm.elevatorAlternateCommitted = false
+							farm.elevatorAlternateTried = true
+							farm.elevatorEntryAttempts = 0
+							farm.elevatorEntryTouched = false
+							farm.elevatorContactRetryAt = 0
+							farm.elevatorHoldCorrections = 0
+							farm.elevatorServerRelocated = false
+							farm.elevatorServerRelocatedAt = nil
+							farm.elevatorWatchFired = false
+							farm.allDoneSince = os.clock()
+							increment("elevatorRecoveryDispatched")
+							debugEvent("MACHINE", "elevator_recovery_to_exit", {
+								attempt=farm.elevatorRecoveryCount,
+								from=farm.elevatorSource or "none",
+							}, "WARN")
+							finishAtElevator(active)
 						end
 						if not farm.elevatorWatchFired and os.clock() - farm.allDoneSince >= 15
 							and not holdForTransition and not farm.elevatorTransit
@@ -4720,8 +4824,11 @@ local function newMachineAutofarm()
 							local reached, geometry, state = false, false, nil
 							for attempt = 1, 2 do
 								if not active() then break end
+								-- Later recovery rounds should finish on the primary exit,
+								-- not permanently strand the player at the unverified backup.
 								local moved = finishAtElevator(active,
-								attempt == 1 and not farm.elevatorAlternateCommitted)
+									attempt == 1 and farm.elevatorRecoveryCount == 0
+									and not farm.elevatorAlternateCommitted)
 								if moved then
 									task.wait(0.05)
 									reached, geometry, state = verifyElevatorPosition()
@@ -4729,7 +4836,9 @@ local function newMachineAutofarm()
 								end
 								if attempt < 2 then task.wait(0.08) end
 							end
-							local verified = reached and (geometry or state)
+							-- Geometry is useful for supporting the character, but not proof
+							-- that the elevator/level transition was accepted.
+							local verified = reached and state ~= nil
 							increment(verified and "elevatorFallbackSuccess" or "elevatorFallbackFailures")
 							increment(verified and "elevatorFallbackVerified" or "elevatorFallbackUnverified")
 							local root = getPlayerRoot()
@@ -4745,6 +4854,24 @@ local function newMachineAutofarm()
 								position=root and tostring(root.Position) or "missing",
 								target=farm.elevatorTarget and tostring(farm.elevatorTarget) or "missing",
 							}, verified and "INFO" or "WARN")
+							if not verified and farm.elevatorRecoveryCount < 3 then
+								farm.elevatorRecoveryCount += 1
+								farm.elevatorRecoveryAt = os.clock() + 11 + farm.elevatorRecoveryCount * 3
+								farm.elevatorEmergencyLocked = false
+								farm.finalizing = false
+								increment("elevatorRecoveryScheduled")
+								debugEvent("MACHINE", "elevator_recovery_scheduled", {
+									attempt=farm.elevatorRecoveryCount,delay=11+farm.elevatorRecoveryCount*3,
+									last=farm.elevatorSource or "none",
+								}, "WARN")
+							elseif not verified then
+								-- Stop force-teleporting after bounded retries. Keep the best
+								-- supported exit as the last holding point, and record uncertainty.
+								increment("elevatorRecoveryExhausted")
+								debugEvent("MACHINE", "elevator_recovery_exhausted", {
+									location=farm.elevatorSource or "none",
+								}, "WARN")
+							end
 						end
 					else
 						local nextObjective,nextStatus = pickMachine()
@@ -4761,6 +4888,10 @@ local function newMachineAutofarm()
 							farm.elevatorServerRelocatedAt = nil
 							farm.elevatorProfiled = false
 							farm.elevatorEntryTouched = false
+							farm.elevatorEntryAttempts = 0
+							farm.elevatorContactRetryAt = 0
+							farm.elevatorRecoveryAt = nil
+							farm.elevatorRecoveryCount = 0
 							if farm.elevatorEmergencyLocked then
 								farm.elevatorEmergencyLocked = false
 								farm.finalizing = false
@@ -5352,7 +5483,7 @@ local function debugReport()
 		"Skillcheck protection=normally defer exits and travel; immediate danger or health loss permits urgent escape",
 		"Elevator check=platform, alternative elevator position, and optional replicated state; no server entry guarantee",
 		"Pickups=before machines only; 24s phase budget and 8s no-progress cutoff",
-				"Elevator fallback=fast dispatch; distinct backup after 3.5s if primary has no entry proof; 15s watchdog; no blind floor steps",
+				"Elevator fallback=physical supported walking even on floor; backup after 3.5-11s; 15s watchdog with bounded retry if entry unverified",
 		"Ability=press F once per detected machine completion; no cooldown HUD polling or Ability remote",
 		"Ability input dispatched is not proof the game accepted it; active skillchecks block completion handling",
 		"Prompts=enabled-aware lookup, visibility events, Humanoid move and single mode-specific correction; dispatched is not confirmed",
