@@ -68,7 +68,7 @@ local OPTIONS = {
 	MovementMode="Teleport",TweenDepth=-15,Disable3DRendering=false,
 }
 
-local BUILD = "TU Rava Hub v2.6.44"
+local BUILD = "TU Rava Hub v2.6.45"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -827,17 +827,6 @@ for index, name in ipairs(TAB_ORDER) do
         debugEvent("UI", "open_tab", { tab=name,access=diagnostic and "dock" or "sidebar" })
     end))
 end
-local diagnosticsQuick = new("TextButton", {
-    Name="DiagnosticsQuickAccess",Text="LOGS",
-    Position=UDim2.fromOffset(259,16),Size=UDim2.fromOffset(72,31),
-    Font=Enum.Font.GothamBold,TextSize=12,TextColor3=UI.text,
-    BackgroundColor3=UI.surface2,BorderSizePixel=0,
-}, top)
-corner(diagnosticsQuick, 8)
-track(diagnosticsQuick.Activated:Connect(function()
-    showTab("Diagnostics")
-    debugEvent("UI", "open_tab", { tab="Diagnostics",access="header" })
-end))
 local function createSection(name)
 	local page = new("ScrollingFrame", {
 		Name=name .. "Page",Position=UDim2.fromOffset(0,0),Size=UDim2.fromScale(1,1),
@@ -1996,8 +1985,10 @@ do
     end)
     task.spawn(function()
         while alive do
+            local hasSnakes = false
             for snake,record in pairs(snakes) do
                 if snake:IsDescendantOf(workspace) then
+                    hasSnakes = true
                     local ok,err=pcall(updateSnake,snake,record)
                     if not ok then
                         debugThrottled("snake_update_error",3,"SNAKES","guard_update_error",
@@ -2007,7 +1998,7 @@ do
                     removeSnake(snake)
                 end
             end
-            task.wait(SETTINGS.Refresh)
+            task.wait(hasSnakes and SETTINGS.Refresh or 0.4)
         end
     end)
 
@@ -6438,6 +6429,13 @@ autoSkillcheck.enable()
 
 machineFarm = newMachineAutofarm()
 
+-- This UI/diagnostics initialization is isolated in its own function frame.
+-- Luau limits the number of simultaneously active local registers in one
+-- function to 200; adding all GUI controls to the long top-level chunk
+-- exceeded that limit at refreshMovementMode in v2.6.44.
+-- The new function captures preexisting state through normal Lua upvalues.
+UNLOAD.finishInitialization = function()
+
 do
 local mainBody = pages.AFK
 local mainControl = createSubcategory(mainBody, "AFK START / STOP", 1, true)
@@ -6781,12 +6779,12 @@ end))
 supervise("diagnostic UI", function() return alive end, function()
 	while alive do
 		if main.Visible then for _, refresh in ipairs(toggleRefreshers) do refresh() end end
-		local working = (machineFarm.enabled and "MACHINE") or (pickupBusy() and "PICKUPS") or "IDLE"
-		headerStatus.Text = working .. "  •  v2.6.44"
-		headerStatus.TextColor3 = working == "IDLE" and UI.muted or UI.good
-		footerLabel.Text = string.format("%s   •   %s   •   %d moves", BUILD, OPTIONS.MovementMode,
-			debugStats.teleports + debugStats.underMapTweens)
 		if main.Visible then
+			local working = (machineFarm.enabled and "MACHINE") or (pickupBusy() and "PICKUPS") or "IDLE"
+			headerStatus.Text = working .. "  •  v2.6.45"
+			headerStatus.TextColor3 = working == "IDLE" and UI.muted or UI.good
+			footerLabel.Text = string.format("%s   •   %s   •   %d moves", BUILD, OPTIONS.MovementMode,
+				debugStats.teleports + debugStats.underMapTweens)
 			afkGoalLabel.Text = string.format("%d / %d machines  |  %d deaths  |  Best %d",
 				GOAL.Streak,GOAL.Target,GOAL.Deaths,GOAL.Best)
 			afkGoalLabel.TextColor3 = GOAL.Achieved and UI.good or GOAL.Deaths > 0 and UI.bad or UI.text
@@ -6828,8 +6826,9 @@ debugEvent("SYSTEM", "initialized", { build=BUILD,place=game.PlaceId,
 	pickupDwell=FARM.Dwell,pickupRate=FARM.SpamRate,itemWaitMax=MACHINE.ItemWaitMax,promptMoveFix=true })
 task.spawn(function()
 	local previous = {}
+	local watchFolders = { "Items","Capsules","Map.InfectedSamples","Candies","Computers","OilMachines","MonsterFolder" }
 	while alive do
-		for _, folderName in ipairs({ "Items","Capsules","Map.InfectedSamples","Candies","Computers","OilMachines","MonsterFolder" }) do
+		for _, folderName in ipairs(watchFolders) do
 			local folder = resolveWorkspacePath(folderName)
 			local present = folder ~= nil
 			if previous[folderName] ~= present then
@@ -6851,3 +6850,7 @@ UNLOAD.handler = function(source)
 	cancelMotion()
 	UNLOAD.force(source)
 end
+
+end -- UNLOAD.finishInitialization
+UNLOAD.finishInitialization()
+UNLOAD.finishInitialization = nil -- release one-time initializer reference
