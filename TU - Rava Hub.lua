@@ -68,7 +68,7 @@ local OPTIONS = {
 	MovementMode="Teleport",TweenDepth=-15,Disable3DRendering=false,
 }
 
-local BUILD = "TU Rava Hub v2.6.51"
+local BUILD = "TU Rava Hub v2.6.52"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -161,6 +161,8 @@ local debugStats = {
 	soundElevatorDoorClosing=0,soundFloorTransitions=0,soundFloorTransitionResets=0,
 	doorClosingIgnoredDuringWork=0,hideStarts=0,hideRetreats=0,hideWaitTicks=0,
 	hideResumes=0,hideSaferTargets=0,hideNoShelter=0,hideDangerStays=0,
+	damageIdleRetreats=0,criticalHealthHolds=0,criticalHealthRecoveries=0,
+	mainPrestageThreatBlocks=0,hideShelterThreatBlocks=0,stagedThreatRetreats=0,
 	soundElevatorSelections=0,soundElevatorReroutes=0,soundElevatorUnmappedDoor=0,soundElevatorSoundFallbacks=0,
 	soundDoneRecovered=0,soundDoneAmbiguous=0,objectiveLateValueBinds=0,
 	completedSkillcheckHandoffs=0,pickupOrbitsSuppressed=0,elevatorTeleportSteps=0,
@@ -2056,6 +2058,11 @@ local function releasePickup(farm)
 end
 
 local function returnPickupHome(force, isBlocked)
+	-- Never drag a critically injured player out of an Auto Hide shelter.
+	if UNLOAD.healthCritical and OPTIONS.AutoHide then
+		pickupCoordinator.home = nil
+		return
+	end
 	if pickupCircuit.paused or pickupCircuit.finalized then return end
 	if not pickupCoordinator.home or pickupCoordinator.owner then return end
 	if UNLOAD.pickupBefore.started and not UNLOAD.pickupBefore.completed then
@@ -3185,6 +3192,10 @@ local function pickupBusy()
 end
 
 local function collectOpen()
+	if OPTIONS.AutoHide and (UNLOAD.healthCritical
+		or (machineFarm and machineFarm.hideState and machineFarm.hideState.active)) then
+		return false
+	end
 	return not UNLOAD.pickupBefore.completed and not pickupCircuit.finalized
 		and not (machinesDone and machinesDone())
 end
@@ -3302,6 +3313,10 @@ local MACHINE = {
 	SkillcheckPause=3, ChaseHold=2.5, HideMinSeconds=2.5, HideClearSeconds=1.5,
 	DoneValue=100, FuseDwell=0.7,
 	EmergencyDistance=27,ThreatLead=0.28,ThreatVertical=26,
+	-- Health <= 1 is a deathless-run emergency. Pause unattended machine movement
+	-- until a health recovery is observed or the user turns Auto Hide off.
+	CriticalHealth=1,HideShelterClearance=42,
+	CriticalShelterClearance=60,MainPrestageClearance=42,
 	Fuseboxes={
 		"Map.SpecialFolder.Fusebox.Handle.ProximityPrompt",
 		"Map.SpecialFolder.ExitFusebox.Handle.ProximityPrompt",
@@ -3496,7 +3511,10 @@ local function nearestInfected(position)
 	local nearestName, nearestDistance, nearestPosition
 	for _, enemy in ipairs(getTargets(folder)) do
 		if enemy:IsA("Model") or enemy:IsA("BasePart") then
-			local pos = targetPosition(enemy)
+			-- Match the threat resolver's moving physical core. Model pivots
+			-- can be offset from the actual enemy, misleading refuge selection.
+			local core = threatCore(enemy)
+			local pos = core and core.Position
 			if pos then
 				local dist = (position - pos).Magnitude
 				if not nearestDistance or dist < nearestDistance then
@@ -3567,6 +3585,7 @@ local function bindHealthSource()
 	end
 	local function observe(newValue)
 		if type(newValue) ~= "number" or not alive then return end
+		UNLOAD.healthCritical = newValue <= MACHINE.CriticalHealth
 		local previous = healthMonitor.old
 		healthMonitor.old = newValue
 		if newValue > 0 and previous ~= nil and previous <= 0 then
@@ -3607,6 +3626,8 @@ local function bindHealthSource()
 		if newValue <= 0 then exportOnDeath(mode or "unknown", newValue) end
 	end
 	healthMonitor.old = mode == "Alive.Health" and source:GetAttribute("Health") or (source and source.Health)
+	UNLOAD.healthCritical = type(healthMonitor.old) == "number"
+		and healthMonitor.old <= MACHINE.CriticalHealth
 	if healthMonitor.old and healthMonitor.old <= 0 then exportOnDeath("initial_zero", healthMonitor.old) end
 	if source and mode == "Alive.Health" then
 		healthMonitor.conn = source:GetAttributeChangedSignal("Health"):Connect(function()
@@ -4942,37 +4963,66 @@ local function newMachineAutofarm()
 		local root = getPlayerRoot()
 		if not root then return false end
 		local choices = {}
+		local critical = type(healthMonitor.old) == "number"
+			and healthMonitor.old <= MACHINE.CriticalHealth
+		local clearance = critical and MACHINE.CriticalShelterClearance
+			or MACHINE.HideShelterClearance
 		for _, path in ipairs({ MACHINE.Elevator, MACHINE.ElevatorFallback }) do
 			local inst = resolveWorkspacePath(path)
 			local pos, platform, detection = elevatorPlatform(inst)
-			if pos and not twistedNear(pos, MACHINE.EmergencyDistance + 8)
-				and UNLOAD.voidGuard.landingOK(pos, "hide") then
-				table.insert(choices, {
-					pos=pos,path=path,platform=platform,detection=detection,
-					distance=(root.Position-pos).Magnitude,
-				})
+			if pos and UNLOAD.voidGuard.landingOK(pos, "hide") then
+				-- Include every physically detected infected for shelter selection,
+				-- not only monsters listed in the routine machine threat filter.
+				local nearName, nearDistance = nearestInfected(pos)
+				if (not nearDistance or nearDistance >= clearance)
+					and not twistedNear(pos, MACHINE.EmergencyDistance + 8) then
+					table.insert(choices, {
+						pos=pos,path=path,platform=platform,detection=detection,
+						distance=(root.Position-pos).Magnitude,
+						clearance=nearDistance or math.huge,
+					})
+				else
+					increment("hideShelterThreatBlocks")
+					debugThrottled("shelter_threat_" .. path,2,"HIDE",
+						"shelter_rejected_enemy",{
+						path=path,enemy=nearName or "unknown",
+						distance=nearDistance or "unknown",minimum=clearance,
+						},"WARN")
+				end
 			end
 		end
-		table.sort(choices, function(a,b) return a.distance < b.distance end)
+		-- Prefer actual distance from monsters over the closest elevator.
+		table.sort(choices, function(a,b)
+			if a.clearance ~= b.clearance then return a.clearance > b.clearance end
+			return a.distance < b.distance
+		end)
 		for _, chosen in ipairs(choices) do
 			if applyElevatorChoice(chosen,keepGoing,true) then
 				debugEvent("HIDE","shelter_reached", {
 					path=chosen.path,distance=string.format("%.1f",chosen.distance),
+					nearestEnemyDistance=chosen.clearance,
 				})
 				return true
 			end
 		end
-		-- Last grounded checkpoint is a fallback ONLY when it is on this map,
-		-- physically supported, and outside the immediate enemy radius.
+		-- Last grounded checkpoint is a fallback ONLY when on this map,
+		-- physically supported, and outside the full enemy-safety radius.
 		local guard = UNLOAD.voidGuard
 		local home = guard and guard.safeCFrame
+		local homeEnemyDistance
+		if home then
+			local _, distance = nearestInfected(home.Position)
+			homeEnemyDistance = distance
+		end
 		if home and guard.safeMap == workspace:FindFirstChild("Map")
+			and (not homeEnemyDistance or homeEnemyDistance >= clearance)
 			and not twistedNear(home.Position, MACHINE.EmergencyDistance + 8)
 			and guard.landingOK(home.Position + Vector3.new(0,1,0),"hide") then
 			return move(home.Position + Vector3.new(0,1,0),keepGoing,"hide")
 		end
 		increment("hideNoShelter")
-		debugThrottled("hide_no_shelter",1.5,"HIDE","no_supported_shelter",{},"WARN")
+		debugThrottled("hide_no_shelter",1.5,"HIDE","no_supported_shelter",
+			{ minimumEnemyDistance=clearance,critical=critical },"WARN")
 		return false
 	end
     -- looseFuses was forward-declared for the sound and elevator guards.
@@ -5574,9 +5624,10 @@ local function newMachineAutofarm()
 			end
 			local prompt = farm.target and getPrompt(farm.target)
 			if prompt then cancelMachinePromptHold(prompt) end
-			if shouldExit and chase.exitRequestedSerial ~= chase.serial then
+			if shouldExit and (reason == "damage" or reason == "critical_health"
+				or reason == "stage_threat" or chase.exitRequestedSerial ~= chase.serial) then
 				leaveObjective("auto_hide_" .. reason,true,0)
-				chase.exitRequestedSerial=chase.serial
+				if reason == "chase" then chase.exitRequestedSerial=chase.serial end
 			end
 			farm.placed = false
 			lastFire = 0
@@ -5589,7 +5640,16 @@ local function newMachineAutofarm()
 			if not hide.active then return false end
 			local now = os.clock()
 			local root = getPlayerRoot()
-			local unsafeAtRoot = not root or twistedNear(root.Position,MACHINE.EmergencyDistance + 8)
+			local health = healthMonitor.old
+			local critical = type(health) == "number" and health <= MACHINE.CriticalHealth
+			local rootEnemyName, rootEnemyDistance
+			if root then
+				rootEnemyName, rootEnemyDistance = nearestInfected(root.Position)
+			end
+			local rootClearance = critical and MACHINE.CriticalShelterClearance
+				or MACHINE.EmergencyDistance + 8
+			local unsafeAtRoot = not root or twistedNear(root.Position,rootClearance)
+				or (rootEnemyDistance and rootEnemyDistance < rootClearance)
 			local target = farm.target
 			if target and (isComplete(target) or not target:IsDescendantOf(workspace)) then
 				if isComplete(target) then
@@ -5629,10 +5689,27 @@ local function newMachineAutofarm()
 			end
 			-- Do NOT move back after a fixed 0.15-second timer. Hold until both
 			-- the minimum dwell and a continuous safe window have elapsed.
-			if unsafeAtRoot or targetUnsafe or chase.pending then
+			if critical then
+				-- At 1 HP another hit ends a 1000-machine streak. Do not
+				-- automatically leave a shelter simply because a timer expired.
+				hide.clearSince = nil
+				if not hide.criticalLogged then
+					hide.criticalLogged = true
+					increment("criticalHealthHolds")
+					debugEvent("HIDE","critical_health_hold", {
+						health=health,needsAbove=MACHINE.CriticalHealth,
+						userMayDisableAutoHide=true,
+					},"WARN")
+				end
+		elseif unsafeAtRoot or targetUnsafe or chase.pending then
 				hide.clearSince = nil
 				increment("hideDangerStays")
 			else
+				if hide.criticalLogged then
+					hide.criticalLogged = false
+					increment("criticalHealthRecoveries")
+					debugEvent("HIDE","critical_health_recovered",{health=health or "unknown"})
+				end
 				hide.clearSince = hide.clearSince or now
 			end
 			local cleared = hide.clearSince and now-hide.clearSince >= MACHINE.HideClearSeconds
@@ -5669,6 +5746,13 @@ local function newMachineAutofarm()
 				or now - (farm.mainPrestageAt or -math.huge) < 0.7 then return end
 			if skillcheckProtected and skillcheckProtected() then return end
 			if pickupCoordinator.owner ~= nil then return end
+			if type(healthMonitor.old) == "number"
+				and healthMonitor.old <= MACHINE.CriticalHealth then
+				increment("mainPrestageThreatBlocks")
+				debugThrottled("critical_prestage",3,"HIDE","main_prestage_blocked_low_health",
+					{health=healthMonitor.old},"WARN")
+				return
+			end
 			local stage = resolveWorkspacePath("Map.SpecialFolder.BigMachine")
 			if not stage then return end
 			local part
@@ -5686,8 +5770,16 @@ local function newMachineAutofarm()
 			farm.mainPrestageAt = now
 			farm.mainPrestageMap = workspace:FindFirstChild("Map")
 			increment("mainPrestageAttempts")
-			if not root or twistedNear(goal) or not UNLOAD.voidGuard.landingOK(goal,"machine") then
+			local nearestName,nearestDist = nearestInfected(goal)
+			if not root or twistedNear(goal)
+				or (nearestDist and nearestDist < MACHINE.MainPrestageClearance)
+				or not UNLOAD.voidGuard.landingOK(goal,"machine") then
 				increment("mainPrestageBlocked")
+				if nearestDist and nearestDist < MACHINE.MainPrestageClearance then
+					increment("mainPrestageThreatBlocks")
+					debugThrottled("main_prestage_enemy",2,"HIDE","main_prestage_unsafe",
+						{enemy=nearestName,distance=nearestDist},"WARN")
+				end
 				return
 			end
 			if (root.Position-goal).Magnitude < 7 then
@@ -5723,6 +5815,58 @@ local function newMachineAutofarm()
                 markNewMap(workspace:FindFirstChild("Map"), "machine_worker")
                 forceRescan = true
             end
+			-- Health loss must interrupt ALL machine phases, including the
+			-- no-target/main-prompt wait where v2.6.51 missed 2 -> 1 HP.
+			local damageSerial = UNLOAD.damageRetreatSerial or 0
+			if damageSerial > lastDamageRetreatSerial then
+				lastDamageRetreatSerial = damageSerial
+				if OPTIONS.AutoHide and not farm.floorTransitionConfirmed
+					and not farm.elevatorEmergencyLocked then
+					increment("damageRetreatTriggers")
+					if not farm.placed then increment("damageIdleRetreats") end
+					debugEvent("HIDE","damage_interrupt_any_phase", {
+						target=farm.target and farm.target.Name or "none",
+						placed=farm.placed,health=healthMonitor.old or "unknown",
+					},"WARN")
+					beginHide("damage",true,farm.placed == true)
+				end
+			end
+			if OPTIONS.AutoHide and not farm.floorTransitionConfirmed
+				and not farm.elevatorEmergencyLocked
+				and type(healthMonitor.old) == "number"
+				and healthMonitor.old <= MACHINE.CriticalHealth
+				and not hide.active then
+				beginHide("critical_health",true,farm.placed == true)
+			end
+			-- The main-stage preposition can become exposed to enemies while
+			-- the 15-second game prompt activation runs. Monitor that waiting phase.
+			if OPTIONS.AutoHide and not hide.active and not farm.floorTransitionConfirmed
+				and farm.mainPrestageSuccess
+				and farm.mainPrestageMap == workspace:FindFirstChild("Map")
+				and os.clock() <= (farm.mainReadyUntil or 0)
+				and not farm.placed then
+				local stageRoot = getPlayerRoot()
+				local stageName,stageDist
+				if stageRoot then
+					stageName,stageDist = nearestInfected(stageRoot.Position)
+				end
+				if stageDist and stageDist < MACHINE.MainPrestageClearance then
+					increment("stagedThreatRetreats")
+					debugEvent("HIDE","staged_wait_threat_detected", {
+						enemy=stageName,distance=stageDist,
+					},"WARN")
+					beginHide("stage_threat",true,false)
+				end
+			end
+			-- Allow an explicit user choice to disable Auto Hide. Otherwise a
+			-- 1-HP run remains sheltered until healed above the critical level.
+			if not OPTIONS.AutoHide and hide.active then
+				hide.active = false
+				debugEvent("HIDE","manually_overridden",{ reason="auto_hide_disabled" },"WARN")
+			elseif hide.active and handleHide() then
+				task.wait(0.06)
+				continue
+			end
             if farm.awaitingFreshObjectives then
                 local nextObj, nextStage = pickMachine()
                 local nextPrompt = nextObj and getPrompt(nextObj)
@@ -5837,17 +5981,6 @@ local function newMachineAutofarm()
 					increment("threatProximityAlerts")
 					debugThrottled("urgent_close_enemy",1,"DANGER","urgent_close_enemy",
 						{ enemy=dangerName,distance=string.format("%.1f",dangerDistance) },"WARN")
-				end
-			end
-			if (UNLOAD.damageRetreatSerial or 0) > lastDamageRetreatSerial then
-				lastDamageRetreatSerial = UNLOAD.damageRetreatSerial
-				if farm.placed then
-					if not chase.pending then chase.serial = (chase.serial or 0) + 1 end
-					chase.pending = true
-					UNLOAD.imminentEvacuationUntil = os.clock() + 0.8
-					increment("damageRetreatTriggers")
-					debugEvent("DANGER","damage_forces_machine_retreat", {
-						target=farm.target and farm.target.Name or "none" },"WARN")
 				end
 			end
 			local protected, checkType = skillcheckProtected()
@@ -7371,7 +7504,8 @@ local function debugReport()
 		"Elevator choice=after final machines use ElevatorDoor Parent ancestry; blackout box=opposite of last closed elevator door; quarantine new map until real objectives spawn; throttle geometry fallback",
         "Blackout=fuse objects under workspace.Items collected separately before chosen fusebox; Item Autofarm ignores Fuse",
 		"Threat detection=physical BasePart cores only (Folder HRP-safe) + short approaching-velocity prediction + vertical separation + explicit chase event",
-		"Auto Hide transitions=asynchronous exit request, grounded shelter when needed, >=2.5s dwell plus >=1.5s continuously clear; return target checked with 8-stud safety buffer",
+		"Auto Hide transitions=damage interrupts all machine phases; shelter enemies checked across monster types; >=2.5s dwell plus >=1.5s continuously clear; at 1 HP hold until healed or Auto Hide disabled",
+		"CriticalHealthPolicy=at or below 1 HP all machine movement pauses at safe shelter; main-stage prepositioning rejects enemy exposure",
 		"Session objective target=1000 machine completions in a single 0-HP-free streak; GOAL.Streak resets to zero on death",
 		"FloorState: " .. fieldString({ observed=UNLOAD.floorState.seen,
 			completed=UNLOAD.floorState.completed,finished=UNLOAD.floorState.finished,
