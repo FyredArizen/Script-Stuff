@@ -68,7 +68,7 @@ local OPTIONS = {
 	MovementMode="Teleport",TweenDepth=-15,Disable3DRendering=false,
 }
 
-local BUILD = "TU Rava Hub v2.6.46"
+local BUILD = "TU Rava Hub v2.6.47"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -153,6 +153,8 @@ local debugStats = {
 	soundElevatorCountdownUnverified=0,
 	soundElevatorDoorClosing=0,soundFloorTransitions=0,soundFloorTransitionResets=0,
 	soundElevatorSelections=0,soundElevatorReroutes=0,soundElevatorUnmappedDoor=0,soundElevatorSoundFallbacks=0,
+	soundDoneRecovered=0,soundDoneAmbiguous=0,objectiveLateValueBinds=0,
+	completedSkillcheckHandoffs=0,pickupOrbitsSuppressed=0,elevatorTeleportSteps=0,
 	soundMainCompleted=0,soundMainCompletedDoor=0,soundMainCompletionVerified=0,
 	soundBlackout=0,soundBlackoutDispatches=0,soundBlackoutDeferred=0,
 	soundWakeups=0,soundHandoffs=0,soundIgnored=0,
@@ -530,12 +532,19 @@ local function instantTeleport(destination, keepGoing, owner, mode)
 	end
 	local protected, checkType = false, "not_ready"
 	if skillcheckProtected then protected, checkType = skillcheckProtected() end
-	if protected and not (emergency and owner == "machine"
+	-- Only a corroborated completion permits the next machine handoff while
+	-- a completed skillcheck GUI is still fading out. Never bypass for pickups.
+	local verifiedHandoff = owner == "machine" and mode == "fast"
+		and os.clock() < (UNLOAD.verifiedHandoffUntil or 0)
+	if protected and not verifiedHandoff and not (emergency and owner == "machine"
 		and os.clock() <= (UNLOAD.imminentEvacuationUntil or 0)) then
 		increment("skillcheckMoveBlocked")
 		debugThrottled("skillcheck_teleport_block_" .. tostring(owner), 1.5,
 			"SKILLCHECK", "teleport_deferred", { owner=owner,mode=mode or "routine",ui=checkType }, "INFO")
 		return false
+	end
+	if verifiedHandoff and protected then
+		increment("completedSkillcheckHandoffs")
 	end
 	if owner == "machine" and activeMotion and activeMotion.owner == "pickup" then
 		debugEvent("MOVE", "machine_preempts_pickup_tween", { phase=activeMotion.phase or "unknown" }, "WARN")
@@ -1521,7 +1530,7 @@ end
 
 -- Autofarm prompt contact uses precise CFrame repositioning only.
 -- No Humanoid:Move, Humanoid:MoveTo, WASD, or virtual walking keys.
--- Elevator entry contact walking remains separately available for touch triggers.
+-- Elevator entry uses separate grounded CFrame steps for possible touch triggers.
 do
     local orbitGeneration, orbitActive = 0, false
     UNLOAD.abortOrbit = function() orbitGeneration += 1 end
@@ -2599,30 +2608,10 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 										end
 									end
 							end
-								-- A final short spiral checks multiple contact angles without repeating a blind teleport.
-								if not success and (why == "confirmation_timeout" or why == "prompt_replaced")
-									and stillPicking(true) and not pickupCircuit.paused then
-									local livePrompt = getPrompt(target)
-									local livePart = livePrompt and getPromptPart(livePrompt, target)
-									if livePrompt and livePrompt.Enabled and livePart then
-										prompt, part = livePrompt, livePart
-										promptPosition = getPromptPosition(prompt, part)
-										local orbitSuccess, orbitReason, orbitFired = UNLOAD.orbitPromptContact(
-											target, prompt, part,
-											function() return stillPicking(true) and not pickupRisk(promptPosition,target).unsafe end,
-											function()
-												return pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
-											end,
-											function() return triggerPrompt(prompt, false) end,
-											"pickup_retry", 0.9)
-										fired += orbitFired
-										if orbitSuccess then
-											success, why = true, "orbit_contact"
-											increment("pickupOrbitRecoveries")
-										elseif orbitReason == "enemy_nearby" or orbitReason == "interrupted" then
-											why = "orbit_" .. orbitReason
-										end
-									end
+								-- No orbit or walking fallback for pickup routes. A failed
+								-- contact retry is retried in the next pickup cycle instead.
+								if not success and (why == "confirmation_timeout" or why == "prompt_replaced") then
+									increment("pickupOrbitsSuppressed")
 								end
 								if not success and isBlocked and isBlocked() then return false, "preempted_by_machine", fired end
 								return success, why, fired
@@ -4030,6 +4019,7 @@ local function newMachineAutofarm()
 		elevatorEntryAttempts=0,elevatorContactRetryAt=0,
 		elevatorRecoveryAt=nil,elevatorRecoveryCount=0,
 		soundSerial=0,soundLast=nil,soundDoneTarget=nil,soundDoneUntil=0,
+		lastPromptTarget=nil,lastPromptAt=-math.huge,
 		mainReadyUntil=0,elevatorDoorOpenUntil=0,
 		elevatorSoundPath=nil,elevatorSoundAt=-math.huge,elevatorSoundWaitSince=nil,
 		pendingDoorPath=nil,pendingDoorAt=-math.huge,
@@ -4068,6 +4058,9 @@ local function newMachineAutofarm()
 		farm.pendingDoorPath = nil
 		farm.pendingDoorAt = -math.huge
 		farm.mainFlushTarget = nil
+		farm.lastPromptTarget = nil
+		farm.lastPromptAt = -math.huge
+		UNLOAD.verifiedHandoffUntil = 0
 		farm.mainFlushAt = -math.huge
 		farm.mainFlushUntil = 0
 		farm.lastDoorSoundAt = -math.huge
@@ -4278,9 +4271,7 @@ local function newMachineAutofarm()
 			and packet.Player == player
 			and (packet.Category == "Machine" or packet.Category == "Computer") then
 			kind, category = "done", packet.Category
-		elseif name == "MainMachineFillingUp" and packet.IsVoiceLine == false
-			and packet.Parent ~= nil
-			and packet.Parent == resolveWorkspacePath("Map.SpecialFolder.BigMachine.Oil") then
+		elseif name == "MainMachineFillingUp" and packet.IsVoiceLine == false then
 			kind = "main_ready"
 		elseif name == "MainMachineFlush" and packet.IsVoiceLine == false then
 			kind = "main_flush"
@@ -4328,17 +4319,28 @@ local function newMachineAutofarm()
 		if kind == "done" then
 			increment(category == "Machine" and "soundOilDone" or "soundComputerDone")
 			local target = farm.target
-			if target and farm.placed and machineKind(target) == category
-				and not isComplete(target) then
+			-- Completion audio can arrive after the prompt disables or the
+			-- old machine has already stopped being considered "placed".
+			-- Accept it only for the current matching objective with recent
+			-- local interaction evidence, or visible near-complete progress.
+			local recentlyUsed = target and farm.lastPromptTarget == target
+				and now - (farm.lastPromptAt or -math.huge) <= 3.0
+			local nearDone = target and (getProgress(target) or 0) >= 92
+			if target and machineKind(target) == category and not isComplete(target)
+				and (recentlyUsed or nearDone or farm.placed) then
 				farm.soundDoneTarget = target
-				farm.soundDoneUntil = now + 1.0
+				farm.soundDoneUntil = now + 3.0 -- allow replication to catch up
+				UNLOAD.verifiedHandoffUntil = now + 2.5
+				if not farm.placed then increment("soundDoneRecovered") end
 				debugEvent("SOUND", "local_machine_done_cue", {
-					target=target.Name,category=category,evidence="local_player_sound",
+					target=target.Name,category=category,
+					evidence=recentlyUsed and "recent_prompt" or nearDone and "near_complete" or "placed",
 				})
 			else
-				increment("soundIgnored")
+				increment("soundDoneAmbiguous")
 				debugThrottled("sound_done_unmatched", 0.7, "SOUND", "done_without_active_match", {
-					category=category,target=target and target.Name or "none" })
+					category=category,target=target and target.Name or "none",
+					placed=farm.placed,prior=recentlyUsed == true })
 			end
 		elseif kind == "main_ready" then
 			-- Confirmed game cue: all BASE oil/computer objectives are done.
@@ -4676,14 +4678,14 @@ local function newMachineAutofarm()
 		local start = root.Position
 		if not supported(start) then
 			increment("elevatorEntryUnsafeSkipped")
-			debugEvent("MACHINE", "elevator_walk_unsafe_floor", {
+			debugEvent("MACHINE", "elevator_contact_unsafe_floor", {
 				source=farm.elevatorSource or "none",attempt=farm.elevatorEntryAttempts,
 				geometry=geometry,position=tostring(start),
 			}, "WARN")
 			return
 		end
 		-- Prefer a named invisible touch zone near the player when present;
-		-- otherwise walk across the confirmed standing surface, not into void.
+		-- otherwise take short guarded teleport steps across supported ground.
 		local candidates = {}
 		local instance = farm.elevatorSource and resolveWorkspacePath(farm.elevatorSource)
 		if instance then
@@ -4726,23 +4728,29 @@ local function newMachineAutofarm()
 			local here = root.Position
 			if (here-start).Magnitude > 12 then break end -- possible server transition
 			local nextPos = here + dir * 1.65
-			if supported(nextPos) then
-				local ok = pcall(function() humanoid:MoveTo(nextPos) end)
-				if ok then
+			if supported(nextPos) and UNLOAD.voidGuard.landingOK(nextPos,"elevator_contact") then
+				-- Elevator contact now uses teleport-only steps. Never leave a
+				-- Humanoid MoveTo command active when the next pickup phase starts.
+				local ok = pcall(function()
+					root.AssemblyLinearVelocity = Vector3.zero
+					root.AssemblyAngularVelocity = Vector3.zero
+					root.CFrame = CFrame.new(nextPos) * (root.CFrame - root.Position)
+				end)
+				if ok and (root.Position-nextPos).Magnitude <= 2.0 then
 					steps += 1
-					task.wait(0.18)
+					increment("elevatorTeleportSteps")
+					task.wait(0.06)
 					moved += (root.Position-here).Magnitude
 					if select(3,verifyElevatorPosition()) then break end
 				end
 			end
 		end
-		pcall(function() humanoid:Move(Vector3.zero, false) end)
 		farm.elevatorEntryTouched = steps > 0
 		increment("elevatorContactWalkSteps",steps)
 		if moved > 0.15 then increment("elevatorContactWalkMoved") end
 		increment("elevatorEntryMoves")
 		if moved > 0.15 then increment("elevatorEntryMoved") end
-		debugEvent("MACHINE", "elevator_entry_walk", {
+		debugEvent("MACHINE", "elevator_entry_teleport_steps", {
 			attempt=farm.elevatorEntryAttempts,steps=steps,
 			moved=string.format("%.2f",moved),platform=geometry,
 			source=farm.elevatorSource or "none",
@@ -5233,6 +5241,7 @@ local function newMachineAutofarm()
 					if not alive or not farm.enabled then return end
 					if value.Value >= MACHINE.DoneValue then
 						forceRescan = true
+						UNLOAD.verifiedHandoffUntil = os.clock() + 1.4
 						increment("completionWakeups")
 					end
 				end))
@@ -5247,10 +5256,28 @@ local function newMachineAutofarm()
 			table.insert(targetWatchConnections, target.AncestryChanged:Connect(function()
 				forceRescan = true
 			end))
+			table.insert(targetWatchConnections, target.DescendantAdded:Connect(function(child)
+				if child:IsA("ProximityPrompt") then
+					forceRescan = true
+				elseif (child.Name == "OilValue" or child.Name == "ComputerPercentage")
+					and (child:IsA("NumberValue") or child:IsA("IntValue")) then
+					UNLOAD.progressValues[target] = child
+					forceRescan = true
+					increment("objectiveLateValueBinds")
+					-- Rebuild watcher once, so completion fires on the new Value.
+					task.defer(function()
+						if active() and watchedTarget == target then
+							clearTargetWatch()
+							watchTarget(target)
+						end
+					end)
+				end
+			end))
 		end
 		local function noteMachineCompleted(machine)
 			if abilityTriggeredFor[machine] then return end
 			abilityTriggeredFor[machine] = true
+			UNLOAD.verifiedHandoffUntil = os.clock() + 1.5
 			increment("machineCompletions")
 			-- Keep total completions for diagnostics, but never count a completion
 			-- toward the deathless goal while the current life is at 0 HP.
@@ -5422,7 +5449,16 @@ local function newMachineAutofarm()
 				end
 			end
 			local protected, checkType = skillcheckProtected()
-			if protected and not chase.pending
+			-- Once completion has been observed, the disappearing skillcheck UI
+			-- must not hold the next objective hostage.
+			local completedTarget = farm.target and
+				(isComplete(farm.target) or
+				(farm.soundDoneTarget == farm.target
+				and os.clock() <= (farm.soundDoneUntil or 0)))
+			if completedTarget then
+				UNLOAD.verifiedHandoffUntil = os.clock() + 1.4
+			end
+			if protected and not completedTarget and not chase.pending
 				and not (dangerAtRoot and dangerDistance
 					and dangerDistance <= MACHINE.EmergencyDistance)
 				and os.clock() > (UNLOAD.imminentEvacuationUntil or 0) then
@@ -5707,6 +5743,7 @@ local function newMachineAutofarm()
 							-- contact walk could cost hundreds of ms on EVERY handoff.
 							local initialFireAt = os.clock()
 							local initialFired = triggerMachinePrompt(prompt)
+							farm.lastPromptTarget,farm.lastPromptAt = target,os.clock()
 							increment("fastPromptDispatches")
 							if not initialFired and active() and not isComplete(target) then
 								local contacted = UNLOAD.refreshPromptContact(prompt, part, function()
@@ -5727,6 +5764,7 @@ local function newMachineAutofarm()
 									prompt, part = fresh, freshPart
 									increment("machineInitialPromptRetries")
 									initialFired = triggerMachinePrompt(prompt)
+									farm.lastPromptTarget,farm.lastPromptAt = target,os.clock()
 								end
 							end
 							debugEvent("PERF", "prompt_after_teleport", {
@@ -5865,6 +5903,7 @@ local function newMachineAutofarm()
 								debugLog(string.format("first fire %s %.2fs after place", target.Name, os.clock() - placedAt))
 							end
 							triggerMachinePrompt(prompt)
+							farm.lastPromptTarget,farm.lastPromptAt = target,os.clock()
 						end
 						if autoUse.enabled and activated and not usedItem and farm.placed
 							and not checking and not (skillcheckProtected and skillcheckProtected())
@@ -6871,10 +6910,10 @@ local function debugReport()
 		"Skillcheck protection=normally defer exits and travel; immediate danger or health loss permits urgent escape",
 		"Elevator check=platform, alternative elevator position, and optional replicated state; no server entry guarantee",
 		"Pickups=before machines only; 24s phase budget and 8s no-progress cutoff",
-				"Elevator fallback=physical supported walking even on floor; backup after 3.5-11s; 15s watchdog with bounded retry if entry unverified",
+				"Elevator fallback=short grounded CFrame steps only; backup after 3.5-11s; 15s watchdog with bounded retry if entry unverified",
 		"Ability=press F once per detected machine completion; no cooldown HUD polling or Ability remote",
 		"Ability input dispatched is not proof the game accepted it; active skillchecks block completion handling",
-		"Prompts=enabled-aware lookup, visibility events, Humanoid move and single mode-specific correction; dispatched is not confirmed",
+		"Prompts=enabled-aware lookup, visibility events, teleport-only contact correction; dispatched is not confirmed",
 		"Snake safety=client-only collidable rectangular guard follows every TSnakes; live rectangular below-snake pickup exclusion; checks on route/prompt/retry",
 		"Autofarm prompt correction=teleport-only, no Humanoid Move/MoveTo or walking keys; elevator touch-entry recovery remains independent",
 		"Item hotkeys=executor keypress preferred, VIM fallback; input success does not prove item effect",
@@ -6987,7 +7026,7 @@ supervise("diagnostic UI", function() return alive end, function()
 		if main.Visible then for _, refresh in ipairs(toggleRefreshers) do refresh() end end
 		if main.Visible then
 			local working = (machineFarm.enabled and "MACHINE") or (pickupBusy() and "PICKUPS") or "IDLE"
-			headerStatus.Text = working .. "  •  v2.6.45"
+			headerStatus.Text = working .. "  •  " .. (BUILD:match("v%d+%.%d+%.%d+") or "RAVA")
 			headerStatus.TextColor3 = working == "IDLE" and UI.muted or UI.good
 			footerLabel.Text = string.format("%s   •   %s   •   %d moves", BUILD, OPTIONS.MovementMode,
 				debugStats.teleports + debugStats.underMapTweens)
