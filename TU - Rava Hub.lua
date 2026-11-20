@@ -68,7 +68,7 @@ local OPTIONS = {
 	MovementMode="Teleport",TweenDepth=-15,Disable3DRendering=false,
 }
 
-local BUILD = "TU Rava Hub v2.6.47"
+local BUILD = "TU Rava Hub v2.6.48"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -152,6 +152,8 @@ local debugStats = {
 	soundElevatorCountdownStop=0,soundElevatorCountdownAccepted=0,
 	soundElevatorCountdownUnverified=0,
 	soundElevatorDoorClosing=0,soundFloorTransitions=0,soundFloorTransitionResets=0,
+	doorClosingIgnoredDuringWork=0,hideStarts=0,hideRetreats=0,hideWaitTicks=0,
+	hideResumes=0,hideSaferTargets=0,hideNoShelter=0,hideDangerStays=0,
 	soundElevatorSelections=0,soundElevatorReroutes=0,soundElevatorUnmappedDoor=0,soundElevatorSoundFallbacks=0,
 	soundDoneRecovered=0,soundDoneAmbiguous=0,objectiveLateValueBinds=0,
 	completedSkillcheckHandoffs=0,pickupOrbitsSuppressed=0,elevatorTeleportSteps=0,
@@ -523,7 +525,7 @@ do
 end
 
 local function instantTeleport(destination, keepGoing, owner, mode)
-	local emergency = mode == "emergency" or mode == "elevator"
+	local emergency = mode == "emergency" or mode == "elevator" or mode == "hide"
 	if not alive or not keepGoing() then return false end
 	if owner == "pickup" and UNLOAD.pickupSnakeUnsafe
 		and UNLOAD.pickupSnakeUnsafe(nil,destination.Position) then
@@ -534,7 +536,7 @@ local function instantTeleport(destination, keepGoing, owner, mode)
 	if skillcheckProtected then protected, checkType = skillcheckProtected() end
 	-- Only a corroborated completion permits the next machine handoff while
 	-- a completed skillcheck GUI is still fading out. Never bypass for pickups.
-	local verifiedHandoff = owner == "machine" and mode == "fast"
+	local verifiedHandoff = owner == "machine" and (mode == "fast" or mode == "handoff")
 		and os.clock() < (UNLOAD.verifiedHandoffUntil or 0)
 	if protected and not verifiedHandoff and not (emergency and owner == "machine"
 		and os.clock() <= (UNLOAD.imminentEvacuationUntil or 0)) then
@@ -608,7 +610,7 @@ local function instantTeleport(destination, keepGoing, owner, mode)
 end
 
 local function tweenUnderMap(destination, keepGoing, owner, mode)
-	local emergency = mode == "emergency" or mode == "elevator"
+	local emergency = mode == "emergency" or mode == "elevator" or mode == "hide"
 	if not alive or not keepGoing() then return false, "inactive" end
 	if owner == "pickup" and UNLOAD.pickupSnakeUnsafe
 		and UNLOAD.pickupSnakeUnsafe(nil,destination.Position) then
@@ -2443,7 +2445,8 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 	local function loop(myId)
 		local function active() return alive and farm.enabled and runId == myId end
 		local function allowed()
-			return active() and not pickupCircuit.paused and not pickupCircuit.finalized and (not gate or gate()) and not (isBlocked and isBlocked())
+			return active() and not (UNLOAD.voidGuard and UNLOAD.voidGuard.blocked)
+				and not pickupCircuit.paused and not pickupCircuit.finalized and (not gate or gate()) and not (isBlocked and isBlocked())
 				and (os.clock() >= motionPauseUntil)
 		end
 		while active() do
@@ -3243,8 +3246,9 @@ local MACHINE = {
 	Elevator="Map.SpecialFolder.ExitElevator", ElevatorFallback="Elevator", ElevatorHeight=-20,
 	Tick=0.010,Settle=0,PromptRetry=0.075,
 	RescanInterval=0.030,StallTimeout=2.7,UseTimeout=8,NearFinishAt=90,NearFinishHold=20,
-	ClearHold=0.10,ItemWaitMax=24,
-	SkillcheckPause=3, ChaseHold=0.15, DoneValue=100, FuseDwell=0.7,
+	ClearHold=1.0,ItemWaitMax=24,
+	SkillcheckPause=3, ChaseHold=2.5, HideMinSeconds=2.5, HideClearSeconds=1.5,
+	DoneValue=100, FuseDwell=0.7,
 	EmergencyDistance=27,ThreatLead=0.28,ThreatVertical=26,
 	Fuseboxes={
 		"Map.SpecialFolder.Fusebox.Handle.ProximityPrompt",
@@ -4037,6 +4041,7 @@ local function newMachineAutofarm()
 		floorTransitionSnapshot=nil,
 		soundMapRef=workspace:FindFirstChild("Map") }
 	local runId = 0
+	local looseFuses -- forward-declared for door and blackout handlers
 	-- Countdown StopSound has no Parent or player identifier. It is only a hint
 	-- until the watchdog corroborates it with a recent elevator approach.
 	local function resetCountdownSignal()
@@ -4302,7 +4307,12 @@ local function newMachineAutofarm()
 		else
 			return
 		end
-		if not farm.enabled then return end
+		if not farm.enabled then
+			-- Closing door direction is still useful if machine autofarm was
+			-- enabled after the starting door animation.
+			if kind == "door_close" then UNLOAD.lastClosedElevatorPath = doorPath end
+			return
+		end
 		if workspace:FindFirstChild("Map") ~= farm.soundMapRef then
 			farm.soundMapRef = workspace:FindFirstChild("Map")
 			farm.soundDoneTarget,farm.soundDoneUntil = nil,0
@@ -4326,7 +4336,16 @@ local function newMachineAutofarm()
 			local recentlyUsed = target and farm.lastPromptTarget == target
 				and now - (farm.lastPromptAt or -math.huge) <= 3.0
 			local nearDone = target and (getProgress(target) or 0) >= 92
-			if target and machineKind(target) == category and not isComplete(target)
+			if target and machineKind(target) == category and isComplete(target) then
+				-- The progress value got to 100 before this sound packet. This is
+				-- confirmed completion, not an ambiguous/unmatched sound.
+				farm.soundDoneTarget = target
+				farm.soundDoneUntil = now + 1.5
+				UNLOAD.verifiedHandoffUntil = now + 1.5
+				debugEvent("SOUND", "machine_done_confirmed_by_progress", {
+					target=target.Name,category=category,progress=getProgress(target),
+				})
+			elseif target and machineKind(target) == category and not isComplete(target)
 				and (recentlyUsed or nearDone or farm.placed) then
 				farm.soundDoneTarget = target
 				farm.soundDoneUntil = now + 3.0 -- allow replication to catch up
@@ -4402,14 +4421,38 @@ local function newMachineAutofarm()
 				fuseboxesEnabled=OPTIONS.Fuseboxes,priority="fusebox_check",
 			})
 		elseif kind == "door_close" then
-            UNLOAD.lastClosedElevatorPath = doorPath
-            debugEvent("SOUND", "last_closing_elevator_saved", {
-                path=doorPath, nextFuseboxSide=oppositeElevatorPath(doorPath) or "unknown",
-            })
-			-- User-confirmed definitive floor-complete sound. Stop the completed
-			-- floor's fuse and elevator retries immediately; map/new objectives rearm.
+			-- Doors can close at the START of a floor or when Auto Hide uses an
+			-- elevator. Remember the side, but do not conclude an unfinished floor
+			-- is complete just because a door closed (observed in v2.6.47 debug).
+			UNLOAD.lastClosedElevatorPath = doorPath
 			increment("soundElevatorDoorClosing")
-			if not farm.floorTransitionConfirmed then
+			debugEvent("SOUND", "last_closing_elevator_saved", {
+				path=doorPath,nextFuseboxSide=oppositeElevatorPath(doorPath) or "unknown",
+			})
+			local nextUnfinished, objectiveStatus = pickMachine()
+			local readyToExit = (farm.allDoneSince ~= nil or objectiveStatus == "done")
+				and nextUnfinished == nil
+				and not farm.blackoutActive
+				and (not looseFuses or #looseFuses() == 0)
+			local mainCue = now - farm.mainCompletionAt <= 30
+			local bigs = getBigMachines()
+			local bigsCompleted = #bigs > 0
+			for _, mainMachine in ipairs(bigs) do
+				if not isComplete(mainMachine) then bigsCompleted = false break end
+			end
+			-- Some elevators close during hiding or when the next floor starts.
+			-- Require evidence that the MAIN stage finished, not merely an empty
+			-- base-machine folder or a shelter's cached elevator target.
+			local finishing = readyToExit and (mainCue or bigsCompleted)
+				and (farm.finalizing or farm.allDoneSince ~= nil or farm.elevatorTarget ~= nil)
+			if not finishing then
+				increment("doorClosingIgnoredDuringWork")
+				debugEvent("SOUND", "door_closing_not_floor_complete", {
+				status=objectiveStatus,unfinished=nextUnfinished and nextUnfinished.Name or "none",
+				finalizing=farm.finalizing == true,ready=readyToExit,
+				path=doorPath,
+			}, "INFO")
+			elseif not farm.floorTransitionConfirmed then
 				farm.floorTransitionConfirmed = true
 				farm.floorTransitionAt = now
 				farm.floorTransitionSnapshot = snapshotFloorObjectives()
@@ -4419,10 +4462,11 @@ local function newMachineAutofarm()
 				farm.allDoneSince = farm.allDoneSince or now
 				UNLOAD.floorState.seen = true
 				UNLOAD.floorState.finished = true
-				UNLOAD.floorState.completionReason = "elevator_door_closing"
+				UNLOAD.floorState.completionReason = "elevator_door_closing_verified"
 				increment("soundFloorTransitions")
 				debugEvent("SOUND", "floor_completed_door_closing", {
-					phase="transition",stopRetries=true,confirmedBy="ElevatorDoorClosing",
+					phase="transition",stopRetries=true,
+					confirmedBy="door_plus_completed_objectives",
 				})
 			end
 		elseif kind == "countdown_stop" then
@@ -4802,7 +4846,46 @@ local function newMachineAutofarm()
 		if arrived and advancePreference then elevatorPreference = elevatorPreference == 1 and 2 or 1 end
 		return arrived
 	end
-    local looseFuses -- Defined below; shared with the elevator guard.
+	-- Auto Hide is NOT floor completion: pick a supported safe refuge. Never
+	-- commit the final elevator selection or use an ungrounded offset to hide.
+	local function goHideShelter(keepGoing)
+		local root = getPlayerRoot()
+		if not root then return false end
+		local choices = {}
+		for _, path in ipairs({ MACHINE.Elevator, MACHINE.ElevatorFallback }) do
+			local inst = resolveWorkspacePath(path)
+			local pos, platform, detection = elevatorPlatform(inst)
+			if pos and not twistedNear(pos, MACHINE.EmergencyDistance + 8)
+				and UNLOAD.voidGuard.landingOK(pos, "hide") then
+				table.insert(choices, {
+					pos=pos,path=path,platform=platform,detection=detection,
+					distance=(root.Position-pos).Magnitude,
+				})
+			end
+		end
+		table.sort(choices, function(a,b) return a.distance < b.distance end)
+		for _, chosen in ipairs(choices) do
+			if applyElevatorChoice(chosen,keepGoing,true) then
+				debugEvent("HIDE","shelter_reached", {
+					path=chosen.path,distance=string.format("%.1f",chosen.distance),
+				})
+				return true
+			end
+		end
+		-- Last grounded checkpoint is a fallback ONLY when it is on this map,
+		-- physically supported, and outside the immediate enemy radius.
+		local guard = UNLOAD.voidGuard
+		local home = guard and guard.safeCFrame
+		if home and guard.safeMap == workspace:FindFirstChild("Map")
+			and not twistedNear(home.Position, MACHINE.EmergencyDistance + 8)
+			and guard.landingOK(home.Position + Vector3.new(0,1,0),"hide") then
+			return move(home.Position + Vector3.new(0,1,0),keepGoing,"hide")
+		end
+		increment("hideNoShelter")
+		debugThrottled("hide_no_shelter",1.5,"HIDE","no_supported_shelter",{},"WARN")
+		return false
+	end
+    -- looseFuses was forward-declared for the sound and elevator guards.
 	local function finishAtElevator(active, alternative)
         if OPTIONS.Fuseboxes and (farm.blackoutActive or #looseFuses() > 0) then
             debugThrottled("elevator_wait_fuses",1,"FUSE","elevator_blocked_by_fuses",
@@ -5166,7 +5249,7 @@ local function newMachineAutofarm()
 
 	local function loop(myId)
 		local function active() return alive and farm.enabled and runId == myId end
-		local hidden = false
+		-- Hide state is handled explicitly below; no one-frame hidden flag.
 		local lastFire = 0
 		local fireAfter = 0
 		local placedAt = 0
@@ -5320,9 +5403,116 @@ local function newMachineAutofarm()
 			debugStatus.handoffPending = reason .. " from " .. handoffFrom
 			debugEvent("PERF", "handoff_begin", { from=handoffFrom,reason=reason })
 		end
+		local hide = {
+			active=false,since=0,clearSince=nil,lastMove=-math.huge,
+			relocate=false,reason="none",shelterReached=false,
+		}
+		farm.hideState = hide
+		local function beginHide(reason, shouldRelocate, shouldExit)
+			local now = os.clock()
+			if not hide.active then
+				hide.active = true
+				hide.since = now
+				hide.clearSince = nil
+				hide.reason = reason
+				hide.relocate = shouldRelocate
+				hide.shelterReached = false
+				increment("hideStarts")
+				debugEvent("HIDE","entered", { reason=reason,
+					minimum=MACHINE.HideMinSeconds,clear=MACHINE.HideClearSeconds,
+					target=farm.target and farm.target.Name or "none" }, "WARN")
+			elseif shouldRelocate then
+				hide.relocate = true
+				hide.clearSince = nil
+			end
+			local prompt = farm.target and getPrompt(farm.target)
+			if prompt then cancelMachinePromptHold(prompt) end
+			if shouldExit and chase.exitRequestedSerial ~= chase.serial then
+				leaveObjective("auto_hide_" .. reason,true,0)
+				chase.exitRequestedSerial=chase.serial
+			end
+			farm.placed = false
+			lastFire = 0
+			lastPrompt = nil
+			lastProgress = nil
+			usedItem = false
+			chase.holdUntil = math.max(chase.holdUntil,hide.since + MACHINE.HideMinSeconds)
+		end
+		local function handleHide()
+			if not hide.active then return false end
+			local now = os.clock()
+			local root = getPlayerRoot()
+			local unsafeAtRoot = not root or twistedNear(root.Position,MACHINE.EmergencyDistance + 8)
+			local target = farm.target
+			if target and (isComplete(target) or not target:IsDescendantOf(workspace)) then
+				if isComplete(target) then
+					beginHandoff("completed_during_hide",target)
+					noteMachineCompleted(target)
+				end
+				farm.target = nil
+				target = nil
+			end
+			local targetPrompt = target and getPrompt(target)
+			local targetPart = targetPrompt and getPromptPart(targetPrompt,target)
+			local targetUnsafe = targetPart and twistedNear(targetPart.Position,MACHINE.Range)
+			if targetUnsafe and now - hide.since >= 0.6 then
+				local alternative = safeAlternative(target)
+				if alternative then
+					farm.target = alternative
+					target = alternative
+					targetUnsafe = false
+					increment("hideSaferTargets")
+					debugEvent("HIDE","safer_objective_selected",{ name=alternative.Name })
+				end
+			end
+			if hide.relocate or unsafeAtRoot then
+				hide.relocate = true
+				if not root or unsafeAtRoot or not hide.shelterReached then
+					if now - hide.lastMove >= 1.0 then
+						hide.lastMove=now
+						UNLOAD.imminentEvacuationUntil=now+1.25
+						hide.shelterReached=goHideShelter(active)
+						if hide.shelterReached then increment("hideRetreats") end
+					end
+				end
+			end
+			-- Do NOT move back after a fixed 0.15-second timer. Hold until both
+			-- the minimum dwell and a continuous safe window have elapsed.
+			if unsafeAtRoot or targetUnsafe or chase.pending then
+				hide.clearSince = nil
+				increment("hideDangerStays")
+			else
+				hide.clearSince = hide.clearSince or now
+			end
+			local cleared = hide.clearSince and now-hide.clearSince >= MACHINE.HideClearSeconds
+			if cleared and now-hide.since >= MACHINE.HideMinSeconds
+				and now >= chase.holdUntil then
+				hide.active=false
+				chase.eventActive=false
+				chase.threatName=nil
+				farm.placed=false
+				farm.elevatorTarget=nil -- A shelter is NOT the end-of-floor elevator.
+				farm.elevatorSource=nil
+				forceRescan=true
+				increment("hideResumes")
+				debugEvent("HIDE","resuming_objectives",{
+					waitMs=math.floor((now-hide.since)*1000+0.5),
+					target=farm.target and farm.target.Name or "rescan",
+				})
+				return false
+			end
+			increment("hideWaitTicks")
+			return true
+		end
 		farm.placed = false
 		beginHandoff("start", nil)
 		while active() do
+			if UNLOAD.voidGuard and UNLOAD.voidGuard.blocked then
+				debugThrottled("void_motion_frozen",5,"VOID","autofarm_paused_for_safety",
+					{ reason="repeated_or_failed_void_recovery" },"ERROR")
+				task.wait(0.3)
+				continue
+			end
 			if workspace:FindFirstChild("Map") ~= farm.soundMapRef then
 				local transitioned = farm.floorTransitionConfirmed
 				farm.soundMapRef = workspace:FindFirstChild("Map")
@@ -5458,7 +5648,7 @@ local function newMachineAutofarm()
 			if completedTarget then
 				UNLOAD.verifiedHandoffUntil = os.clock() + 1.4
 			end
-			if protected and not completedTarget and not chase.pending
+			if protected and not hide.active and not completedTarget and not chase.pending
 				and not (dangerAtRoot and dangerDistance
 					and dangerDistance <= MACHINE.EmergencyDistance)
 				and os.clock() > (UNLOAD.imminentEvacuationUntil or 0) then
@@ -5470,50 +5660,18 @@ local function newMachineAutofarm()
 				task.wait(MACHINE.Tick)
 				continue
 			end
-			if chase.pending and root and farm.target and farm.placed then
-				local remaining = getProgress(farm.target)
-				if remaining and remaining >= MACHINE.NearFinishAt and remaining < MACHINE.DoneValue then
-					local _, closest = nearestInfected(root.Position)
-					if not chase.eventActive and (not closest or closest > 40)
-						and os.clock() > (UNLOAD.imminentEvacuationUntil or 0) then
-						chase.pending, chase.holdUntil = false, 0
-						motionPauseUntil = 0
-						increment("machineChaseDeferred")
-						debugThrottled("finish_chase_deferred", 3, "MACHINE", "near_finish_chase_held",
-							{ name=farm.target.Name,progress=remaining,nearest=closest or "none" })
-					end
-				end
-			end
 			if chase.pending then
 				chase.pending = false
-				chase.holdUntil = os.clock() + MACHINE.ChaseHold
-				debugLog("chase started: hiding")
-				local currentPrompt = farm.target and getPrompt(farm.target)
-				if currentPrompt then cancelMachinePromptHold(currentPrompt) end
-				farm.placed = false
-				lastFire = 0
-				lastPrompt = nil
-				lastProgress = nil
-				usedItem = false
-				-- Proximity/damage triggered hides do not have a Chase event; send
-				-- the same unconditional exit request for those as well. Chase events
-				-- already queued their own remote above, even during skillchecks.
-				if chase.exitRequestedSerial ~= chase.serial then
-					leaveObjective("auto_hide_chase_escape", true, 0)
-					chase.exitRequestedSerial = chase.serial
-				else
-					-- The exit request was dispatched by the Chase event.
-					-- Travel starts now, without waiting on the network response.
-					local flight = UNLOAD.exitInFlight
-					if flight and flight.finished and not flight.successful then
-						leaveObjective("auto_hide_chase_retry", true, 0)
-					end
-				end
-				if root then
-					hidden = goElevator(false, active)
-				else
-					hidden = false
-				end
+				debugEvent("DANGER","chase_shelter_requested", {
+					target=farm.target and farm.target.Name or "none",
+				},"WARN")
+				-- The Chase listener may already have queued the remote exit. Do
+				-- not queue it twice, but never wait on InvokeServer before escape.
+				beginHide("chase",true,true)
+			end
+			if hide.active and handleHide() then
+				task.wait(0.06)
+				continue
 			end
 			if finished and not farm.elevatorEmergencyLocked then
 				local newObjective, newStatus = scanMachine()
@@ -5572,7 +5730,7 @@ local function newMachineAutofarm()
 			if pending and not farm.placed then
 				local currentPrompt = farm.target and getPrompt(farm.target)
 				if currentPrompt then cancelMachinePromptHold(currentPrompt) end
-				hidden, farm.placed = false, false
+				farm.placed = false
 				lastFire = 0
 				lastPrompt = nil
 				usedItem = false
@@ -5669,61 +5827,38 @@ local function newMachineAutofarm()
 					finished = false
 					local danger, dangerName, dangerDist = twistedNear(part.Position)
 					local progressNow = getProgress(target)
-					if danger and progressNow and progressNow >= MACHINE.NearFinishAt
-						and progressNow < MACHINE.DoneValue and dangerDist and dangerDist > 34 then
-						debugThrottled("near_finish_danger_" .. tostring(target), 4,
-							"MACHINE", "near_finish_danger_held", { name=target.Name,
-							progress=progressNow,enemy=dangerName,distance=dangerDist })
-						danger = false
-					end
-					if danger then
-						clearSince = nil
-					elseif not clearSince then
-						clearSince = os.clock()
-					end
+					-- A danger at the NEXT objective is not evidence that the player
+					-- is being chased. Never spam leave/retreat while already safe.
 					if danger then
 						farm.placed = false
 						cancelMachinePromptHold(prompt)
-						lastFire = 0
-						lastPrompt = nil
-						lastProgress = getProgress(target)
-						usedItem = false
-						if not hidden then
-							increment("machineDangers")
-							debugEvent("DANGER", "machine_threat", { enemy=tostring(dangerName),
-								distance=string.format("%.1f",dangerDist or 0),machine=target.Name }, "WARN")
-							leaveObjective("infected_near_machine", true, 0)
-							-- Escape follows the request; an unreturned response cannot
-							-- indefinitely hold the character near an infected.
-							local alternative = safeAlternative(target)
-							if alternative then
-								beginHandoff("danger_reroute", target)
-								debugLog("switching to " .. alternative.Name)
-								farm.target = alternative
-								emergencyNextMove = true
-							else
-								debugLog("hiding at elevator")
-								hidden = goElevator(false, active)
-							end
+						local nearPlayer = twistedNear(root.Position,MACHINE.EmergencyDistance)
+						local alternative = safeAlternative(target)
+						increment("machineDangers")
+						debugThrottled("danger_target_" .. tostring(target),1.5,
+							"DANGER","unsafe_objective",{
+							name=target.Name,enemy=tostring(dangerName),
+							distance=string.format("%.1f",dangerDist or 0),
+							nearPlayer=nearPlayer == true,
+							alternative=alternative and alternative.Name or "none",
+							},"WARN")
+						if alternative and not nearPlayer then
+							beginHandoff("danger_reroute",target)
+							farm.target = alternative
+							forceRescan=true
+						else
+							-- If the character is safe, hold position; if being chased,
+							-- move to a supported shelter. Neither case teleports back
+							-- until the clear window has been continuously satisfied.
+							beginHide("unsafe_objective",nearPlayer == true,nearPlayer == true)
 						end
-					elseif hidden and os.clock() - clearSince < MACHINE.ClearHold then
+					elseif hide.active then
 						farm.placed = false
 						cancelMachinePromptHold(prompt)
 					elseif os.clock() < chase.holdUntil then
 						farm.placed = false
 						cancelMachinePromptHold(prompt)
-						lastFire = 0
-						lastPrompt = nil
-						usedItem = false
-						if not hidden then
-							if os.clock() - (chase.holdExitAt or -math.huge) > 0.5 then
-								chase.holdExitAt = os.clock()
-								leaveObjective("auto_hide_hold_retry", true, 0)
-							end
-							hidden = goElevator(false, active)
-						end
 					else
-						hidden = false
 						if farm.placed and prompt.Enabled and (root.Position - part.Position).Magnitude > prompt.MaxActivationDistance then
 							farm.placed = false
 						end
@@ -6329,6 +6464,7 @@ local function newMachineAutofarm()
 	function farm.disable()
 		local wasEnabled = farm.enabled
 		farm.enabled = false
+		if farm.hideState then farm.hideState.active = false end
 		farm.soundDoneTarget,farm.soundDoneUntil = nil,0
 		farm.mainReadyUntil,farm.elevatorDoorOpenUntil = 0,0
 		resetFlushSignals()
@@ -6351,10 +6487,9 @@ local function newMachineAutofarm()
 			if protected then
 				debugEvent("MACHINE", "disable_exit_deferred_skillcheck", { ui=checkType }, "INFO")
 			else
-				leaveObjective("machine_autofarm_disabled", true)
-				if OPTIONS.AutoElevator then
-					goElevator(true, function() return alive and not farm.enabled end)
-				end
+				leaveObjective("machine_autofarm_disabled", true, 0)
+				-- Disabling automation must not teleport the character to a random
+				-- elevator, especially when an incomplete objective remains.
 			end
 		end
 	end
@@ -6920,11 +7055,11 @@ local function debugReport()
 		"AbilityConfig: " .. fieldString(ABILITY),
 		"Death export=automatic when observed health <= 0 (once per life)",
 		"Handoff timing=objective completion/unavailable to first immediate prompt dispatch; progression wakeup is value event-driven",
-		"Sound cues=MainMachineFillingUp means base done; MainMachineCompleted means main done; Flush is secondary; Fuses starts blackout; ElevatorCountdown StopSound is early hint; ElevatorDoorClosing confirms floor completion",
+		"Sound cues=MainMachineFillingUp means base done; MainMachineCompleted means main done; Flush secondary; Fuses blackout; Countdown StopSound early hint; DoorClosing final only when all objectives complete",
 		"Elevator choice=after final machines use ElevatorDoor Parent ancestry; blackout box=opposite of last closed elevator door; 2s geometry fallback for actual elevator",
         "Blackout=fuse objects under workspace.Items collected separately before chosen fusebox; Item Autofarm ignores Fuse",
 		"Threat detection=nearest active moving core + short approaching-velocity prediction + vertical separation + explicit chase event",
-		"Auto Hide transitions=asynchronous exit request, immediate emergency teleport, 0.15s minimum chase hold, 0.10s clear debounce",
+		"Auto Hide transitions=asynchronous exit request, grounded shelter when needed, >=2.5s dwell plus >=1.5s continuously clear before objective return",
 		"Session objective target=1000 machine completions in a single 0-HP-free streak; GOAL.Streak resets to zero on death",
 		"FloorState: " .. fieldString({ observed=UNLOAD.floorState.seen,
 			completed=UNLOAD.floorState.completed,finished=UNLOAD.floorState.finished,
@@ -6936,6 +7071,12 @@ local function debugReport()
 		"Stats: " .. fieldString(debugStats),
 		"Goal: " .. fieldString(GOAL),
 		"Status: " .. fieldString(debugStatus),
+		"AutoHideState: " .. fieldString(machineFarm and machineFarm.hideState and {
+			active=machineFarm.hideState.active,reason=machineFarm.hideState.reason,
+			seconds=machineFarm.hideState.active and
+				string.format("%.2f",os.clock()-machineFarm.hideState.since) or "0",
+			shelterReached=machineFarm.hideState.shelterReached,
+		} or { active=false }),
 		string.format("Performance: firstObjectiveMs=%d handoffs=%d averageMs=%.1f maxMs=%d lastMs=%d slowScans=%d cacheRefreshes=%d cacheHits=%d",
 			debugStats.firstObjectiveMs,debugStats.handoffs,
 			debugStats.handoffs > 0 and debugStats.handoffTotalMs / debugStats.handoffs or 0,
