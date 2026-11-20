@@ -63,12 +63,12 @@ function UNLOAD.request(source)
 end
 
 local OPTIONS = {
-	AutoHide=true, AutoElevator=true,
-	Fuseboxes=true,
+	AutoHide=false, AutoElevator=false,
+	Fuseboxes=false,
 	MovementMode="Teleport",TweenDepth=-15,Disable3DRendering=false,
 }
 
-local BUILD = "TU Rava Hub v2.6.45-R1"
+local BUILD = "TU Rava Hub v2.6.43"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -157,10 +157,6 @@ local debugStats = {
 	soundBlackout=0,soundBlackoutDispatches=0,soundBlackoutDeferred=0,
 	soundWakeups=0,soundHandoffs=0,soundIgnored=0,
 }
--- Tracks the user's actual goal: 1,000 machine completions without reaching 0 HP.
--- Total machine completions remain separate because a cumulative count would
--- not demonstrate a deathless streak.
-local GOAL = { Target=1000, Streak=0, Best=0, Deaths=0, Achieved=false }
 local debugStatus = { action="Ready",lastWarning="None",currentTarget="None",
 	lastHit="None",lastHandoff="None",handoffPending="None" }
 local function increment(metric, amount)
@@ -300,7 +296,6 @@ UNLOAD.fallbackReport = function()
 		"PlaceId=" .. tostring(game.PlaceId) .. " JobId=" .. tostring(game.JobId),
 		"FullDiagnostics=" .. tostring(UNLOAD.fullDiagnostics),
 		"Stats: " .. fieldString(debugStats),
-		"Goal: " .. fieldString(GOAL),
 		"Status: " .. fieldString(debugStatus),
 		"---- EVENTS ----",
 	}
@@ -795,10 +790,10 @@ local diagnosticsDock = new("Frame", {
 }, main)
 new("Frame", { Size=UDim2.new(1,-20,0,1),Position=UDim2.fromOffset(10,2),
     BackgroundColor3=UI.soft,BorderSizePixel=0,ZIndex=3 }, diagnosticsDock)
-local pages, menuButtons, activeTab = {}, {}, "AFK"
+local pages, menuButtons, activeTab = {}, {}, "Main"
 local toggleRefreshers = {}
-local TAB_ORDER = { "AFK","Manual","Diagnostics" }
-local TAB_SYMBOL = { AFK="◆",Manual="◉",Diagnostics="≡" }
+local TAB_ORDER = { "Main","Autofarm","Machines","ESP","Diagnostics" }
+local TAB_SYMBOL = { Main="⌂",Autofarm="◆",Machines="▣",ESP="◉",Diagnostics="≡" }
 local function showTab(name)
 	activeTab = name
 	for _, refresh in ipairs(toggleRefreshers) do refresh() end
@@ -827,6 +822,17 @@ for index, name in ipairs(TAB_ORDER) do
         debugEvent("UI", "open_tab", { tab=name,access=diagnostic and "dock" or "sidebar" })
     end))
 end
+local diagnosticsQuick = new("TextButton", {
+    Name="DiagnosticsQuickAccess",Text="LOGS",
+    Position=UDim2.fromOffset(259,16),Size=UDim2.fromOffset(72,31),
+    Font=Enum.Font.GothamBold,TextSize=12,TextColor3=UI.text,
+    BackgroundColor3=UI.surface2,BorderSizePixel=0,
+}, top)
+corner(diagnosticsQuick, 8)
+track(diagnosticsQuick.Activated:Connect(function()
+    showTab("Diagnostics")
+    debugEvent("UI", "open_tab", { tab="Diagnostics",access="header" })
+end))
 local function createSection(name)
 	local page = new("ScrollingFrame", {
 		Name=name .. "Page",Position=UDim2.fromOffset(0,0),Size=UDim2.fromScale(1,1),
@@ -890,21 +896,8 @@ local function createSubcategory(page, heading, order, initiallyOpen)
 	return body
 end
 
-pages.AFK = createSection("AFK")
-pages.Manual = createSection("Manual")
+pages.Main = createSection("Main")
 pages.Diagnostics = createSection("Diagnostics")
-uiText(pages.AFK, "Runs unattended: objectives, survival, pickups, and floor transitions.",
-    12, false, UI.muted, { LayoutOrder=-1,Size=UDim2.new(1,-12,0,34),TextWrapped=true })
-uiText(pages.Manual, "Use while playing: ESP, camera, rendering, and movement settings.",
-    12, false, UI.muted, { LayoutOrder=-1,Size=UDim2.new(1,-12,0,34),TextWrapped=true })
-local goalCard = new("Frame", { Name="DeathlessGoal",LayoutOrder=0,
-    Size=UDim2.new(1,-9,0,72),BackgroundColor3=UI.surface2,BorderSizePixel=0 }, pages.AFK)
-corner(goalCard, 10)
-uiStroke(goalCard)
-uiText(goalCard, "DEATHLESS MACHINE CHALLENGE", 12, true, UI.text, {
-    Position=UDim2.fromOffset(12,8),Size=UDim2.new(1,-24,0,22) })
-local afkGoalLabel = uiText(goalCard, "0 / 1000 machines  |  0 deaths  |  Best 0", 13, true, UI.good, {
-    Position=UDim2.fromOffset(12,34),Size=UDim2.new(1,-24,0,26) })
 uiText(pages.Diagnostics, "Initializing Diagnostics…",
 	12, false, UI.muted, {
 		Name="DiagnosticsStartupNotice",LayoutOrder=1,
@@ -1803,11 +1796,10 @@ track(workspace.ChildAdded:Connect(function(instance)
 	end
 end))
 
-UNLOAD.pickupBefore = { completed=false,started=nil,active=false,mapRef=workspace:FindFirstChild("Map") }
+UNLOAD.pickupBefore = { completed=false,started=nil,mapRef=workspace:FindFirstChild("Map") }
 function UNLOAD.pickupBefore.reset(reason)
 	UNLOAD.pickupBefore.completed = false
 	UNLOAD.pickupBefore.started = nil
-	UNLOAD.pickupBefore.active = false
 	UNLOAD.pickupBefore.mapRef = workspace:FindFirstChild("Map")
 	pickupCircuit.reset(reason)
 	debugEvent("PICKUP", "before_phase_reset", { reason=reason })
@@ -1986,10 +1978,8 @@ do
     end)
     task.spawn(function()
         while alive do
-            local hasSnakes = false
             for snake,record in pairs(snakes) do
                 if snake:IsDescendantOf(workspace) then
-                    hasSnakes = true
                     local ok,err=pcall(updateSnake,snake,record)
                     if not ok then
                         debugThrottled("snake_update_error",3,"SNAKES","guard_update_error",
@@ -1999,7 +1989,7 @@ do
                     removeSnake(snake)
                 end
             end
-            task.wait(hasSnakes and SETTINGS.Refresh or 0.4)
+            task.wait(SETTINGS.Refresh)
         end
     end)
 
@@ -2065,9 +2055,6 @@ local function pickupThreatSnapshot(force)
                     or (enemy:FindFirstChild("HumanoidRootPart", true)
                         or enemy.PrimaryPart or enemy:FindFirstChild("Head", true)
                         or enemy:FindFirstChildWhichIsA("BasePart", true))
-                if core and not core:IsA("BasePart") then
-                    core = enemy:FindFirstChildWhichIsA("BasePart",true)
-                end
                 if core then
                     table.insert(entries, { object=enemy,core=core,
                         position=core.Position,velocity=core.AssemblyLinearVelocity,
@@ -2507,12 +2494,6 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 		if farm.enabled then return end
 		farm.enabled = true
 		pickupCoordinator.enabledCount += 1
-		if isBlocked and isBlocked() then
-			debugEvent("PICKUP", "enabled_deferred_until_pickup_window", {
-				source=type(folderName) == "table" and table.concat(folderName, ",") or folderName,
-				machineBusy=true,
-			})
-		end
 		runId += 1
 		local myId = runId
 		supervise("item autofarm", function()
@@ -2543,10 +2524,9 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 end
 
 do
-local espBody = pages.Manual
-local espWorld = createSubcategory(espBody, "ESP - COLLECTIBLES & OBJECTIVES", 1)
-local espThreats = createSubcategory(espBody, "ESP - INFECTED TRACKING", 2, true)
-UNLOAD.manualThreatSection = espThreats
+local espBody = createSection("ESP", 1)
+local espWorld = createSubcategory(espBody, "COLLECTIBLES & OBJECTIVES", 1)
+local espThreats = createSubcategory(espBody, "INFECTED TRACKING", 2, true)
 for i, config in ipairs(ESP_CONFIGS) do
 	local parent = (config.Name == "Infected ESP") and espThreats or espWorld
 	createToggleRow(parent, config.Name, i, newESP(config))
@@ -2556,7 +2536,7 @@ end
 
 local TRASH_ITEMS = { Coffee=true,Socks=true,Waffle=true,["Pristine Boots"]=true }
 local HEALTH_ITEMS = { Bandaid=true,Medkit=true,["Pristine Medkit"]=true }
-local ITEM_OPTIONS = { Trash=false,Health=false,AutoTrashUse=true }
+local ITEM_OPTIONS = { Trash=false,Health=false,AutoTrashUse=false }
 
 local function getHealth()
 	local aliveFolder = workspace:FindFirstChild("Alive")
@@ -2959,19 +2939,9 @@ local function collectOpen()
 end
 
 local function machineBusy()
-	if not (machineFarm and machineFarm.enabled) then return false end
-	-- When the machine worker deliberately yields for the per-floor pickup phase,
-	-- an already-selected (but not yet placed) target cannot block every collector.
-	-- Never override an actively held machine, transition, blackout, or emergency move.
-	if UNLOAD.pickupBefore.active and not machineFarm.placed
-		and not machineFarm.moving and not machineFarm.finalizing
-		and not machineFarm.elevatorTransit and not machineFarm.blackoutActive
-		and not chase.pending then
-		return false
-	end
-	return machineFarm.target ~= nil or machineFarm.placed == true
-		or machineFarm.moving == true or machineFarm.finalizing == true
-		or machineFarm.elevatorTransit == true or machineFarm.blackoutActive == true
+	return machineFarm ~= nil and machineFarm.enabled == true and
+		(machineFarm.target ~= nil or machineFarm.placed == true or machineFarm.moving == true
+			or machineFarm.finalizing == true)
 end
 
 local capsuleFarm = newAutofarm({ "Capsules","Map.InfectedSamples" }, collectOpen, nil, false, machineBusy)
@@ -3049,23 +3019,22 @@ local function newOption(options, key, onChange)
 end
 
 do
-local farmBody = pages.AFK
-local farmActions = createSubcategory(farmBody, "AUTOMATIC ITEM & ABILITY USE", 7, true)
+local farmBody = createSection("Autofarm", 2)
+local farmActions = createSubcategory(farmBody, "AUTOMATIC ACTIONS", 1, true)
 createToggleRow(farmActions, "Auto Use Ability", 1, autoAbility)
 createToggleRow(farmActions, "Auto Use Items", 3, autoUse)
 UNLOAD.trashUseToggle = newOption(ITEM_OPTIONS, "AutoTrashUse")
 createToggleRow(farmActions, "Auto Use Trash Items", 4, UNLOAD.trashUseToggle)
 
-local farmPickups = createSubcategory(farmBody, "PICKUP AUTOFARMS", 5, true)
+local farmPickups = createSubcategory(farmBody, "PICKUP ROUTES", 2, true)
 createToggleRow(farmPickups, "Capsule Autofarm", 1, capsuleFarm)
 createToggleRow(farmPickups, "Item Autofarm", 2, itemFarm)
 createToggleRow(farmPickups, "Candy Autofarm", 3, candyFarm)
-local farmFilters = createSubcategory(farmBody, "PICKUP FILTERS", 6, false)
+local farmFilters = createSubcategory(farmBody, "COLLECTION FILTERS", 3, true)
 createToggleRow(farmFilters, "Pick Up Trash Items", 1, newOption(ITEM_OPTIONS, "Trash"))
 createToggleRow(farmFilters, "Pick Up Health Items", 2, newOption(ITEM_OPTIONS, "Health"))
 
-autoUse.enable()
-autoAbility.enable()
+-- All optional actions begin disabled; Auto Skillcheck starts enabled separately.
 for _, refresh in ipairs(toggleRefreshers) do refresh() end
 
 end
@@ -3108,9 +3077,7 @@ local function selenaPosition(unit)
 	if unit:IsA("BasePart") then return unit.Position end
 	local part = unit.PrimaryPart or unit:FindFirstChild("Head", true)
 		or unit:FindFirstChild("HumanoidRootPart", true)
-	if not (part and part:IsA("BasePart")) then
-		part = unit:FindFirstChildWhichIsA("BasePart",true)
-	end
+		or unit:FindFirstChildWhichIsA("BasePart", true)
 	return part and part.Position or nil
 end
 
@@ -3210,11 +3177,9 @@ end
 local function threatCore(unit)
 	if unit:IsA("BasePart") then return unit end
 	if unit:IsA("Model") then
-		local candidate = unit:FindFirstChild("HumanoidRootPart", true)
-		if candidate and candidate:IsA("BasePart") then return candidate end
-		candidate = unit.PrimaryPart or unit:FindFirstChild("Head", true)
-		if candidate and candidate:IsA("BasePart") then return candidate end
-		return unit:FindFirstChildWhichIsA("BasePart", true)
+		return unit:FindFirstChild("HumanoidRootPart", true)
+			or unit.PrimaryPart or unit:FindFirstChild("Head", true)
+			or unit:FindFirstChildWhichIsA("BasePart", true)
 	end
 	return nil
 end
@@ -3301,13 +3266,6 @@ local function exportOnDeath(reason, hp)
 	if deathExport.handled or not alive then return end
 	deathExport.handled = true
 	increment("deathExports")
-	GOAL.Best = math.max(GOAL.Best, GOAL.Streak)
-	GOAL.Deaths += 1
-	debugEvent("GOAL", "deathless_streak_broken", {
-		completed=GOAL.Streak,best=GOAL.Best,deaths=GOAL.Deaths,target=GOAL.Target,
-		trigger=reason,health=hp,
-	}, "ERROR")
-	GOAL.Streak = 0
 	debugEvent("HITS", "health_zero", { trigger=reason,health=hp,life=deathExport.life }, "ERROR")
 	task.defer(function()
 		if not alive then return end
@@ -4546,11 +4504,7 @@ local function newMachineAutofarm()
 			if (here-start).Magnitude > 12 then break end -- possible server transition
 			local nextPos = here + dir * 1.65
 			if supported(nextPos) then
-				local ok = pcall(function()
-					root.AssemblyLinearVelocity = Vector3.zero
-					root.AssemblyAngularVelocity = Vector3.zero
-					root.CFrame = CFrame.new(nextPos) * (root.CFrame - root.Position)
-				end)
+				local ok = pcall(function() humanoid:MoveTo(nextPos) end)
 				if ok then
 					steps += 1
 					task.wait(0.18)
@@ -4559,12 +4513,13 @@ local function newMachineAutofarm()
 				end
 			end
 		end
+		pcall(function() humanoid:Move(Vector3.zero, false) end)
 		farm.elevatorEntryTouched = steps > 0
 		increment("elevatorContactWalkSteps",steps)
 		if moved > 0.15 then increment("elevatorContactWalkMoved") end
 		increment("elevatorEntryMoves")
 		if moved > 0.15 then increment("elevatorEntryMoved") end
-		debugEvent("MACHINE", "elevator_entry_teleport_steps", {
+		debugEvent("MACHINE", "elevator_entry_walk", {
 			attempt=farm.elevatorEntryAttempts,steps=steps,
 			moved=string.format("%.2f",moved),platform=geometry,
 			source=farm.elevatorSource or "none",
@@ -5074,28 +5029,14 @@ local function newMachineAutofarm()
 			if abilityTriggeredFor[machine] then return end
 			abilityTriggeredFor[machine] = true
 			increment("machineCompletions")
-			-- Keep total completions for diagnostics, but never count a completion
-			-- toward the deathless goal while the current life is at 0 HP.
-			if not deathExport.handled and (healthMonitor.old == nil or healthMonitor.old > 0) then
-				GOAL.Streak += 1
-				GOAL.Best = math.max(GOAL.Best, GOAL.Streak)
-				if GOAL.Streak >= GOAL.Target and not GOAL.Achieved then
-					GOAL.Achieved = true
-					debugEvent("GOAL", "target_reached_without_death", {
-						streak=GOAL.Streak,target=GOAL.Target,deaths=GOAL.Deaths,
-					})
-				end
-			else
-				debugEvent("GOAL", "completion_ignored_at_zero_health", { name=machine.Name }, "WARN")
-			end
 			local state = UNLOAD.floorState
 			state.seen = true
 			state.completed += 1
 			state.lastCompletion = os.clock()
-			if GOAL.Streak > 0 and GOAL.Streak % 100 == 0 then
+			if debugStats.machineCompletions % 100 == 0 then
 				increment("survivalMilestones")
-				debugEvent("GOAL", "deathless_streak_milestone", {
-					streak=GOAL.Streak,best=GOAL.Best,target=GOAL.Target,
+				debugEvent("GOAL", "session_objective_milestone", {
+					completed=debugStats.machineCompletions,target=1000,
 				})
 			end
 			debugEvent("MACHINE", "completed", {
@@ -5120,19 +5061,7 @@ local function newMachineAutofarm()
 		while active() do
 			if workspace:FindFirstChild("Map") ~= farm.soundMapRef then
 				local transitioned = farm.floorTransitionConfirmed
-				local newMap = workspace:FindFirstChild("Map")
-				farm.soundMapRef = newMap
-				-- The workspace ChildAdded listener may already have reset the global
-				-- phase; synchronize the worker-local flag either way.
-				if UNLOAD.pickupBefore.mapRef ~= newMap then
-					UNLOAD.pickupBefore.reset("machine_new_map")
-				end
-				startupPickupsDone = UNLOAD.pickupBefore.completed
-				waitStart = nil
-				finished = false
-				farm.placed = false
-				farm.target = nil
-				clearTargetWatch()
+				farm.soundMapRef = workspace:FindFirstChild("Map")
 				farm.soundDoneTarget,farm.soundDoneUntil = nil,0
 				farm.mainReadyUntil,farm.elevatorDoorOpenUntil = 0,0
 				resetFlushSignals()
@@ -5331,16 +5260,6 @@ local function newMachineAutofarm()
 				if availableObjective or objectiveStatus == "wait" then
 					local now = os.clock()
 					UNLOAD.pickupBefore.started = UNLOAD.pickupBefore.started or now
-					if not UNLOAD.pickupBefore.active then
-						UNLOAD.pickupBefore.active = true
-						increment("pickupWindowsOpened")
-						debugEvent("PICKUP", "pickup_window_open", {
-							capsules=capsuleFarm.enabled,items=itemFarm.enabled,
-							candy=candyFarm.enabled,
-							machineTarget=farm.target and farm.target.Name or "none",
-							limitSeconds=MACHINE.ItemWaitMax,
-						})
-					end
 					if not waitStart then
 						waitStart = UNLOAD.pickupBefore.started
 						increment("pickupBeforeWaits")
@@ -5350,9 +5269,7 @@ local function newMachineAutofarm()
 					local snapshot = scanFinalPickups()
 					local collectorWorking = pickupBusy() or pickupCoordinator.owner ~= nil
 					local safePending = snapshot.safe > 0 or collectorWorking
-					-- Give the freshly replicated pickup folders a short opportunity
-					-- to expose prompts before declaring the floor empty.
-					local spawnGrace = elapsed < 1.8
+					local spawnGrace = elapsed < 0.7
 					local expired = elapsed >= MACHINE.ItemWaitMax
 					local stalled = elapsed > pickupCircuit.MaxStallSeconds
 						and debugStats.pickupAttempts > 0
@@ -5361,7 +5278,6 @@ local function newMachineAutofarm()
 						pending = true
 					else
 						UNLOAD.pickupBefore.completed = true
-						UNLOAD.pickupBefore.active = false
 						startupPickupsDone = true
 						pickupCoordinator.home = nil
 						if activeMotion and activeMotion.owner == "pickup" then cancelMotion("pickup") end
@@ -5378,7 +5294,6 @@ local function newMachineAutofarm()
 			end
 			if not anyPickup and not UNLOAD.pickupBefore.completed then
 				UNLOAD.pickupBefore.completed = true
-				UNLOAD.pickupBefore.active = false
 				startupPickupsDone = true
 			end
 			if pending and not farm.placed then
@@ -5605,7 +5520,6 @@ local function newMachineAutofarm()
 							farm.placed = true
 							startupPickupsDone = true
 							UNLOAD.pickupBefore.completed = true
-							UNLOAD.pickupBefore.active = false
 							moved = true
 							placedAt = os.clock()
 							increment("machinePlacements")
@@ -5732,7 +5646,6 @@ local function newMachineAutofarm()
 						if not verifyTarget and UNLOAD.floorStatus(verifyTarget, verifyStatus) then
 							finished = true
 							UNLOAD.pickupBefore.completed = true
-							UNLOAD.pickupBefore.active = false
 							pickupCircuit.finalized = true
 							pickupCoordinator.home = nil
 							pickupCoordinator.owner = nil
@@ -6484,18 +6397,18 @@ autoSkillcheck.enable()
 
 machineFarm = newMachineAutofarm()
 
--- This UI/diagnostics initialization is isolated in its own function frame.
--- Luau limits the number of simultaneously active local registers in one
--- function to 200; adding all GUI controls to the long top-level chunk
--- exceeded that limit at refreshMovementMode in v2.6.44.
--- The new function captures preexisting state through normal Lua upvalues.
-UNLOAD.finishInitialization = function()
-
 do
-local mainBody = pages.AFK
-local mainControl = createSubcategory(mainBody, "AFK START / STOP", 1, true)
-local farmFeatures = { capsuleFarm,itemFarm,candyFarm,machineFarm,
-	autoSkillcheck,autoUse,autoAbility,UNLOAD.trashUseToggle }
+local mainBody = pages.Main
+local mainControl = createSubcategory(mainBody, "AUTOFARM", 1, true)
+-- Master controls the four farms plus the requested supporting automations.
+-- Enable safety/flow helpers before the machine worker starts moving.
+UNLOAD.autoHideToggle = newOption(OPTIONS, "AutoHide")
+UNLOAD.autoElevatorToggle = newOption(OPTIONS, "AutoElevator")
+UNLOAD.fuseboxToggle = newOption(OPTIONS, "Fuseboxes")
+local farmFeatures = {
+	UNLOAD.autoHideToggle, UNLOAD.autoElevatorToggle, UNLOAD.fuseboxToggle,
+	autoUse, capsuleFarm, itemFarm, candyFarm, machineFarm,
+}
 local master = { enabled=false }
 local function allEnabled()
 	for _, feature in ipairs(farmFeatures) do
@@ -6512,7 +6425,9 @@ function master.enable()
 	debugEvent("MAIN", "autofarm_enabled", { allEnabled=master.enabled })
 end
 function master.disable()
-	for _, feature in ipairs(farmFeatures) do
+	-- Stop machine movement before turning off Auto Hide and exit helpers.
+	for i = #farmFeatures, 1, -1 do
+		local feature = farmFeatures[i]
 		if feature.enabled then feature.disable() end
 	end
 	master.enabled = false
@@ -6523,16 +6438,16 @@ local function refreshMaster()
 	master.enabled = allEnabled()
 end
 table.insert(toggleRefreshers, refreshMaster)
-createToggleRow(mainControl, "Master Autofarm", 1, master, "One-click control for all core autofarms")
+createToggleRow(mainControl, "Master Autofarm", 1, master)
 end
 
 do
-local machinesBody = pages.AFK
-local machineCore = createSubcategory(machinesBody, "MACHINE & SKILLCHECK AUTOFARM", 2, true)
+local machinesBody = createSection("Machines", 3)
+local machineCore = createSubcategory(machinesBody, "OBJECTIVE AUTOMATION", 1, true)
 createToggleRow(machineCore, "Machine Autofarm", 1, machineFarm)
 createToggleRow(machineCore, "Auto Skillcheck", 2, autoSkillcheck)
 
-local machineMovement = createSubcategory(pages.Manual, "MOVEMENT SETTINGS", 3, true)
+local machineMovement = createSubcategory(machinesBody, "MOVEMENT", 2, true)
 local modeRow = new("Frame", { LayoutOrder=1,Size=UDim2.new(1,-9,0,43),
 	BackgroundColor3=UI.surface,BorderSizePixel=0 }, machineMovement)
 corner(modeRow, 9)
@@ -6631,19 +6546,19 @@ end))
 table.insert(toggleRefreshers, refreshMovementMode)
 refreshMovementMode()
 
-local machineSafety = createSubcategory(machinesBody, "SURVIVAL & AUTO HIDE", 3, true)
-createToggleRow(machineSafety, "Auto Hide", 1, newOption(OPTIONS, "AutoHide"))
-createToggleRow(UNLOAD.manualThreatSection, "Look At Selena", 3, UNLOAD.selenaLook)
-createInputRow(machineSafety, "Danger range (studs)", 2, function(value)
+local machineSafety = createSubcategory(machinesBody, "SAFETY & THREATS", 3, true)
+createToggleRow(machineSafety, "Auto Hide", 1, UNLOAD.autoHideToggle)
+createToggleRow(machineSafety, "Look At Selena", 2, UNLOAD.selenaLook)
+createInputRow(machineSafety, "Danger range (studs)", 3, function(value)
 	if value and value > 0 and value < 2000 then MACHINE.Range = value end
 	return MACHINE.Range
 end)
 
-local machineFlow = createSubcategory(machinesBody, "BLACKOUT & ELEVATOR AUTOMATION", 4, true)
-createToggleRow(machineFlow, "Auto Elevator", 1, newOption(OPTIONS, "AutoElevator"))
-createToggleRow(machineFlow, "Fusebox Check", 2, newOption(OPTIONS, "Fuseboxes"))
+local machineFlow = createSubcategory(machinesBody, "EXIT & PRIORITIES", 4, true)
+createToggleRow(machineFlow, "Auto Elevator", 1, UNLOAD.autoElevatorToggle)
+createToggleRow(machineFlow, "Fusebox Check", 2, UNLOAD.fuseboxToggle)
 
-local machinePerformance = createSubcategory(pages.Manual, "VISUAL PERFORMANCE", 4, true)
+local machinePerformance = createSubcategory(machinesBody, "PERFORMANCE", 5, true)
 createToggleRow(machinePerformance, "Disable 3D Rendering", 1, UNLOAD.render3d)
 end
 
@@ -6711,7 +6626,6 @@ local function debugReport()
 			os.clock() - debugStart,tostring(game.PlaceId),tostring(game.JobId)),
 		"Mode=" .. OPTIONS.MovementMode .. " underMapDepth=" .. tostring(OPTIONS.TweenDepth),
 		"Movement policy=instant objective handoffs and Auto Hide; routine pickups/finish routes use selected mode",
-		"UI layout=Manual (ESP, view, movement), AFK (machine automation, survival, pickups, blackout, automatic item use), Diagnostics",
 		"Movement priority=instant objective handoffs/Auto Hide; routine pickups follow movement selection; prompt spam stays at 16/s",
 		"LOS=disabled only for prompts; pickup routing uses monster-to-pickup raycasts (client-side estimates)",
 		"Hit attribution=nearest infected only (not confirmed attacker)",
@@ -6735,7 +6649,7 @@ local function debugReport()
         "Blackout=fuse objects under workspace.Items collected separately before chosen fusebox; Item Autofarm ignores Fuse",
 		"Threat detection=nearest active moving core + short approaching-velocity prediction + vertical separation + explicit chase event",
 		"Auto Hide transitions=asynchronous exit request, immediate emergency teleport, 0.15s minimum chase hold, 0.10s clear debounce",
-		"Session objective target=1000 machine completions in a single 0-HP-free streak; GOAL.Streak resets to zero on death",
+		"Session objective target=1000 completed without death is a goal, not a guaranteed outcome",
 		"FloorState: " .. fieldString({ observed=UNLOAD.floorState.seen,
 			completed=UNLOAD.floorState.completed,finished=UNLOAD.floorState.finished,
 			reason=UNLOAD.floorState.completionReason }),
@@ -6744,7 +6658,6 @@ local function debugReport()
 			tostring(pcall(function() return game:GetService("VirtualInputManager") end)),
 			tostring(typeof(setclipboard) == "function"),tostring(typeof(writefile) == "function")),
 		"Stats: " .. fieldString(debugStats),
-		"Goal: " .. fieldString(GOAL),
 		"Status: " .. fieldString(debugStatus),
 		string.format("Performance: firstObjectiveMs=%d handoffs=%d averageMs=%.1f maxMs=%d lastMs=%d slowScans=%d cacheRefreshes=%d cacheHits=%d",
 			debugStats.firstObjectiveMs,debugStats.handoffs,
@@ -6762,7 +6675,6 @@ local function debugReport()
 			debugStats.underMapGuardBlocks,debugStats.pickupTweenDistance),
 		"PickupTiming=Before; 0.14s teleport / 0.11s tween pickup-only interruptible gaps",
 		"PickupPhase: " .. fieldString({ completed=UNLOAD.pickupBefore.completed,
-			active=UNLOAD.pickupBefore.active,
 			started=UNLOAD.pickupBefore.started ~= nil,mapLoaded=UNLOAD.pickupBefore.mapRef ~= nil }),
 		"PickupGuard: " .. fieldString({ paused=pickupCircuit.paused,finalized=pickupCircuit.finalized,
 			contactRetries=debugStats.pickupContactRetries,contactRecovered=debugStats.pickupContactRecovered,
@@ -6835,20 +6747,14 @@ end))
 supervise("diagnostic UI", function() return alive end, function()
 	while alive do
 		if main.Visible then for _, refresh in ipairs(toggleRefreshers) do refresh() end end
-		if main.Visible then
-			local working = (machineFarm.enabled and "MACHINE") or (pickupBusy() and "PICKUPS") or "IDLE"
-			headerStatus.Text = working .. "  •  v2.6.45"
-			headerStatus.TextColor3 = working == "IDLE" and UI.muted or UI.good
-			footerLabel.Text = string.format("%s   •   %s   •   %d moves", BUILD, OPTIONS.MovementMode,
-				debugStats.teleports + debugStats.underMapTweens)
-			afkGoalLabel.Text = string.format("%d / %d machines  |  %d deaths  |  Best %d",
-				GOAL.Streak,GOAL.Target,GOAL.Deaths,GOAL.Best)
-			afkGoalLabel.TextColor3 = GOAL.Achieved and UI.good or GOAL.Deaths > 0 and UI.bad or UI.text
-		end
+		local working = (machineFarm.enabled and "MACHINE") or (pickupBusy() and "PICKUPS") or "IDLE"
+		headerStatus.Text = working .. "  •  v2.6.43"
+		headerStatus.TextColor3 = working == "IDLE" and UI.muted or UI.good
+		footerLabel.Text = string.format("%s   •   %s   •   %d moves", BUILD, OPTIONS.MovementMode,
+			debugStats.teleports + debugStats.underMapTweens)
 		if activeTab == "Diagnostics" and main.Visible then
-			stateLabel.Text = string.format("DEATHLESS: %d/%d  |  Best %d  |  0 HP: %d",
-				GOAL.Streak,GOAL.Target,GOAL.Best,GOAL.Deaths)
-			statsLabel.Text = string.format("Hits %d  |  Damage %.1f  |  Handoffs %d (avg %.0fms)\nTeleports %d  |  Pickups %d/%d  |  ESP %d active\nMachines %d total  |  Stalls %d  |  Errors %d\nSounds oil %d  |  computer %d  |  base %d  |  mainDone %d  |  blackout %d\nFlush %d  |  door %d  |  closing %d  |  countdown %d\nAbilities %d  |  Trash inputs %d  |  Death logs %d",
+			stateLabel.Text = "Target: " .. debugStatus.currentTarget .. "  |  Last handoff: " .. tostring(debugStats.handoffLastMs) .. "ms"
+			statsLabel.Text = string.format("Hits %d  |  Damage %.1f  |  Handoffs %d (avg %.0fms)\nTeleports %d  |  Pickups %d/%d  |  ESP %d active\nMachines %d done  |  Stalls %d  |  Errors %d\nSounds oil %d  |  computer %d  |  base %d  |  mainDone %d  |  blackout %d\nFlush %d  |  door %d  |  closing %d  |  countdown %d\nAbilities %d  |  Trash inputs %d  |  Death logs %d",
 				debugStats.hits, debugStats.totalDamage, debugStats.handoffs,
 				debugStats.handoffs > 0 and debugStats.handoffTotalMs / debugStats.handoffs or 0,
 				debugStats.teleports, debugStats.pickupConfirmed, debugStats.pickupAttempts,
@@ -6875,16 +6781,15 @@ end)
 debugEvent("SYSTEM", "initialized", { build=BUILD,place=game.PlaceId,
 	startupChecks="passed",fallbackExport=true,
     diagnosticsTab=menuButtons.Diagnostics ~= nil and pages.Diagnostics ~= nil,
-    diagnosticsDock=diagnosticsDock.Parent ~= nil,ui="manual_afk_collapsible",
+    diagnosticsDock=diagnosticsDock.Parent ~= nil,ui="collapsible_subcategories",
 	mode=OPTIONS.MovementMode,underMapDepth=OPTIONS.TweenDepth,selenaCamera=true,
-	lineOfSight="disabled",abilityAuto=true,abilityTrigger="F_after_machine_completion",sampleFarm=true,pickupSpeed=PICKUP_TRAVEL.Speed,
+	lineOfSight="disabled",abilityAuto=autoAbility.enabled,abilityTrigger="F_after_machine_completion",sampleFarm=true,pickupSpeed=PICKUP_TRAVEL.Speed,
 	enemyClearance=PICKUP_TRAVEL.SafetyRadius,pickupSettle=FARM.Settle,
 	pickupDwell=FARM.Dwell,pickupRate=FARM.SpamRate,itemWaitMax=MACHINE.ItemWaitMax,promptMoveFix=true })
 task.spawn(function()
 	local previous = {}
-	local watchFolders = { "Items","Capsules","Map.InfectedSamples","Candies","Computers","OilMachines","MonsterFolder" }
 	while alive do
-		for _, folderName in ipairs(watchFolders) do
+		for _, folderName in ipairs({ "Items","Capsules","Map.InfectedSamples","Candies","Computers","OilMachines","MonsterFolder" }) do
 			local folder = resolveWorkspacePath(folderName)
 			local present = folder ~= nil
 			if previous[folderName] ~= present then
@@ -6906,7 +6811,3 @@ UNLOAD.handler = function(source)
 	cancelMotion()
 	UNLOAD.force(source)
 end
-
-end -- UNLOAD.finishInitialization
-UNLOAD.finishInitialization()
-UNLOAD.finishInitialization = nil -- release one-time initializer reference
