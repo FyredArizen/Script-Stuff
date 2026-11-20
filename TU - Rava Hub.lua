@@ -68,7 +68,7 @@ local OPTIONS = {
 	MovementMode="Teleport",TweenDepth=-15,Disable3DRendering=false,
 }
 
-local BUILD = "TU Rava Hub v2.6.52"
+local BUILD = "TU Rava Hub v2.6.45-R1"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -94,9 +94,6 @@ local debugStats = {
 	promptAttempts=0,promptFailures=0,machineTargetChanges=0,
 	promptAlternateSelected=0,promptShownEvents=0,promptHiddenEvents=0,
 	nestedProgressResolutions=0,machineInitialPromptRetries=0,
-	machineSyncRetries=0,machineSyncRepositions=0,
-	machineSyncBlocked=0,machineSyncProgressConfirmed=0,
-	pickupRangeResnaps=0,pickupRangeResnapSuccess=0,
 	promptSeatAttempts=0,promptSeatVerified=0,promptSeatBlocked=0,
 	promptOrbitAttempts=0,promptOrbitMoves=0,promptOrbitConfirmed=0,
 	promptOrbitBlocked=0,promptOrbitTimeouts=0,promptOrbitFires=0,
@@ -120,7 +117,6 @@ local debugStats = {
 	elevatorContactWalks=0,elevatorContactWalkSteps=0,elevatorContactWalkMoved=0,
 	elevatorRecoveryScheduled=0,elevatorRecoveryDispatched=0,elevatorRecoveryExhausted=0,
 	fuseLocatedDisabled=0,fuseDynamicFound=0,fuseActivationUnverified=0,
-	fuseSyncRetries=0,fuseSyncRepositions=0,fuseConfirmedByPrompt=0,
     blackoutFuseFound=0,blackoutFuseCollected=0,blackoutFuseUnsafe=0,
     blackoutBoxDispatches=0,blackoutBoxFallbacks=0,blackoutBoxMissing=0,
 	machineExitFlightWaits=0,damageRetreatTriggers=0,
@@ -150,27 +146,16 @@ local debugStats = {
 	handoffs=0,handoffTotalMs=0,handoffMaxMs=0,
 	handoffLastMs=0,firstObjectiveMs=0,machineScans=0,slowMachineScans=0,
 	completionWakeups=0,fastHandoffs=0,fastPromptDispatches=0,
-	handoffPromptWaitMs=0,handoffReadyMoveMs=0,handoffLongWaits=0,
-	handoffSlowReadyMoves=0,mainPrestageAttempts=0,mainPrestageSuccess=0,
-	mainPrestageBlocked=0,mainStageFallbacks=0,
 	threatPredictions=0,threatProximityAlerts=0,instantHideMoves=0,
 	soundComputerDone=0,soundOilDone=0,soundMainReady=0,soundElevatorDoor=0,
 	soundMainFlush=0,soundMainFlushDoor=0,soundMainFlushCorroborated=0,
 	soundElevatorCountdownStop=0,soundElevatorCountdownAccepted=0,
 	soundElevatorCountdownUnverified=0,
 	soundElevatorDoorClosing=0,soundFloorTransitions=0,soundFloorTransitionResets=0,
-	doorClosingIgnoredDuringWork=0,hideStarts=0,hideRetreats=0,hideWaitTicks=0,
-	hideResumes=0,hideSaferTargets=0,hideNoShelter=0,hideDangerStays=0,
-	damageIdleRetreats=0,criticalHealthHolds=0,criticalHealthRecoveries=0,
-	mainPrestageThreatBlocks=0,hideShelterThreatBlocks=0,stagedThreatRetreats=0,
 	soundElevatorSelections=0,soundElevatorReroutes=0,soundElevatorUnmappedDoor=0,soundElevatorSoundFallbacks=0,
-	soundDoneRecovered=0,soundDoneAmbiguous=0,objectiveLateValueBinds=0,
-	completedSkillcheckHandoffs=0,pickupOrbitsSuppressed=0,elevatorTeleportSteps=0,
 	soundMainCompleted=0,soundMainCompletedDoor=0,soundMainCompletionVerified=0,
 	soundBlackout=0,soundBlackoutDispatches=0,soundBlackoutDeferred=0,
 	soundWakeups=0,soundHandoffs=0,soundIgnored=0,
-	voidLandingsBlocked=0,voidDropsDetected=0,voidRecoveries=0,voidRecoveryFailures=0,
-	voidCircuitTrips=0,voidSurfaceSnapshots=0,voidTweenRoutesBlocked=0,
 }
 -- Tracks the user's actual goal: 1,000 machine completions without reaching 0 HP.
 -- Total machine completions remain separate because a cumulative count would
@@ -370,171 +355,8 @@ local function cancelMotion(owner)
 	end
 end
 UNLOAD.cancelMovement = cancelMotion
-
--- Avoid sending the character into missing collision geometry (especially
--- the elevator's old unverified -20-stud fallback). An AFK session should
--- prefer a skipped objective to falling below the map and losing a life.
-do
-    local guard = { blocked=false, recovering=false, safeCFrame=nil,
-        safeMap=nil, safePart=nil, safeAt=0, previousRoot=nil,
-        sampleAt=0, recentRecoveries={}, lastMovementAt=0 }
-    UNLOAD.voidGuard = guard
-
-    local function floorBelow(point, maxDrop, character)
-        if typeof(point) ~= "Vector3" then return nil end
-        if point.Y <= workspace.FallenPartsDestroyHeight + 25 then return nil end
-        local params = RaycastParams.new()
-        params.FilterType = Enum.RaycastFilterType.Exclude
-        local ignore = {}
-        if character then table.insert(ignore, character) end
-        local snakePlates = workspace:FindFirstChild("TU_Rava_SnakeGuards")
-        if snakePlates then table.insert(ignore, snakePlates) end
-        params.FilterDescendantsInstances = ignore
-        pcall(function() params.RespectCanCollide = true end)
-        -- Several passes ignore decorative, transparent or non-collidable
-        -- surfaces without ignoring legitimate glass or solid platforms.
-        for attempt=1,7 do
-            local hit = workspace:Raycast(point + Vector3.new(0,2,0),
-                Vector3.new(0,-(maxDrop+2),0),params)
-            if not hit then return nil end
-            local part = hit.Instance
-            local vertical = point.Y - hit.Position.Y
-            if hit.Normal.Y >= 0.48 and vertical >= -0.15 and vertical <= maxDrop
-                and (part == workspace.Terrain or (part and part.CanCollide)) then
-                return hit
-            end
-            if not part then return nil end
-            table.insert(ignore,part)
-            params.FilterDescendantsInstances=ignore
-        end
-        return nil
-    end
-
-    function guard.landingOK(where, owner)
-        if guard.blocked or guard.recovering then return false,"recovery_locked" end
-        if typeof(where) ~= "Vector3" then return false,"invalid_position" end
-        if where.Y <= workspace.FallenPartsDestroyHeight + 35 then
-            return false,"near_destroy_height"
-        end
-        local character=player.Character
-        -- The approach to a prompt may be somewhat higher than the ground;
-        -- require a genuinely collidable floor in the landing column.
-        if not floorBelow(where,22,character) then
-            return false,"no_supported_landing"
-        end
-        return true,"ground_found"
-    end
-
-    function guard.noteMove(owner,where)
-        guard.lastMovementAt=os.clock()
-    end
-
-    function guard.recover(reason, root)
-        if guard.recovering or guard.blocked then return false end
-        guard.recovering=true
-        local character=player.Character
-        local humanoid=character and character:FindFirstChildOfClass("Humanoid")
-        local safe=guard.safeCFrame
-        local sameMap=guard.safeMap == workspace:FindFirstChild("Map")
-        -- A saved platform from the previous floor is not a safe destination.
-        local valid=safe and sameMap and guard.safePart and guard.safePart.Parent
-            and floorBelow(safe.Position,10,character)
-        local ok=false
-        motionPauseUntil=math.max(motionPauseUntil,os.clock()+2.0)
-        if valid and character and root and root.Parent and humanoid
-            and humanoid.Health > 0 then
-            pcall(cancelMotion)
-            if UNLOAD.abortOrbit then pcall(UNLOAD.abortOrbit) end
-            ok=pcall(function()
-                root.Anchored=false
-                root.AssemblyLinearVelocity=Vector3.zero
-                root.AssemblyAngularVelocity=Vector3.zero
-                root.CFrame=(safe+Vector3.new(0,1.5,0))
-            end)
-            ok=ok and root.Parent ~= nil
-                and (root.Position-(safe.Position+Vector3.new(0,1.5,0))).Magnitude < 7
-        end
-        if ok then
-            increment("voidRecoveries")
-            local now=os.clock()
-            table.insert(guard.recentRecoveries,now)
-            while #guard.recentRecoveries > 0
-                and now-guard.recentRecoveries[1] > 30 do
-                table.remove(guard.recentRecoveries,1)
-            end
-            if #guard.recentRecoveries >= 3 then
-                -- Repeated recoveries indicate a bad map/route: lock motion.
-                guard.blocked=true
-                increment("voidCircuitTrips")
-            end
-        else
-            increment("voidRecoveryFailures")
-            -- No proven support => stop all future automated movements.
-            guard.blocked=true
-        end
-        debugEvent("VOID",ok and "safe_position_restored" or "recovery_failed",{
-            reason=reason,restored=ok,locked=guard.blocked,
-            rootY=root and math.floor(root.Position.Y) or "missing",
-            savedY=safe and math.floor(safe.Position.Y) or "none",
-            mapMatched=sameMap,
-        },ok and "WARN" or "ERROR")
-        guard.recovering=false
-        return ok
-    end
-
-    local elapsed=0
-    local conn=RunService.Heartbeat:Connect(function(dt)
-        if not alive or guard.recovering or guard.blocked then return end
-        elapsed+=dt
-        if elapsed < 0.08 then return end
-        elapsed=0
-        local character=player.Character
-        local root=character and character:FindFirstChild("HumanoidRootPart")
-        local humanoid=character and character:FindFirstChildOfClass("Humanoid")
-        if not root or not root.Parent or not humanoid or humanoid.Health <= 0 then return end
-        if root ~= guard.previousRoot then
-            guard.previousRoot=root
-            guard.safeCFrame=nil
-            guard.safePart=nil
-            guard.safeMap=nil
-            guard.safeAt=0
-            guard.recentRecoveries={}
-        end
-        local pos=root.Position
-        local time=os.clock()
-        local supported=(not root.Anchored and not activeMotion)
-            and floorBelow(pos,8,character)
-        if supported then
-            -- A stable landing snapshot is trustworthy only with solid support.
-            if (not guard.safeCFrame) or time-guard.safeAt > 0.20 then
-                guard.safeCFrame=root.CFrame
-                guard.safePart=supported.Instance
-                guard.safeMap=workspace:FindFirstChild("Map")
-                guard.safeAt=time
-                increment("voidSurfaceSnapshots")
-            end
-            return
-        end
-        local lowerThanSafe=guard.safeCFrame
-            and pos.Y < guard.safeCFrame.Position.Y - 17
-        local nearKillHeight=pos.Y <= workspace.FallenPartsDestroyHeight + 45
-        local falling=root.AssemblyLinearVelocity.Y < -12
-        -- Only recover when there's no ground within a generous lower column.
-        -- This avoids interrupting normal jumps and server floor transitions.
-        local farBelowSafe=guard.safeCFrame
-            and pos.Y < guard.safeCFrame.Position.Y - 35
-        if (nearKillHeight or (lowerThanSafe and falling) or farBelowSafe)
-            and not floorBelow(pos,30,character) then
-            increment("voidDropsDetected")
-            guard.recover(nearKillHeight and "kill_height" or "falling_below_floor",root)
-        end
-    end)
-    table.insert(connections,conn)
-    table.insert(cleanups,function() guard.blocked=true end)
-end
-
 local function instantTeleport(destination, keepGoing, owner, mode)
-	local emergency = mode == "emergency" or mode == "elevator" or mode == "hide"
+	local emergency = mode == "emergency" or mode == "elevator"
 	if not alive or not keepGoing() then return false end
 	if owner == "pickup" and UNLOAD.pickupSnakeUnsafe
 		and UNLOAD.pickupSnakeUnsafe(nil,destination.Position) then
@@ -543,19 +365,12 @@ local function instantTeleport(destination, keepGoing, owner, mode)
 	end
 	local protected, checkType = false, "not_ready"
 	if skillcheckProtected then protected, checkType = skillcheckProtected() end
-	-- Only a corroborated completion permits the next machine handoff while
-	-- a completed skillcheck GUI is still fading out. Never bypass for pickups.
-	local verifiedHandoff = owner == "machine" and (mode == "fast" or mode == "handoff")
-		and os.clock() < (UNLOAD.verifiedHandoffUntil or 0)
-	if protected and not verifiedHandoff and not (emergency and owner == "machine"
+	if protected and not (emergency and owner == "machine"
 		and os.clock() <= (UNLOAD.imminentEvacuationUntil or 0)) then
 		increment("skillcheckMoveBlocked")
 		debugThrottled("skillcheck_teleport_block_" .. tostring(owner), 1.5,
 			"SKILLCHECK", "teleport_deferred", { owner=owner,mode=mode or "routine",ui=checkType }, "INFO")
 		return false
-	end
-	if verifiedHandoff and protected then
-		increment("completedSkillcheckHandoffs")
 	end
 	if owner == "machine" and activeMotion and activeMotion.owner == "pickup" then
 		debugEvent("MOVE", "machine_preempts_pickup_tween", { phase=activeMotion.phase or "unknown" }, "WARN")
@@ -573,14 +388,6 @@ local function instantTeleport(destination, keepGoing, owner, mode)
 	local root = char and char:FindFirstChild("HumanoidRootPart")
 	if not root or not root:IsDescendantOf(workspace) then
 		debugThrottled("root_" .. owner, 5, "MOVE", "root_missing", { owner=owner }, "WARN")
-		return false
-	end
-	local landingOK, landingWhy = UNLOAD.voidGuard.landingOK(destination.Position,owner)
-	if not landingOK then
-		increment("voidLandingsBlocked")
-		debugThrottled("unsafe_landing_"..tostring(owner),1.5,"VOID",
-			"teleport_rejected",{ owner=owner,reason=landingWhy,
-			to=tostring(destination.Position) },"WARN")
 		return false
 	end
 	local from = root.Position
@@ -609,7 +416,6 @@ local function instantTeleport(destination, keepGoing, owner, mode)
 			{ owner=owner,drift=string.format("%.2f",drift),target=tostring(destination.Position) }, "WARN")
 		return false
 	end
-	UNLOAD.voidGuard.noteMove(owner,destination.Position)
 	increment("teleports")
 	debugEvent("MOVE", "teleport", {
 		owner=owner,mode=emergency and "emergency" or "routine",
@@ -619,7 +425,7 @@ local function instantTeleport(destination, keepGoing, owner, mode)
 end
 
 local function tweenUnderMap(destination, keepGoing, owner, mode)
-	local emergency = mode == "emergency" or mode == "elevator" or mode == "hide"
+	local emergency = mode == "emergency" or mode == "elevator"
 	if not alive or not keepGoing() then return false, "inactive" end
 	if owner == "pickup" and UNLOAD.pickupSnakeUnsafe
 		and UNLOAD.pickupSnakeUnsafe(nil,destination.Position) then
@@ -642,13 +448,6 @@ local function tweenUnderMap(destination, keepGoing, owner, mode)
 	if not root or not root:IsDescendantOf(workspace) then return false, "missing_root" end
 	local from = root.Position
 	local goal = destination.Position
-	local landingOK,landingWhy=UNLOAD.voidGuard.landingOK(goal,owner)
-	if not landingOK then
-		increment("voidLandingsBlocked")
-		debugThrottled("bad_tween_landing_"..tostring(owner),2,"VOID",
-			"tween_rejected",{owner=owner,reason=landingWhy},"WARN")
-		return false,landingWhy
-	end
 	if (from - goal).Magnitude < 0.25 then return true, "already_there" end
 	if not emergency and infectedNear and infectedNear(goal, owner == "pickup" and PICKUP_TRAVEL.SafetyRadius or 15) then
 		increment("underMapGuardBlocks")
@@ -816,14 +615,6 @@ local function teleportCharacter(destination, keepGoing, owner, mode)
 		return instantTeleport(destination, keepGoing, owner,
 			mode == "hide" and "emergency" or "fast")
 	end
-	-- AFK movement is always surface teleport: anchored under-map tweens can
-	-- strand the character beneath a removed platform or moving elevator.
-	if owner == "machine" or owner == "pickup" or owner == "return" then
-		if OPTIONS.MovementMode == "Tween" then
-			increment("voidTweenRoutesBlocked")
-		end
-		return instantTeleport(destination, keepGoing, owner, mode)
-	end
 	if OPTIONS.MovementMode == "Teleport" then
 		return instantTeleport(destination, keepGoing, owner, mode)
 	end
@@ -841,25 +632,16 @@ local function track(connection)
 end
 
 local function supervise(label, isActive, fn)
-    task.spawn(function()
-        local consecutive = 0
-        local lastFailure = nil
-        while isActive() do
-            local ok, err = pcall(fn)
-            if ok then return end
-            consecutive += 1
-            local message = tostring(err)
-            local delaySeconds = math.min(0.5 * (2 ^ math.min(consecutive - 1, 4)), 5)
-            increment("workerErrors")
-            if message ~= lastFailure or consecutive == 1 or consecutive % 8 == 0 then
-                warn("[TU Rava Hub] " .. label .. " error: " .. message)
-                debugEvent("WORKER", "crashed", { worker=label, error=message,
-                    repeats=consecutive, retrySeconds=delaySeconds }, "ERROR")
-            end
-            lastFailure = message
-            task.wait(delaySeconds)
-        end
-    end)
+	task.spawn(function()
+		while isActive() do
+			local ok, err = pcall(fn)
+			if ok then return end
+			warn("[TU Rava Hub] " .. label .. " error: " .. tostring(err))
+			increment("workerErrors")
+			debugEvent("WORKER", "crashed", { worker=label,error=tostring(err),retry="0.5s" }, "ERROR")
+			task.wait(0.5)
+		end
+	end)
 end
 
 local function findTSquid()
@@ -1550,7 +1332,7 @@ end
 
 -- Autofarm prompt contact uses precise CFrame repositioning only.
 -- No Humanoid:Move, Humanoid:MoveTo, WASD, or virtual walking keys.
--- Elevator entry uses separate grounded CFrame steps for possible touch triggers.
+-- Elevator entry contact walking remains separately available for touch triggers.
 do
     local orbitGeneration, orbitActive = 0, false
     UNLOAD.abortOrbit = function() orbitGeneration += 1 end
@@ -1595,11 +1377,6 @@ do
             return false,"enemy_nearby"
         end
         if not keepGoing() or player.Character ~= character then return false,"interrupted" end
-        local okay,why=UNLOAD.voidGuard.landingOK(destination,"prompt")
-        if not okay then
-            increment("voidLandingsBlocked")
-            return false,why
-        end
         local success,err=pcall(function()
             root.AssemblyLinearVelocity=Vector3.zero
             root.AssemblyAngularVelocity=Vector3.zero
@@ -1685,11 +1462,6 @@ do
                 if infectedNear and (infectedNear(root.Position,radiusRisk)
                     or infectedNear(goal,radiusRisk)) then
                     result="enemy_nearby" break
-                end
-                local landingOK=UNLOAD.voidGuard.landingOK(goal,"prompt_orbit")
-                if not landingOK then
-                    increment("voidLandingsBlocked")
-                    result="orbit_landing_unsafe" break
                 end
                 root.AssemblyLinearVelocity=Vector3.zero
                 root.AssemblyAngularVelocity=Vector3.zero
@@ -2031,10 +1803,11 @@ track(workspace.ChildAdded:Connect(function(instance)
 	end
 end))
 
-UNLOAD.pickupBefore = { completed=false,started=nil,mapRef=workspace:FindFirstChild("Map") }
+UNLOAD.pickupBefore = { completed=false,started=nil,active=false,mapRef=workspace:FindFirstChild("Map") }
 function UNLOAD.pickupBefore.reset(reason)
 	UNLOAD.pickupBefore.completed = false
 	UNLOAD.pickupBefore.started = nil
+	UNLOAD.pickupBefore.active = false
 	UNLOAD.pickupBefore.mapRef = workspace:FindFirstChild("Map")
 	pickupCircuit.reset(reason)
 	debugEvent("PICKUP", "before_phase_reset", { reason=reason })
@@ -2058,11 +1831,6 @@ local function releasePickup(farm)
 end
 
 local function returnPickupHome(force, isBlocked)
-	-- Never drag a critically injured player out of an Auto Hide shelter.
-	if UNLOAD.healthCritical and OPTIONS.AutoHide then
-		pickupCoordinator.home = nil
-		return
-	end
 	if pickupCircuit.paused or pickupCircuit.finalized then return end
 	if not pickupCoordinator.home or pickupCoordinator.owner then return end
 	if UNLOAD.pickupBefore.started and not UNLOAD.pickupBefore.completed then
@@ -2276,29 +2044,6 @@ do
     end
 end
 
--- Some streamed monsters use a Folder named HumanoidRootPart instead of a
--- physical part. A named Folder has no Position/CFrame/AssemblyLinearVelocity.
--- Resolve an actual BasePart before EVERY proximity/velocity query.
--- Exposed via the existing UNLOAD table to avoid adding more chunk-level locals
--- in this very large Luau source (200-register compiler limit).
-function UNLOAD.safeThreatCore(unit)
-    if typeof(unit) ~= "Instance" or not unit.Parent then return nil end
-    if unit:IsA("BasePart") then return unit end
-    if not (unit:IsA("Model") or unit:IsA("Folder")) then return nil end
-    local root = unit:FindFirstChild("HumanoidRootPart", true)
-    if root and root:IsA("BasePart") then return root end
-    if root and (root:IsA("Folder") or root:IsA("Model")) then
-        local nested = root:FindFirstChildWhichIsA("BasePart", true)
-        if nested then return nested end
-    end
-    if unit:IsA("Model") and unit.PrimaryPart and unit.PrimaryPart:IsA("BasePart") then
-        return unit.PrimaryPart
-    end
-    local head = unit:FindFirstChild("Head", true)
-    if head and head:IsA("BasePart") then return head end
-    return unit:FindFirstChildWhichIsA("BasePart", true)
-end
-
 -- Pickup-only threat assessment. This does not modify objective movement or
 -- the ProximityPrompt.RequiresLineOfSight setting. A wall can hide a pickup
 -- from a monster even when the pickup prompt itself ignores sight rules.
@@ -2316,8 +2061,14 @@ local function pickupThreatSnapshot(force)
             -- other monster models as potential pickup threats.
             if (enemy:IsA("Model") or enemy:IsA("BasePart"))
                 and enemy.Name ~= "TSnakes" then
-                local core = UNLOAD.safeThreatCore(enemy)
-                if core and core:IsDescendantOf(workspace) then
+                local core = enemy:IsA("BasePart") and enemy
+                    or (enemy:FindFirstChild("HumanoidRootPart", true)
+                        or enemy.PrimaryPart or enemy:FindFirstChild("Head", true)
+                        or enemy:FindFirstChildWhichIsA("BasePart", true))
+                if core and not core:IsA("BasePart") then
+                    core = enemy:FindFirstChildWhichIsA("BasePart",true)
+                end
+                if core then
                     table.insert(entries, { object=enemy,core=core,
                         position=core.Position,velocity=core.AssemblyLinearVelocity,
                         look=core.CFrame.LookVector })
@@ -2488,8 +2239,7 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 	local function loop(myId)
 		local function active() return alive and farm.enabled and runId == myId end
 		local function allowed()
-			return active() and not (UNLOAD.voidGuard and UNLOAD.voidGuard.blocked)
-				and not pickupCircuit.paused and not pickupCircuit.finalized and (not gate or gate()) and not (isBlocked and isBlocked())
+			return active() and not pickupCircuit.paused and not pickupCircuit.finalized and (not gate or gate()) and not (isBlocked and isBlocked())
 				and (os.clock() >= motionPauseUntil)
 		end
 		while active() do
@@ -2609,20 +2359,6 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 									return false, "enemy_after_arrival", 0
 								end
 								local actualRange = (root.Position - promptPosition).Magnitude
-								if actualRange > prompt.MaxActivationDistance and stillPicking(true)
-									and not pickupRisk(promptPosition,target).unsafe then
-									increment("pickupRangeResnaps")
-									local snapped=UNLOAD.refreshPromptContact(prompt,part,function()
-										return stillPicking(true) and not pickupRisk(promptPosition,target).unsafe
-									end,"pickup_range_resnap")
-									if snapped then
-										RunService.Heartbeat:Wait()
-										actualRange=(root.Position-promptPosition).Magnitude
-										if actualRange <= prompt.MaxActivationDistance then
-											increment("pickupRangeResnapSuccess")
-										end
-									end
-								end
 								if actualRange > prompt.MaxActivationDistance then
 									debugEvent("PICKUP", "outside_prompt_range", {
 										name=target.Name,distance=string.format("%.2f",actualRange),
@@ -2668,10 +2404,30 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 										end
 									end
 							end
-								-- No orbit or walking fallback for pickup routes. A failed
-								-- contact retry is retried in the next pickup cycle instead.
-								if not success and (why == "confirmation_timeout" or why == "prompt_replaced") then
-									increment("pickupOrbitsSuppressed")
+								-- A final short spiral checks multiple contact angles without repeating a blind teleport.
+								if not success and (why == "confirmation_timeout" or why == "prompt_replaced")
+									and stillPicking(true) and not pickupCircuit.paused then
+									local livePrompt = getPrompt(target)
+									local livePart = livePrompt and getPromptPart(livePrompt, target)
+									if livePrompt and livePrompt.Enabled and livePart then
+										prompt, part = livePrompt, livePart
+										promptPosition = getPromptPosition(prompt, part)
+										local orbitSuccess, orbitReason, orbitFired = UNLOAD.orbitPromptContact(
+											target, prompt, part,
+											function() return stillPicking(true) and not pickupRisk(promptPosition,target).unsafe end,
+											function()
+												return pickupEvidence(prompt, target, initialParent, confirmPickup, initialHeld)
+											end,
+											function() return triggerPrompt(prompt, false) end,
+											"pickup_retry", 0.9)
+										fired += orbitFired
+										if orbitSuccess then
+											success, why = true, "orbit_contact"
+											increment("pickupOrbitRecoveries")
+										elseif orbitReason == "enemy_nearby" or orbitReason == "interrupted" then
+											why = "orbit_" .. orbitReason
+										end
+									end
 								end
 								if not success and isBlocked and isBlocked() then return false, "preempted_by_machine", fired end
 								return success, why, fired
@@ -2751,6 +2507,12 @@ local function newAutofarm(folderName, gate, filter, confirmPickup, isBlocked)
 		if farm.enabled then return end
 		farm.enabled = true
 		pickupCoordinator.enabledCount += 1
+		if isBlocked and isBlocked() then
+			debugEvent("PICKUP", "enabled_deferred_until_pickup_window", {
+				source=type(folderName) == "table" and table.concat(folderName, ",") or folderName,
+				machineBusy=true,
+			})
+		end
 		runId += 1
 		local myId = runId
 		supervise("item autofarm", function()
@@ -3192,18 +2954,24 @@ local function pickupBusy()
 end
 
 local function collectOpen()
-	if OPTIONS.AutoHide and (UNLOAD.healthCritical
-		or (machineFarm and machineFarm.hideState and machineFarm.hideState.active)) then
-		return false
-	end
 	return not UNLOAD.pickupBefore.completed and not pickupCircuit.finalized
 		and not (machinesDone and machinesDone())
 end
 
 local function machineBusy()
-	return machineFarm ~= nil and machineFarm.enabled == true and
-		(machineFarm.target ~= nil or machineFarm.placed == true or machineFarm.moving == true
-			or machineFarm.finalizing == true)
+	if not (machineFarm and machineFarm.enabled) then return false end
+	-- When the machine worker deliberately yields for the per-floor pickup phase,
+	-- an already-selected (but not yet placed) target cannot block every collector.
+	-- Never override an actively held machine, transition, blackout, or emergency move.
+	if UNLOAD.pickupBefore.active and not machineFarm.placed
+		and not machineFarm.moving and not machineFarm.finalizing
+		and not machineFarm.elevatorTransit and not machineFarm.blackoutActive
+		and not chase.pending then
+		return false
+	end
+	return machineFarm.target ~= nil or machineFarm.placed == true
+		or machineFarm.moving == true or machineFarm.finalizing == true
+		or machineFarm.elevatorTransit == true or machineFarm.blackoutActive == true
 end
 
 local capsuleFarm = newAutofarm({ "Capsules","Map.InfectedSamples" }, collectOpen, nil, false, machineBusy)
@@ -3306,17 +3074,10 @@ local MACHINE = {
 	Folders={ "OilMachines","Computers" }, Range=50, Height=3,
 	Elevator="Map.SpecialFolder.ExitElevator", ElevatorFallback="Elevator", ElevatorHeight=-20,
 	Tick=0.010,Settle=0,PromptRetry=0.075,
-	-- Prompt dispatch stays immediate; retries run only when progress is absent.
-	PromptSyncStages={0.14,0.38,0.78},
 	RescanInterval=0.030,StallTimeout=2.7,UseTimeout=8,NearFinishAt=90,NearFinishHold=20,
-	ClearHold=1.0,ItemWaitMax=24,
-	SkillcheckPause=3, ChaseHold=2.5, HideMinSeconds=2.5, HideClearSeconds=1.5,
-	DoneValue=100, FuseDwell=0.7,
+	ClearHold=0.10,ItemWaitMax=24,
+	SkillcheckPause=3, ChaseHold=0.15, DoneValue=100, FuseDwell=0.7,
 	EmergencyDistance=27,ThreatLead=0.28,ThreatVertical=26,
-	-- Health <= 1 is a deathless-run emergency. Pause unattended machine movement
-	-- until a health recovery is observed or the user turns Auto Hide off.
-	CriticalHealth=1,HideShelterClearance=42,
-	CriticalShelterClearance=60,MainPrestageClearance=42,
 	Fuseboxes={
 		"Map.SpecialFolder.Fusebox.Handle.ProximityPrompt",
 		"Map.SpecialFolder.ExitFusebox.Handle.ProximityPrompt",
@@ -3345,7 +3106,11 @@ end
 local function selenaPosition(unit)
 	if not unit or not unit.Parent then return nil end
 	if unit:IsA("BasePart") then return unit.Position end
-	local part = UNLOAD.safeThreatCore(unit)
+	local part = unit.PrimaryPart or unit:FindFirstChild("Head", true)
+		or unit:FindFirstChild("HumanoidRootPart", true)
+	if not (part and part:IsA("BasePart")) then
+		part = unit:FindFirstChildWhichIsA("BasePart",true)
+	end
 	return part and part.Position or nil
 end
 
@@ -3443,7 +3208,15 @@ end
 -- Resolve the moving core rather than a model pivot or a decorative part;
 -- inactive decoration can be dozens of studs from the actual monster.
 local function threatCore(unit)
-    return UNLOAD.safeThreatCore(unit)
+	if unit:IsA("BasePart") then return unit end
+	if unit:IsA("Model") then
+		local candidate = unit:FindFirstChild("HumanoidRootPart", true)
+		if candidate and candidate:IsA("BasePart") then return candidate end
+		candidate = unit.PrimaryPart or unit:FindFirstChild("Head", true)
+		if candidate and candidate:IsA("BasePart") then return candidate end
+		return unit:FindFirstChildWhichIsA("BasePart", true)
+	end
+	return nil
 end
 
 infectedNear = function(position, radius)
@@ -3511,10 +3284,7 @@ local function nearestInfected(position)
 	local nearestName, nearestDistance, nearestPosition
 	for _, enemy in ipairs(getTargets(folder)) do
 		if enemy:IsA("Model") or enemy:IsA("BasePart") then
-			-- Match the threat resolver's moving physical core. Model pivots
-			-- can be offset from the actual enemy, misleading refuge selection.
-			local core = threatCore(enemy)
-			local pos = core and core.Position
+			local pos = targetPosition(enemy)
 			if pos then
 				local dist = (position - pos).Magnitude
 				if not nearestDistance or dist < nearestDistance then
@@ -3585,7 +3355,6 @@ local function bindHealthSource()
 	end
 	local function observe(newValue)
 		if type(newValue) ~= "number" or not alive then return end
-		UNLOAD.healthCritical = newValue <= MACHINE.CriticalHealth
 		local previous = healthMonitor.old
 		healthMonitor.old = newValue
 		if newValue > 0 and previous ~= nil and previous <= 0 then
@@ -3626,8 +3395,6 @@ local function bindHealthSource()
 		if newValue <= 0 then exportOnDeath(mode or "unknown", newValue) end
 	end
 	healthMonitor.old = mode == "Alive.Health" and source:GetAttribute("Health") or (source and source.Health)
-	UNLOAD.healthCritical = type(healthMonitor.old) == "number"
-		and healthMonitor.old <= MACHINE.CriticalHealth
 	if healthMonitor.old and healthMonitor.old <= 0 then exportOnDeath("initial_zero", healthMonitor.old) end
 	if source and mode == "Alive.Health" then
 		healthMonitor.conn = source:GetAttributeChangedSignal("Health"):Connect(function()
@@ -4088,10 +3855,7 @@ local function newMachineAutofarm()
 		elevatorEntryAttempts=0,elevatorContactRetryAt=0,
 		elevatorRecoveryAt=nil,elevatorRecoveryCount=0,
 		soundSerial=0,soundLast=nil,soundDoneTarget=nil,soundDoneUntil=0,
-		lastPromptTarget=nil,lastPromptAt=-math.huge,
-		mainReadyUntil=0,mainReadyAt=-math.huge,elevatorDoorOpenUntil=0,
-		mainPrestageAt=-math.huge,mainPrestageMap=nil,mainPrestageSuccess=false,
-		mainReadySeenBases=nil,
+		mainReadyUntil=0,elevatorDoorOpenUntil=0,
 		elevatorSoundPath=nil,elevatorSoundAt=-math.huge,elevatorSoundWaitSince=nil,
 		pendingDoorPath=nil,pendingDoorAt=-math.huge,
 		mainFlushTarget=nil,mainFlushAt=-math.huge,mainFlushUntil=0,
@@ -4106,10 +3870,8 @@ local function newMachineAutofarm()
 		elevatorCountdownHoldUntil=0,elevatorCountdownAccepted=false,
 		floorTransitionConfirmed=false,floorTransitionAt=-math.huge,
 		floorTransitionSnapshot=nil,
-        awaitingFreshObjectives=false,elevatorFastRetryAt=0,
 		soundMapRef=workspace:FindFirstChild("Map") }
 	local runId = 0
-	local looseFuses -- forward-declared for door and blackout handlers
 	-- Countdown StopSound has no Parent or player identifier. It is only a hint
 	-- until the watchdog corroborates it with a recent elevator approach.
 	local function resetCountdownSignal()
@@ -4131,9 +3893,6 @@ local function newMachineAutofarm()
 		farm.pendingDoorPath = nil
 		farm.pendingDoorAt = -math.huge
 		farm.mainFlushTarget = nil
-		farm.lastPromptTarget = nil
-		farm.lastPromptAt = -math.huge
-		UNLOAD.verifiedHandoffUntil = 0
 		farm.mainFlushAt = -math.huge
 		farm.mainFlushUntil = 0
 		farm.lastDoorSoundAt = -math.huge
@@ -4156,47 +3915,7 @@ local function newMachineAutofarm()
 		farm.lastFuseAttemptAt = -math.huge
 		farm.lastBlackoutDeferredCueAt = -math.huge
 		farm.fuseInFlight = false
-		farm.mainReadyAt = -math.huge
-		farm.mainPrestageAt = -math.huge
-		farm.mainPrestageMap = nil
-		farm.mainPrestageSuccess = false
-		farm.mainReadySeenBases = nil
 	end
-
-    -- A new Map can arrive before its machines have replicated. Quarantine
-    -- stale floor/elevator state instead of dispatching a teleport to the
-    -- old exit every 0.06s. Both sound and worker paths use this same reset.
-    local function markNewMap(newMap, source)
-        if newMap == farm.soundMapRef then return false end
-        local fromTransition = farm.floorTransitionConfirmed
-        farm.soundMapRef = newMap
-        farm.soundDoneTarget, farm.soundDoneUntil = nil, 0
-        farm.mainReadyUntil, farm.elevatorDoorOpenUntil = 0, 0
-        resetFlushSignals()
-        farm.awaitingFreshObjectives = true
-        farm.elevatorFastRetryAt = 0
-        farm.allDoneSince = nil
-        farm.elevatorTarget, farm.elevatorSource, farm.elevatorPlatform = nil, nil, nil
-        farm.elevatorEmergencyLocked, farm.finalizing = false, false
-        farm.elevatorWatchFired = false
-        farm.elevatorRecoveryAt, farm.elevatorRecoveryCount = nil, 0
-        farm.lastElevatorMoveAt = nil
-        farm.lastElevatorInside = nil
-        UNLOAD.floorState.mapRef = newMap
-        UNLOAD.floorState.seen = false
-        UNLOAD.floorState.finished = false
-        UNLOAD.floorState.completed = 0
-        UNLOAD.floorState.noTargetsSince = nil
-        UNLOAD.floorState.lastCompletion = -math.huge
-        UNLOAD.floorState.completionReason = "new_map_loading"
-        doneAt, doneValue = 0, false
-        increment("soundFloorTransitionResets")
-        debugEvent("SOUND", "new_floor_map_loading", {
-            fromTransition=fromTransition, source=source or "unknown",
-            waitFor="first_enabled_objective",
-        })
-        return true
-    end
 
 	-- Door closing is the final floor-complete cue in this game.
 	-- If the map model is reused, wait until genuinely fresh objectives appear
@@ -4384,7 +4103,9 @@ local function newMachineAutofarm()
 			and packet.Player == player
 			and (packet.Category == "Machine" or packet.Category == "Computer") then
 			kind, category = "done", packet.Category
-		elseif name == "MainMachineFillingUp" and packet.IsVoiceLine == false then
+		elseif name == "MainMachineFillingUp" and packet.IsVoiceLine == false
+			and packet.Parent ~= nil
+			and packet.Parent == resolveWorkspacePath("Map.SpecialFolder.BigMachine.Oil") then
 			kind = "main_ready"
 		elseif name == "MainMachineFlush" and packet.IsVoiceLine == false then
 			kind = "main_flush"
@@ -4415,15 +4136,13 @@ local function newMachineAutofarm()
 		else
 			return
 		end
-		if not farm.enabled then
-			-- Closing door direction is still useful if machine autofarm was
-			-- enabled after the starting door animation.
-			if kind == "door_close" then UNLOAD.lastClosedElevatorPath = doorPath end
-			return
+		if not farm.enabled then return end
+		if workspace:FindFirstChild("Map") ~= farm.soundMapRef then
+			farm.soundMapRef = workspace:FindFirstChild("Map")
+			farm.soundDoneTarget,farm.soundDoneUntil = nil,0
+			farm.mainReadyUntil,farm.elevatorDoorOpenUntil = 0,0
+			resetFlushSignals()
 		end
-        if workspace:FindFirstChild("Map") ~= farm.soundMapRef then
-            markNewMap(workspace:FindFirstChild("Map"), "sound")
-        end
 		-- Suppress doubled sound packets before recording a second handoff.
 		local fingerprint = kind .. ":" .. tostring(category or "") .. ":" .. tostring(doorPath or "")
 		if fingerprint == farm.lastSoundFingerprint
@@ -4434,37 +4153,17 @@ local function newMachineAutofarm()
 		if kind == "done" then
 			increment(category == "Machine" and "soundOilDone" or "soundComputerDone")
 			local target = farm.target
-			-- Completion audio can arrive after the prompt disables or the
-			-- old machine has already stopped being considered "placed".
-			-- Accept it only for the current matching objective with recent
-			-- local interaction evidence, or visible near-complete progress.
-			local recentlyUsed = target and farm.lastPromptTarget == target
-				and now - (farm.lastPromptAt or -math.huge) <= 3.0
-			local nearDone = target and (getProgress(target) or 0) >= 92
-			if target and machineKind(target) == category and isComplete(target) then
-				-- The progress value got to 100 before this sound packet. This is
-				-- confirmed completion, not an ambiguous/unmatched sound.
+			if target and farm.placed and machineKind(target) == category
+				and not isComplete(target) then
 				farm.soundDoneTarget = target
-				farm.soundDoneUntil = now + 1.5
-				UNLOAD.verifiedHandoffUntil = now + 1.5
-				debugEvent("SOUND", "machine_done_confirmed_by_progress", {
-					target=target.Name,category=category,progress=getProgress(target),
-				})
-			elseif target and machineKind(target) == category and not isComplete(target)
-				and (recentlyUsed or nearDone or farm.placed) then
-				farm.soundDoneTarget = target
-				farm.soundDoneUntil = now + 3.0 -- allow replication to catch up
-				UNLOAD.verifiedHandoffUntil = now + 2.5
-				if not farm.placed then increment("soundDoneRecovered") end
+				farm.soundDoneUntil = now + 1.0
 				debugEvent("SOUND", "local_machine_done_cue", {
-					target=target.Name,category=category,
-					evidence=recentlyUsed and "recent_prompt" or nearDone and "near_complete" or "placed",
+					target=target.Name,category=category,evidence="local_player_sound",
 				})
 			else
-				increment("soundDoneAmbiguous")
+				increment("soundIgnored")
 				debugThrottled("sound_done_unmatched", 0.7, "SOUND", "done_without_active_match", {
-					category=category,target=target and target.Name or "none",
-					placed=farm.placed,prior=recentlyUsed == true })
+					category=category,target=target and target.Name or "none" })
 			end
 		elseif kind == "main_ready" then
 			-- Confirmed game cue: all BASE oil/computer objectives are done.
@@ -4472,12 +4171,6 @@ local function newMachineAutofarm()
 			-- a base objective still appears unfinished during replication.
 			increment("soundMainReady")
 			farm.mainReadyUntil = now + 15.0
-			farm.mainReadyAt = now
-			farm.mainPrestageAt = -math.huge
-			farm.mainPrestageMap = nil
-			farm.mainPrestageSuccess = false
-			farm.mainReadySeenBases = {}
-			for _, base in ipairs(getMachines()) do farm.mainReadySeenBases[base] = true end
 			debugEvent("SOUND", "base_objectives_completed", {
 				priority="main_machine_next",verifiedBy="MainMachineFillingUp",
 			})
@@ -4532,38 +4225,14 @@ local function newMachineAutofarm()
 				fuseboxesEnabled=OPTIONS.Fuseboxes,priority="fusebox_check",
 			})
 		elseif kind == "door_close" then
-			-- Doors can close at the START of a floor or when Auto Hide uses an
-			-- elevator. Remember the side, but do not conclude an unfinished floor
-			-- is complete just because a door closed (observed in v2.6.47 debug).
-			UNLOAD.lastClosedElevatorPath = doorPath
+            UNLOAD.lastClosedElevatorPath = doorPath
+            debugEvent("SOUND", "last_closing_elevator_saved", {
+                path=doorPath, nextFuseboxSide=oppositeElevatorPath(doorPath) or "unknown",
+            })
+			-- User-confirmed definitive floor-complete sound. Stop the completed
+			-- floor's fuse and elevator retries immediately; map/new objectives rearm.
 			increment("soundElevatorDoorClosing")
-			debugEvent("SOUND", "last_closing_elevator_saved", {
-				path=doorPath,nextFuseboxSide=oppositeElevatorPath(doorPath) or "unknown",
-			})
-			local nextUnfinished, objectiveStatus = pickMachine()
-			local readyToExit = (farm.allDoneSince ~= nil or objectiveStatus == "done")
-				and nextUnfinished == nil
-				and not farm.blackoutActive
-				and (not looseFuses or #looseFuses() == 0)
-			local mainCue = now - farm.mainCompletionAt <= 30
-			local bigs = getBigMachines()
-			local bigsCompleted = #bigs > 0
-			for _, mainMachine in ipairs(bigs) do
-				if not isComplete(mainMachine) then bigsCompleted = false break end
-			end
-			-- Some elevators close during hiding or when the next floor starts.
-			-- Require evidence that the MAIN stage finished, not merely an empty
-			-- base-machine folder or a shelter's cached elevator target.
-			local finishing = readyToExit and (mainCue or bigsCompleted)
-				and (farm.finalizing or farm.allDoneSince ~= nil or farm.elevatorTarget ~= nil)
-			if not finishing then
-				increment("doorClosingIgnoredDuringWork")
-				debugEvent("SOUND", "door_closing_not_floor_complete", {
-				status=objectiveStatus,unfinished=nextUnfinished and nextUnfinished.Name or "none",
-				finalizing=farm.finalizing == true,ready=readyToExit,
-				path=doorPath,
-			}, "INFO")
-			elseif not farm.floorTransitionConfirmed then
+			if not farm.floorTransitionConfirmed then
 				farm.floorTransitionConfirmed = true
 				farm.floorTransitionAt = now
 				farm.floorTransitionSnapshot = snapshotFloorObjectives()
@@ -4573,11 +4242,10 @@ local function newMachineAutofarm()
 				farm.allDoneSince = farm.allDoneSince or now
 				UNLOAD.floorState.seen = true
 				UNLOAD.floorState.finished = true
-				UNLOAD.floorState.completionReason = "elevator_door_closing_verified"
+				UNLOAD.floorState.completionReason = "elevator_door_closing"
 				increment("soundFloorTransitions")
 				debugEvent("SOUND", "floor_completed_door_closing", {
-					phase="transition",stopRetries=true,
-					confirmedBy="door_plus_completed_objectives",
+					phase="transition",stopRetries=true,confirmedBy="ElevatorDoorClosing",
 				})
 			end
 		elseif kind == "countdown_stop" then
@@ -4738,13 +4406,7 @@ local function newMachineAutofarm()
 			end
 			return pos, best, bestKind, scanned
 		end
-		-- Never aim at an arbitrary -20 stud offset: it may be below the map.
-		if UNLOAD.voidGuard and UNLOAD.voidGuard.landingOK(fallback,"elevator_fallback") then
-			return fallback,nil,"unverified_offset_grounded",scanned
-		end
-		debugThrottled("elevator_void_fallback",2,"VOID",
-			"unsupported_elevator_offset_skipped",{position=tostring(fallback)},"WARN")
-		return nil
+		return fallback, nil, "unverified_offset", scanned
 	end
 	local function platformContains(part, point)
 		if not part or not part.Parent then return false end
@@ -4833,14 +4495,14 @@ local function newMachineAutofarm()
 		local start = root.Position
 		if not supported(start) then
 			increment("elevatorEntryUnsafeSkipped")
-			debugEvent("MACHINE", "elevator_contact_unsafe_floor", {
+			debugEvent("MACHINE", "elevator_walk_unsafe_floor", {
 				source=farm.elevatorSource or "none",attempt=farm.elevatorEntryAttempts,
 				geometry=geometry,position=tostring(start),
 			}, "WARN")
 			return
 		end
 		-- Prefer a named invisible touch zone near the player when present;
-		-- otherwise take short guarded teleport steps across supported ground.
+		-- otherwise walk across the confirmed standing surface, not into void.
 		local candidates = {}
 		local instance = farm.elevatorSource and resolveWorkspacePath(farm.elevatorSource)
 		if instance then
@@ -4883,18 +4545,15 @@ local function newMachineAutofarm()
 			local here = root.Position
 			if (here-start).Magnitude > 12 then break end -- possible server transition
 			local nextPos = here + dir * 1.65
-			if supported(nextPos) and UNLOAD.voidGuard.landingOK(nextPos,"elevator_contact") then
-				-- Elevator contact now uses teleport-only steps. Never leave a
-				-- Humanoid MoveTo command active when the next pickup phase starts.
+			if supported(nextPos) then
 				local ok = pcall(function()
 					root.AssemblyLinearVelocity = Vector3.zero
 					root.AssemblyAngularVelocity = Vector3.zero
 					root.CFrame = CFrame.new(nextPos) * (root.CFrame - root.Position)
 				end)
-				if ok and (root.Position-nextPos).Magnitude <= 2.0 then
+				if ok then
 					steps += 1
-					increment("elevatorTeleportSteps")
-					task.wait(0.06)
+					task.wait(0.18)
 					moved += (root.Position-here).Magnitude
 					if select(3,verifyElevatorPosition()) then break end
 				end
@@ -4957,75 +4616,7 @@ local function newMachineAutofarm()
 		if arrived and advancePreference then elevatorPreference = elevatorPreference == 1 and 2 or 1 end
 		return arrived
 	end
-	-- Auto Hide is NOT floor completion: pick a supported safe refuge. Never
-	-- commit the final elevator selection or use an ungrounded offset to hide.
-	local function goHideShelter(keepGoing)
-		local root = getPlayerRoot()
-		if not root then return false end
-		local choices = {}
-		local critical = type(healthMonitor.old) == "number"
-			and healthMonitor.old <= MACHINE.CriticalHealth
-		local clearance = critical and MACHINE.CriticalShelterClearance
-			or MACHINE.HideShelterClearance
-		for _, path in ipairs({ MACHINE.Elevator, MACHINE.ElevatorFallback }) do
-			local inst = resolveWorkspacePath(path)
-			local pos, platform, detection = elevatorPlatform(inst)
-			if pos and UNLOAD.voidGuard.landingOK(pos, "hide") then
-				-- Include every physically detected infected for shelter selection,
-				-- not only monsters listed in the routine machine threat filter.
-				local nearName, nearDistance = nearestInfected(pos)
-				if (not nearDistance or nearDistance >= clearance)
-					and not twistedNear(pos, MACHINE.EmergencyDistance + 8) then
-					table.insert(choices, {
-						pos=pos,path=path,platform=platform,detection=detection,
-						distance=(root.Position-pos).Magnitude,
-						clearance=nearDistance or math.huge,
-					})
-				else
-					increment("hideShelterThreatBlocks")
-					debugThrottled("shelter_threat_" .. path,2,"HIDE",
-						"shelter_rejected_enemy",{
-						path=path,enemy=nearName or "unknown",
-						distance=nearDistance or "unknown",minimum=clearance,
-						},"WARN")
-				end
-			end
-		end
-		-- Prefer actual distance from monsters over the closest elevator.
-		table.sort(choices, function(a,b)
-			if a.clearance ~= b.clearance then return a.clearance > b.clearance end
-			return a.distance < b.distance
-		end)
-		for _, chosen in ipairs(choices) do
-			if applyElevatorChoice(chosen,keepGoing,true) then
-				debugEvent("HIDE","shelter_reached", {
-					path=chosen.path,distance=string.format("%.1f",chosen.distance),
-					nearestEnemyDistance=chosen.clearance,
-				})
-				return true
-			end
-		end
-		-- Last grounded checkpoint is a fallback ONLY when on this map,
-		-- physically supported, and outside the full enemy-safety radius.
-		local guard = UNLOAD.voidGuard
-		local home = guard and guard.safeCFrame
-		local homeEnemyDistance
-		if home then
-			local _, distance = nearestInfected(home.Position)
-			homeEnemyDistance = distance
-		end
-		if home and guard.safeMap == workspace:FindFirstChild("Map")
-			and (not homeEnemyDistance or homeEnemyDistance >= clearance)
-			and not twistedNear(home.Position, MACHINE.EmergencyDistance + 8)
-			and guard.landingOK(home.Position + Vector3.new(0,1,0),"hide") then
-			return move(home.Position + Vector3.new(0,1,0),keepGoing,"hide")
-		end
-		increment("hideNoShelter")
-		debugThrottled("hide_no_shelter",1.5,"HIDE","no_supported_shelter",
-			{ minimumEnemyDistance=clearance,critical=critical },"WARN")
-		return false
-	end
-    -- looseFuses was forward-declared for the sound and elevator guards.
+    local looseFuses -- Defined below; shared with the elevator guard.
 	local function finishAtElevator(active, alternative)
         if OPTIONS.Fuseboxes and (farm.blackoutActive or #looseFuses() > 0) then
             debugThrottled("elevator_wait_fuses",1,"FUSE","elevator_blocked_by_fuses",
@@ -5257,7 +4848,7 @@ local function newMachineAutofarm()
 
 	local function checkFuseboxes(active, selectedPath)
 		local candidates, found = {}, {}
-        local confirmed=false
+        local didAttempt=false
 		local function register(prompt, path)
 			if prompt and prompt:IsA("ProximityPrompt") and not found[prompt] then
 				found[prompt] = true
@@ -5316,7 +4907,6 @@ local function newMachineAutofarm()
 			})
 			if not prompt.Enabled then
 				increment("fuseLocatedDisabled")
-				confirmed=true
 			elseif part and not twistedNear(part.Position) then
 				if not move(part.Position + Vector3.new(0, MACHINE.Height, 0), active) then
 					debugEvent("FUSE", "approach_failed", { path=entry.path }, "WARN")
@@ -5329,46 +4919,17 @@ local function newMachineAutofarm()
 					end, "fusebox_arrival")
 					local deadline = os.clock() + math.max(0.7, math.min(2, prompt.HoldDuration + 0.3))
 					local fires = 0
-					local snapStage=0
-					local started=os.clock()
 					while active() and prompt.Parent and prompt.Enabled and os.clock() < deadline do
 						if twistedNear(part.Position) then break end
-						local elapsed=os.clock()-started
-						if snapStage < 2 and elapsed >= (snapStage == 0 and 0.18 or 0.43) then
-							snapStage += 1
-							increment("fuseSyncRetries")
-							local keep=function()
-								return active() and prompt.Parent and prompt.Enabled
-									and not twistedNear(part.Position)
-							end
-							local repositioned
-							if snapStage==1 then
-								repositioned=UNLOAD.refreshPromptContact(prompt,part,keep,"fusebox_retry")
-							else
-								repositioned=UNLOAD.seatPrompt(prompt,part,keep,"fusebox_retry")
-							end
-							if repositioned then
-								increment("fuseSyncRepositions")
-								RunService.Heartbeat:Wait()
-							end
-						end
-						if active() and prompt.Parent and prompt.Enabled
-							and not twistedNear(part.Position) and triggerPrompt(prompt) then
-							fires += 1
-						end
+						if triggerPrompt(prompt) then fires += 1 end
 						task.wait(MACHINE.PromptRetry)
 					end
 					increment("fuseAttempts")
-					if not prompt.Enabled then
-						confirmed=true
-						increment("fuseConfirmedByPrompt")
-					else
-						increment("fuseActivationUnverified")
-					end
+                    if fires > 0 then didAttempt = true end
+					if prompt.Enabled then increment("fuseActivationUnverified") end
 					debugEvent("FUSE", "interaction_result", {
 						path=entry.path,fires=fires,promptEnabled=prompt.Enabled,
-						observedCompletion=not prompt.Enabled,
-						acceptedByServer="not_directly_verified",
+						acceptedByServer="unknown",
 					}, prompt.Enabled and "WARN" or "INFO")
 				end
 			else
@@ -5377,13 +4938,12 @@ local function newMachineAutofarm()
 				}, "WARN")
 			end
 		end
-        -- Sending an input is NOT completion. Wait for the selected prompt to
-        -- become disabled (or retry on next pass); do not abandon the blackout
-        -- just because fireproximityprompt returned successfully.
+        -- A disabled prompt or a sent interaction is enough to release the
+        -- blackout route; neither guarantees server acceptance. Keep diagnostics.
         if selectedPath then
-            return #candidates > 0 and not candidates[1].prompt.Enabled
+            return didAttempt or (#candidates > 0 and not candidates[1].prompt.Enabled)
         end
-        return confirmed
+        return didAttempt
 	end
 
     local function handleBlackout(active)
@@ -5420,7 +4980,7 @@ local function newMachineAutofarm()
 
 	local function loop(myId)
 		local function active() return alive and farm.enabled and runId == myId end
-		-- Hide state is handled explicitly below; no one-frame hidden flag.
+		local hidden = false
 		local lastFire = 0
 		local fireAfter = 0
 		local placedAt = 0
@@ -5431,7 +4991,6 @@ local function newMachineAutofarm()
 		local toolTryAt = setmetatable({}, { __mode="k" })
 		local lastPrompt = nil
 		local lastProgress = nil
-		local promptSyncStage = 0
 		local lastMachineRescan = 0
 		local finished = false
 		local activated, lockedOn = false, false
@@ -5445,7 +5004,6 @@ local function newMachineAutofarm()
 		local doneCandidateAt = nil
 		local emergencyNextMove = false
 		local handoffStartedAt, handoffFrom, handoffReason = nil, nil, nil
-		local handoffReadyAt, handoffReadyTarget, handoffHideObserved = nil, nil, false
 		local abilityTriggeredFor = setmetatable({}, { __mode="k" })
 		local watchedTarget, targetWatchConnections = nil, {}
 		local forceRescan = true
@@ -5464,32 +5022,10 @@ local function newMachineAutofarm()
 				local bigs = getBigMachines()
 				local candidate, anyIncomplete = nearestIncomplete(bigs, excluded)
 				if candidate then return candidate, "work" end
-				-- MainMachineFillingUp can precede the enabled main prompts.
-				-- Do not mistake a missing main prompt for a completed floor.
-				if #bigs == 0 or anyIncomplete then
-					-- Only fall back to a different BASE machine if its prompt is
-					-- truly usable and it was not already counted as complete.
-					-- A brief replication grace prevents snapping back to an old
-					-- completed base objective on the same network frame.
-					if #bigs == 0 and now - (farm.mainReadyAt or now) >= 0.30 then
-						for _, base in ipairs(getMachines()) do
-							-- A new machine is safe to consider, but old BASE models
-							-- can show stale prompts/progress after the main-ready cue.
-							if not (farm.mainReadySeenBases and farm.mainReadySeenBases[base])
-								and base ~= excluded and not abilityTriggeredFor[base]
-								and not isComplete(base) then
-								local p = getPrompt(base)
-								if p and p.Enabled and targetPosition(base) then
-									increment("mainStageFallbacks")
-									debugThrottled("main_stage_base_fallback",1.5,
-										"PERF","main_stage_new_base_work",{target=base.Name},"WARN")
-									return base, "work"
-								end
-							end
-						end
-					end
-					return nil, "wait"
-				end
+				-- Do not return to a stale base-machine percentage while the
+				-- main machine prompt is still spawning or temporarily disabled.
+				-- Once all visible main machines are complete, proceed normally.
+				if #bigs == 0 or anyIncomplete then return nil, "wait" end
 			end
 			-- After the actual completion cue, avoid re-entering the same main
 			-- machine because its progress value is a few frames behind.
@@ -5519,7 +5055,6 @@ local function newMachineAutofarm()
 					if not alive or not farm.enabled then return end
 					if value.Value >= MACHINE.DoneValue then
 						forceRescan = true
-						UNLOAD.verifiedHandoffUntil = os.clock() + 1.4
 						increment("completionWakeups")
 					end
 				end))
@@ -5534,28 +5069,10 @@ local function newMachineAutofarm()
 			table.insert(targetWatchConnections, target.AncestryChanged:Connect(function()
 				forceRescan = true
 			end))
-			table.insert(targetWatchConnections, target.DescendantAdded:Connect(function(child)
-				if child:IsA("ProximityPrompt") then
-					forceRescan = true
-				elseif (child.Name == "OilValue" or child.Name == "ComputerPercentage")
-					and (child:IsA("NumberValue") or child:IsA("IntValue")) then
-					UNLOAD.progressValues[target] = child
-					forceRescan = true
-					increment("objectiveLateValueBinds")
-					-- Rebuild watcher once, so completion fires on the new Value.
-					task.defer(function()
-						if active() and watchedTarget == target then
-							clearTargetWatch()
-							watchTarget(target)
-						end
-					end)
-				end
-			end))
 		end
 		local function noteMachineCompleted(machine)
 			if abilityTriggeredFor[machine] then return end
 			abilityTriggeredFor[machine] = true
-			UNLOAD.verifiedHandoffUntil = os.clock() + 1.5
 			increment("machineCompletions")
 			-- Keep total completions for diagnostics, but never count a completion
 			-- toward the deathless goal while the current life is at 0 HP.
@@ -5593,297 +5110,43 @@ local function newMachineAutofarm()
 		local function beginHandoff(reason, from)
 			if handoffStartedAt then return end
 			handoffStartedAt = os.clock()
-			handoffReadyAt, handoffReadyTarget, handoffHideObserved = nil,nil,false
 			handoffFrom = from and from.Name or "none"
 			handoffReason = reason
 			debugStatus.handoffPending = reason .. " from " .. handoffFrom
 			debugEvent("PERF", "handoff_begin", { from=handoffFrom,reason=reason })
 		end
-		local hide = {
-			active=false,since=0,clearSince=nil,lastMove=-math.huge,
-			relocate=false,reason="none",shelterReached=false,
-		}
-		farm.hideState = hide
-		local function beginHide(reason, shouldRelocate, shouldExit)
-			local now = os.clock()
-			if handoffStartedAt then handoffHideObserved = true end
-			if not hide.active then
-				hide.active = true
-				hide.since = now
-				hide.clearSince = nil
-				hide.reason = reason
-				hide.relocate = shouldRelocate
-				hide.shelterReached = false
-				increment("hideStarts")
-				debugEvent("HIDE","entered", { reason=reason,
-					minimum=MACHINE.HideMinSeconds,clear=MACHINE.HideClearSeconds,
-					target=farm.target and farm.target.Name or "none" }, "WARN")
-			elseif shouldRelocate then
-				hide.relocate = true
-				hide.clearSince = nil
-			end
-			local prompt = farm.target and getPrompt(farm.target)
-			if prompt then cancelMachinePromptHold(prompt) end
-			if shouldExit and (reason == "damage" or reason == "critical_health"
-				or reason == "stage_threat" or chase.exitRequestedSerial ~= chase.serial) then
-				leaveObjective("auto_hide_" .. reason,true,0)
-				if reason == "chase" then chase.exitRequestedSerial=chase.serial end
-			end
-			farm.placed = false
-			lastFire = 0
-			lastPrompt = nil
-			lastProgress = nil
-			usedItem = false
-			chase.holdUntil = math.max(chase.holdUntil,hide.since + MACHINE.HideMinSeconds)
-		end
-		local function handleHide()
-			if not hide.active then return false end
-			local now = os.clock()
-			local root = getPlayerRoot()
-			local health = healthMonitor.old
-			local critical = type(health) == "number" and health <= MACHINE.CriticalHealth
-			local rootEnemyName, rootEnemyDistance
-			if root then
-				rootEnemyName, rootEnemyDistance = nearestInfected(root.Position)
-			end
-			local rootClearance = critical and MACHINE.CriticalShelterClearance
-				or MACHINE.EmergencyDistance + 8
-			local unsafeAtRoot = not root or twistedNear(root.Position,rootClearance)
-				or (rootEnemyDistance and rootEnemyDistance < rootClearance)
-			local target = farm.target
-			if target and (isComplete(target) or not target:IsDescendantOf(workspace)) then
-				if isComplete(target) then
-					beginHandoff("completed_during_hide",target)
-					noteMachineCompleted(target)
-				end
-				farm.target = nil
-				target = nil
-			end
-            local targetPrompt = target and getPrompt(target)
-            local targetPart = targetPrompt and getPromptPart(targetPrompt,target)
-            local targetPoint = targetPart and targetPart.Position
-                or (target and targetPosition(target))
-            -- Do not resume into a threat that is just beyond the normal
-            -- radius while a prompt is temporarily disabled during hiding.
-            local targetUnsafe = targetPoint and twistedNear(targetPoint,MACHINE.Range + 8)
-			if targetUnsafe and now - hide.since >= 0.6 then
-				local alternative = safeAlternative(target)
-				if alternative then
-					farm.target = alternative
-					target = alternative
-					targetUnsafe = false
-					increment("hideSaferTargets")
-					debugEvent("HIDE","safer_objective_selected",{ name=alternative.Name })
-				end
-			end
-			if hide.relocate or unsafeAtRoot then
-				hide.relocate = true
-				if not root or unsafeAtRoot or not hide.shelterReached then
-					if now - hide.lastMove >= 1.0 then
-						hide.lastMove=now
-						UNLOAD.imminentEvacuationUntil=now+1.25
-						hide.shelterReached=goHideShelter(active)
-						if hide.shelterReached then increment("hideRetreats") end
-					end
-				end
-			end
-			-- Do NOT move back after a fixed 0.15-second timer. Hold until both
-			-- the minimum dwell and a continuous safe window have elapsed.
-			if critical then
-				-- At 1 HP another hit ends a 1000-machine streak. Do not
-				-- automatically leave a shelter simply because a timer expired.
-				hide.clearSince = nil
-				if not hide.criticalLogged then
-					hide.criticalLogged = true
-					increment("criticalHealthHolds")
-					debugEvent("HIDE","critical_health_hold", {
-						health=health,needsAbove=MACHINE.CriticalHealth,
-						userMayDisableAutoHide=true,
-					},"WARN")
-				end
-		elseif unsafeAtRoot or targetUnsafe or chase.pending then
-				hide.clearSince = nil
-				increment("hideDangerStays")
-			else
-				if hide.criticalLogged then
-					hide.criticalLogged = false
-					increment("criticalHealthRecoveries")
-					debugEvent("HIDE","critical_health_recovered",{health=health or "unknown"})
-				end
-				hide.clearSince = hide.clearSince or now
-			end
-			local cleared = hide.clearSince and now-hide.clearSince >= MACHINE.HideClearSeconds
-			if cleared and now-hide.since >= MACHINE.HideMinSeconds
-				and now >= chase.holdUntil then
-				hide.active=false
-				chase.eventActive=false
-				chase.threatName=nil
-				farm.placed=false
-				farm.elevatorTarget=nil -- A shelter is NOT the end-of-floor elevator.
-				farm.elevatorSource=nil
-				forceRescan=true
-				increment("hideResumes")
-				debugEvent("HIDE","resuming_objectives",{
-					waitMs=math.floor((now-hide.since)*1000+0.5),
-					target=farm.target and farm.target.Name or "rescan",
-				})
-				return false
-			end
-			increment("hideWaitTicks")
-			return true
-		end
-		-- Move toward the main stage immediately when MainMachineFillingUp plays,
-		-- even if the actual machine prompt has not spawned yet. This is MOVEMENT
-		-- prepositioning only: never claim prompt dispatch/completion in advance.
-		-- Abandon on danger/Auto Hide/blackout, and reject unsupported landings.
-		local function stageMainWhilePromptLoads()
-			local now = os.clock()
-			if now >= (farm.mainReadyUntil or 0) or not handoffStartedAt
-				or hide.active or chase.pending or farm.blackoutActive
-				or farm.floorTransitionConfirmed or farm.awaitingFreshObjectives
-				or not active() or (UNLOAD.voidGuard and UNLOAD.voidGuard.blocked)
-				or farm.mainPrestageSuccess and farm.mainPrestageMap == workspace:FindFirstChild("Map")
-				or now - (farm.mainPrestageAt or -math.huge) < 0.7 then return end
-			if skillcheckProtected and skillcheckProtected() then return end
-			if pickupCoordinator.owner ~= nil then return end
-			if type(healthMonitor.old) == "number"
-				and healthMonitor.old <= MACHINE.CriticalHealth then
-				increment("mainPrestageThreatBlocks")
-				debugThrottled("critical_prestage",3,"HIDE","main_prestage_blocked_low_health",
-					{health=healthMonitor.old},"WARN")
-				return
-			end
-			local stage = resolveWorkspacePath("Map.SpecialFolder.BigMachine")
-			if not stage then return end
-			local part
-			for _, main in ipairs(getBigMachines()) do
-				part = getAdorneePart(main)
-				if part and part:IsA("BasePart") then break end
-			end
-			if not part then
-				local oil = stage:FindFirstChild("Oil",true)
-				part = oil and getAdorneePart(oil) or getAdorneePart(stage)
-			end
-			if not part or not part:IsA("BasePart") then return end
-			local goal = part.Position + Vector3.new(0, MACHINE.Height, 0)
-			local root = getPlayerRoot()
-			farm.mainPrestageAt = now
-			farm.mainPrestageMap = workspace:FindFirstChild("Map")
-			increment("mainPrestageAttempts")
-			local nearestName,nearestDist = nearestInfected(goal)
-			if not root or twistedNear(goal)
-				or (nearestDist and nearestDist < MACHINE.MainPrestageClearance)
-				or not UNLOAD.voidGuard.landingOK(goal,"machine") then
-				increment("mainPrestageBlocked")
-				if nearestDist and nearestDist < MACHINE.MainPrestageClearance then
-					increment("mainPrestageThreatBlocks")
-					debugThrottled("main_prestage_enemy",2,"HIDE","main_prestage_unsafe",
-						{enemy=nearestName,distance=nearestDist},"WARN")
-				end
-				return
-			end
-			if (root.Position-goal).Magnitude < 7 then
-				farm.mainPrestageSuccess = true
-				increment("mainPrestageSuccess")
-				return
-			end
-			local arrived = move(goal,function()
-				return active() and not hide.active and not chase.pending
-					and not farm.blackoutActive and not farm.floorTransitionConfirmed
-			end,"handoff")
-			if arrived then
-				farm.mainPrestageSuccess = true
-				increment("mainPrestageSuccess")
-				debugEvent("PERF","main_stage_prepositioned",{
-					msAfterCue=math.floor((now - farm.mainReadyAt)*1000 + 0.5),
-					position=tostring(goal),waitingFor="main_prompt_enabled",
-				})
-			else
-				increment("mainPrestageBlocked")
-			end
-		end
 		farm.placed = false
 		beginHandoff("start", nil)
 		while active() do
-			if UNLOAD.voidGuard and UNLOAD.voidGuard.blocked then
-				debugThrottled("void_motion_frozen",5,"VOID","autofarm_paused_for_safety",
-					{ reason="repeated_or_failed_void_recovery" },"ERROR")
-				task.wait(0.3)
-				continue
-			end
-            if workspace:FindFirstChild("Map") ~= farm.soundMapRef then
-                markNewMap(workspace:FindFirstChild("Map"), "machine_worker")
-                forceRescan = true
-            end
-			-- Health loss must interrupt ALL machine phases, including the
-			-- no-target/main-prompt wait where v2.6.51 missed 2 -> 1 HP.
-			local damageSerial = UNLOAD.damageRetreatSerial or 0
-			if damageSerial > lastDamageRetreatSerial then
-				lastDamageRetreatSerial = damageSerial
-				if OPTIONS.AutoHide and not farm.floorTransitionConfirmed
-					and not farm.elevatorEmergencyLocked then
-					increment("damageRetreatTriggers")
-					if not farm.placed then increment("damageIdleRetreats") end
-					debugEvent("HIDE","damage_interrupt_any_phase", {
-						target=farm.target and farm.target.Name or "none",
-						placed=farm.placed,health=healthMonitor.old or "unknown",
-					},"WARN")
-					beginHide("damage",true,farm.placed == true)
+			if workspace:FindFirstChild("Map") ~= farm.soundMapRef then
+				local transitioned = farm.floorTransitionConfirmed
+				local newMap = workspace:FindFirstChild("Map")
+				farm.soundMapRef = newMap
+				-- The workspace ChildAdded listener may already have reset the global
+				-- phase; synchronize the worker-local flag either way.
+				if UNLOAD.pickupBefore.mapRef ~= newMap then
+					UNLOAD.pickupBefore.reset("machine_new_map")
 				end
-			end
-			if OPTIONS.AutoHide and not farm.floorTransitionConfirmed
-				and not farm.elevatorEmergencyLocked
-				and type(healthMonitor.old) == "number"
-				and healthMonitor.old <= MACHINE.CriticalHealth
-				and not hide.active then
-				beginHide("critical_health",true,farm.placed == true)
-			end
-			-- The main-stage preposition can become exposed to enemies while
-			-- the 15-second game prompt activation runs. Monitor that waiting phase.
-			if OPTIONS.AutoHide and not hide.active and not farm.floorTransitionConfirmed
-				and farm.mainPrestageSuccess
-				and farm.mainPrestageMap == workspace:FindFirstChild("Map")
-				and os.clock() <= (farm.mainReadyUntil or 0)
-				and not farm.placed then
-				local stageRoot = getPlayerRoot()
-				local stageName,stageDist
-				if stageRoot then
-					stageName,stageDist = nearestInfected(stageRoot.Position)
+				startupPickupsDone = UNLOAD.pickupBefore.completed
+				waitStart = nil
+				finished = false
+				farm.placed = false
+				farm.target = nil
+				clearTargetWatch()
+				farm.soundDoneTarget,farm.soundDoneUntil = nil,0
+				farm.mainReadyUntil,farm.elevatorDoorOpenUntil = 0,0
+				resetFlushSignals()
+				farm.elevatorTarget = nil
+				farm.allDoneSince = nil
+				farm.elevatorEmergencyLocked = false
+				farm.finalizing = false
+				if transitioned then
+					UNLOAD.floorStatus(nil,"wait")
+					increment("soundFloorTransitionResets")
+					debugEvent("SOUND","new_floor_map_detected")
 				end
-				if stageDist and stageDist < MACHINE.MainPrestageClearance then
-					increment("stagedThreatRetreats")
-					debugEvent("HIDE","staged_wait_threat_detected", {
-						enemy=stageName,distance=stageDist,
-					},"WARN")
-					beginHide("stage_threat",true,false)
-				end
+				forceRescan = true
 			end
-			-- Allow an explicit user choice to disable Auto Hide. Otherwise a
-			-- 1-HP run remains sheltered until healed above the critical level.
-			if not OPTIONS.AutoHide and hide.active then
-				hide.active = false
-				debugEvent("HIDE","manually_overridden",{ reason="auto_hide_disabled" },"WARN")
-			elseif hide.active and handleHide() then
-				task.wait(0.06)
-				continue
-			end
-            if farm.awaitingFreshObjectives then
-                local nextObj, nextStage = pickMachine()
-                local nextPrompt = nextObj and getPrompt(nextObj)
-                local nextPart = nextPrompt and nextPrompt.Enabled and getPromptPart(nextPrompt, nextObj)
-                if nextStage == "work" and nextPart then
-                    farm.awaitingFreshObjectives = false
-                    farm.elevatorFastRetryAt = 0
-                    doneAt, doneValue = 0, false
-                    forceRescan = true
-                    debugEvent("SOUND", "new_floor_objectives_ready", {
-                        target=nextObj.Name, stage=nextStage,
-                    })
-                else
-                    task.wait(0.10)
-                    continue
-                end
-            end
 			if farm.floorTransitionConfirmed then
 				-- No objective teleports, breaker interactions or elevator retry
 				-- corrections on the floor after the door-close completion event.
@@ -5893,12 +5156,10 @@ local function newMachineAutofarm()
 				end
 				farm.target, farm.placed = nil, false
 				if freshFloorObjectivesPresent() then
-                    resetFlushSignals()
-                    farm.awaitingFreshObjectives = false
-                    farm.elevatorFastRetryAt = 0
-                    farm.elevatorTarget = nil
-                    farm.allDoneSince = nil
-                    farm.elevatorEmergencyLocked = false
+					resetFlushSignals()
+					farm.elevatorTarget = nil
+					farm.allDoneSince = nil
+					farm.elevatorEmergencyLocked = false
 					farm.finalizing = false
 					UNLOAD.floorState.seen = false
 					UNLOAD.floorState.finished = false
@@ -5983,17 +5244,19 @@ local function newMachineAutofarm()
 						{ enemy=dangerName,distance=string.format("%.1f",dangerDistance) },"WARN")
 				end
 			end
-			local protected, checkType = skillcheckProtected()
-			-- Once completion has been observed, the disappearing skillcheck UI
-			-- must not hold the next objective hostage.
-			local completedTarget = farm.target and
-				(isComplete(farm.target) or
-				(farm.soundDoneTarget == farm.target
-				and os.clock() <= (farm.soundDoneUntil or 0)))
-			if completedTarget then
-				UNLOAD.verifiedHandoffUntil = os.clock() + 1.4
+			if (UNLOAD.damageRetreatSerial or 0) > lastDamageRetreatSerial then
+				lastDamageRetreatSerial = UNLOAD.damageRetreatSerial
+				if farm.placed then
+					if not chase.pending then chase.serial = (chase.serial or 0) + 1 end
+					chase.pending = true
+					UNLOAD.imminentEvacuationUntil = os.clock() + 0.8
+					increment("damageRetreatTriggers")
+					debugEvent("DANGER","damage_forces_machine_retreat", {
+						target=farm.target and farm.target.Name or "none" },"WARN")
+				end
 			end
-			if protected and not hide.active and not completedTarget and not chase.pending
+			local protected, checkType = skillcheckProtected()
+			if protected and not chase.pending
 				and not (dangerAtRoot and dangerDistance
 					and dangerDistance <= MACHINE.EmergencyDistance)
 				and os.clock() > (UNLOAD.imminentEvacuationUntil or 0) then
@@ -6005,18 +5268,50 @@ local function newMachineAutofarm()
 				task.wait(MACHINE.Tick)
 				continue
 			end
+			if chase.pending and root and farm.target and farm.placed then
+				local remaining = getProgress(farm.target)
+				if remaining and remaining >= MACHINE.NearFinishAt and remaining < MACHINE.DoneValue then
+					local _, closest = nearestInfected(root.Position)
+					if not chase.eventActive and (not closest or closest > 40)
+						and os.clock() > (UNLOAD.imminentEvacuationUntil or 0) then
+						chase.pending, chase.holdUntil = false, 0
+						motionPauseUntil = 0
+						increment("machineChaseDeferred")
+						debugThrottled("finish_chase_deferred", 3, "MACHINE", "near_finish_chase_held",
+							{ name=farm.target.Name,progress=remaining,nearest=closest or "none" })
+					end
+				end
+			end
 			if chase.pending then
 				chase.pending = false
-				debugEvent("DANGER","chase_shelter_requested", {
-					target=farm.target and farm.target.Name or "none",
-				},"WARN")
-				-- The Chase listener may already have queued the remote exit. Do
-				-- not queue it twice, but never wait on InvokeServer before escape.
-				beginHide("chase",true,true)
-			end
-			if hide.active and handleHide() then
-				task.wait(0.06)
-				continue
+				chase.holdUntil = os.clock() + MACHINE.ChaseHold
+				debugLog("chase started: hiding")
+				local currentPrompt = farm.target and getPrompt(farm.target)
+				if currentPrompt then cancelMachinePromptHold(currentPrompt) end
+				farm.placed = false
+				lastFire = 0
+				lastPrompt = nil
+				lastProgress = nil
+				usedItem = false
+				-- Proximity/damage triggered hides do not have a Chase event; send
+				-- the same unconditional exit request for those as well. Chase events
+				-- already queued their own remote above, even during skillchecks.
+				if chase.exitRequestedSerial ~= chase.serial then
+					leaveObjective("auto_hide_chase_escape", true, 0)
+					chase.exitRequestedSerial = chase.serial
+				else
+					-- The exit request was dispatched by the Chase event.
+					-- Travel starts now, without waiting on the network response.
+					local flight = UNLOAD.exitInFlight
+					if flight and flight.finished and not flight.successful then
+						leaveObjective("auto_hide_chase_retry", true, 0)
+					end
+				end
+				if root then
+					hidden = goElevator(false, active)
+				else
+					hidden = false
+				end
 			end
 			if finished and not farm.elevatorEmergencyLocked then
 				local newObjective, newStatus = scanMachine()
@@ -6036,6 +5331,16 @@ local function newMachineAutofarm()
 				if availableObjective or objectiveStatus == "wait" then
 					local now = os.clock()
 					UNLOAD.pickupBefore.started = UNLOAD.pickupBefore.started or now
+					if not UNLOAD.pickupBefore.active then
+						UNLOAD.pickupBefore.active = true
+						increment("pickupWindowsOpened")
+						debugEvent("PICKUP", "pickup_window_open", {
+							capsules=capsuleFarm.enabled,items=itemFarm.enabled,
+							candy=candyFarm.enabled,
+							machineTarget=farm.target and farm.target.Name or "none",
+							limitSeconds=MACHINE.ItemWaitMax,
+						})
+					end
 					if not waitStart then
 						waitStart = UNLOAD.pickupBefore.started
 						increment("pickupBeforeWaits")
@@ -6045,7 +5350,9 @@ local function newMachineAutofarm()
 					local snapshot = scanFinalPickups()
 					local collectorWorking = pickupBusy() or pickupCoordinator.owner ~= nil
 					local safePending = snapshot.safe > 0 or collectorWorking
-					local spawnGrace = elapsed < 0.7
+					-- Give the freshly replicated pickup folders a short opportunity
+					-- to expose prompts before declaring the floor empty.
+					local spawnGrace = elapsed < 1.8
 					local expired = elapsed >= MACHINE.ItemWaitMax
 					local stalled = elapsed > pickupCircuit.MaxStallSeconds
 						and debugStats.pickupAttempts > 0
@@ -6054,6 +5361,7 @@ local function newMachineAutofarm()
 						pending = true
 					else
 						UNLOAD.pickupBefore.completed = true
+						UNLOAD.pickupBefore.active = false
 						startupPickupsDone = true
 						pickupCoordinator.home = nil
 						if activeMotion and activeMotion.owner == "pickup" then cancelMotion("pickup") end
@@ -6070,12 +5378,13 @@ local function newMachineAutofarm()
 			end
 			if not anyPickup and not UNLOAD.pickupBefore.completed then
 				UNLOAD.pickupBefore.completed = true
+				UNLOAD.pickupBefore.active = false
 				startupPickupsDone = true
 			end
 			if pending and not farm.placed then
 				local currentPrompt = farm.target and getPrompt(farm.target)
 				if currentPrompt then cancelMachinePromptHold(currentPrompt) end
-				farm.placed = false
+				hidden, farm.placed = false, false
 				lastFire = 0
 				lastPrompt = nil
 				usedItem = false
@@ -6156,26 +5465,12 @@ local function newMachineAutofarm()
 				if target ~= loggedTarget then
 					lastContactAt = -math.huge
 					loggedTarget = target
-					promptSyncStage = 0
 					debugStatus.currentTarget = target and target.Name or "None"
 					increment("machineTargetChanges")
 					debugEvent("MACHINE", "target_changed", { name=target and target.Name or "none",status=status })
 				end
 				local prompt = target and getPrompt(target)
 				local part = prompt and getPromptPart(prompt, target)
-				if handoffStartedAt and (not part or not prompt or not prompt.Enabled) then
-					stageMainWhilePromptLoads()
-					if os.clock()-handoffStartedAt >= 0.30 then
-						debugThrottled("handoff_prompt_unready",2,"PERF","handoff_waiting_for_prompt",{
-							from=handoffFrom,ms=math.floor((os.clock()-handoffStartedAt)*1000+0.5),
-							candidate=target and target.Name or "none",
-							mainCue=farm.mainReadyUntil>os.clock(),safetyHold=handoffHideObserved,
-						},"INFO")
-					end
-				end
-				if part and prompt.Enabled and handoffStartedAt and handoffReadyTarget ~= target then
-					handoffReadyAt,handoffReadyTarget = os.clock(),target
-				end
 				if part then
 					UNLOAD.floorStatus(target, "work")
 					doneCandidateAt = nil
@@ -6186,38 +5481,61 @@ local function newMachineAutofarm()
 					finished = false
 					local danger, dangerName, dangerDist = twistedNear(part.Position)
 					local progressNow = getProgress(target)
-					-- A danger at the NEXT objective is not evidence that the player
-					-- is being chased. Never spam leave/retreat while already safe.
+					if danger and progressNow and progressNow >= MACHINE.NearFinishAt
+						and progressNow < MACHINE.DoneValue and dangerDist and dangerDist > 34 then
+						debugThrottled("near_finish_danger_" .. tostring(target), 4,
+							"MACHINE", "near_finish_danger_held", { name=target.Name,
+							progress=progressNow,enemy=dangerName,distance=dangerDist })
+						danger = false
+					end
+					if danger then
+						clearSince = nil
+					elseif not clearSince then
+						clearSince = os.clock()
+					end
 					if danger then
 						farm.placed = false
 						cancelMachinePromptHold(prompt)
-						local nearPlayer = twistedNear(root.Position,MACHINE.EmergencyDistance)
-						local alternative = safeAlternative(target)
-						increment("machineDangers")
-						debugThrottled("danger_target_" .. tostring(target),1.5,
-							"DANGER","unsafe_objective",{
-							name=target.Name,enemy=tostring(dangerName),
-							distance=string.format("%.1f",dangerDist or 0),
-							nearPlayer=nearPlayer == true,
-							alternative=alternative and alternative.Name or "none",
-							},"WARN")
-						if alternative and not nearPlayer then
-							beginHandoff("danger_reroute",target)
-							farm.target = alternative
-							forceRescan=true
-						else
-							-- If the character is safe, hold position; if being chased,
-							-- move to a supported shelter. Neither case teleports back
-							-- until the clear window has been continuously satisfied.
-							beginHide("unsafe_objective",nearPlayer == true,nearPlayer == true)
+						lastFire = 0
+						lastPrompt = nil
+						lastProgress = getProgress(target)
+						usedItem = false
+						if not hidden then
+							increment("machineDangers")
+							debugEvent("DANGER", "machine_threat", { enemy=tostring(dangerName),
+								distance=string.format("%.1f",dangerDist or 0),machine=target.Name }, "WARN")
+							leaveObjective("infected_near_machine", true, 0)
+							-- Escape follows the request; an unreturned response cannot
+							-- indefinitely hold the character near an infected.
+							local alternative = safeAlternative(target)
+							if alternative then
+								beginHandoff("danger_reroute", target)
+								debugLog("switching to " .. alternative.Name)
+								farm.target = alternative
+								emergencyNextMove = true
+							else
+								debugLog("hiding at elevator")
+								hidden = goElevator(false, active)
+							end
 						end
-					elseif hide.active then
+					elseif hidden and os.clock() - clearSince < MACHINE.ClearHold then
 						farm.placed = false
 						cancelMachinePromptHold(prompt)
 					elseif os.clock() < chase.holdUntil then
 						farm.placed = false
 						cancelMachinePromptHold(prompt)
+						lastFire = 0
+						lastPrompt = nil
+						usedItem = false
+						if not hidden then
+							if os.clock() - (chase.holdExitAt or -math.huge) > 0.5 then
+								chase.holdExitAt = os.clock()
+								leaveObjective("auto_hide_hold_retry", true, 0)
+							end
+							hidden = goElevator(false, active)
+						end
 					else
+						hidden = false
 						if farm.placed and prompt.Enabled and (root.Position - part.Position).Magnitude > prompt.MaxActivationDistance then
 							farm.placed = false
 						end
@@ -6237,7 +5555,6 @@ local function newMachineAutofarm()
 							-- contact walk could cost hundreds of ms on EVERY handoff.
 							local initialFireAt = os.clock()
 							local initialFired = triggerMachinePrompt(prompt)
-							farm.lastPromptTarget,farm.lastPromptAt = target,os.clock()
 							increment("fastPromptDispatches")
 							if not initialFired and active() and not isComplete(target) then
 								local contacted = UNLOAD.refreshPromptContact(prompt, part, function()
@@ -6258,7 +5575,6 @@ local function newMachineAutofarm()
 									prompt, part = fresh, freshPart
 									increment("machineInitialPromptRetries")
 									initialFired = triggerMachinePrompt(prompt)
-									farm.lastPromptTarget,farm.lastPromptAt = target,os.clock()
 								end
 							end
 							debugEvent("PERF", "prompt_after_teleport", {
@@ -6268,19 +5584,6 @@ local function newMachineAutofarm()
 							if handoffStartedAt then
 								increment("fastHandoffs")
 								local ms = math.floor((os.clock() - handoffStartedAt) * 1000 + 0.5)
-								local promptWaitMs = math.floor((math.max(0,(handoffReadyAt or os.clock())-handoffStartedAt))*1000+0.5)
-								local readyMoveMs = math.floor(math.max(0,os.clock()-(handoffReadyAt or os.clock()))*1000+0.5)
-								if handoffReason ~= "start" then
-									increment("handoffPromptWaitMs",promptWaitMs)
-									increment("handoffReadyMoveMs",readyMoveMs)
-									if promptWaitMs > 250 then increment("handoffLongWaits") end
-									if readyMoveMs > 100 and not handoffHideObserved then
-										increment("handoffSlowReadyMoves")
-										debugEvent("PERF","slow_dispatch_after_ready",{
-											ms=readyMoveMs,to=target.Name,from=handoffFrom,
-										},"WARN")
-									end
-								end
 								if handoffReason == "start" then
 									debugStats.firstObjectiveMs = ms
 								else
@@ -6293,18 +5596,16 @@ local function newMachineAutofarm()
 								debugStatus.handoffPending = "None"
 								debugEvent("PERF", handoffReason == "start" and "first_objective" or "handoff_complete", {
 									from=handoffFrom,to=target.Name,ms=ms,
-									promptNotReadyMs=promptWaitMs,readyToDispatchMs=readyMoveMs,
-									autoHideDuringWait=handoffHideObserved,
 									reason=handoffReason,dispatched=initialFired,
 								})
 								handoffStartedAt, handoffFrom, handoffReason = nil, nil, nil
-								handoffReadyAt,handoffReadyTarget,handoffHideObserved = nil,nil,false
 							end
 							lastFire = initialFireAt
 							fireAfter = 0
 							farm.placed = true
 							startupPickupsDone = true
 							UNLOAD.pickupBefore.completed = true
+							UNLOAD.pickupBefore.active = false
 							moved = true
 							placedAt = os.clock()
 							increment("machinePlacements")
@@ -6315,7 +5616,6 @@ local function newMachineAutofarm()
 							usedItem = false
 							lastPrompt = prompt
 							lastProgress = getProgress(target)
-							promptSyncStage = 0
 							activated, lockedOn = false, false
 							lastProgressAt = os.clock()
 							checkingSince = nil
@@ -6325,14 +5625,6 @@ local function newMachineAutofarm()
 							and progress > lastProgress
 						if progress ~= nil then lastProgress = progress end
 						if progressAdvanced then
-							if promptSyncStage > 0 and promptSyncStage <= #MACHINE.PromptSyncStages then
-								increment("machineSyncProgressConfirmed")
-								debugEvent("PROMPT","delayed_progress_confirmed",{
-									target=target.Name,attempts=promptSyncStage,
-									afterArrivalMs=math.floor((os.clock()-placedAt)*1000+0.5),
-								})
-							end
-							promptSyncStage = #MACHINE.PromptSyncStages + 1
 							lastProgressAt = os.clock()
 							activated = true
 							if logProgress then
@@ -6364,63 +5656,10 @@ local function newMachineAutofarm()
 							checkingSince = nil
 						end
 						local paused = checking and os.clock() - checkingSince < MACHINE.SkillcheckPause
-						-- The first prompt is dispatched on the teleport frame. A client-side
-						-- successful dispatch does NOT mean the server received proximity.
-						-- At most three guarded retries, only if progress has not started.
-						-- Keep objective handoffs instant; this retry path runs afterwards.
-						if farm.placed and not activated and not checking and not paused
-							and not hide.active and not chase.pending and not activeMotion
-							and not isComplete(target) and prompt.Enabled
-							and promptSyncStage < #MACHINE.PromptSyncStages
-							and os.clock()-placedAt >= MACHINE.PromptSyncStages[promptSyncStage+1] then
-							promptSyncStage += 1
-							local stage=promptSyncStage
-							increment("machineSyncRetries")
-							local fresh=getPrompt(target)
-							local freshPart=fresh and getPromptPart(fresh,target)
-							if fresh and fresh.Enabled and freshPart then
-								prompt,part=fresh,freshPart
-							end
-							local center=getPromptPosition(prompt,part)
-							local inRange=(root.Position-center).Magnitude <= math.max(0,prompt.MaxActivationDistance-0.15)
-							local corrected=inRange
-							local keepContact=function()
-								return active() and farm.target == target and farm.placed
-									and not hide.active and not chase.pending and not isComplete(target)
-									and target:IsDescendantOf(workspace) and prompt.Enabled
-									and not twistedNear(center)
-							end
-							if stage == 3 then
-								corrected=UNLOAD.seatPrompt(prompt,part,keepContact,"machine_sync_retry")
-							elseif stage == 2 or not inRange then
-								corrected=UNLOAD.refreshPromptContact(prompt,part,keepContact,"machine_sync_retry")
-							end
-							if corrected and (stage >= 2 or not inRange) then
-								increment("machineSyncRepositions")
-								-- Give the engine a frame to observe this corrected CFrame.
-								RunService.Heartbeat:Wait()
-							end
-							if corrected and keepContact()
-								and (root.Position-getPromptPosition(prompt,part)).Magnitude
-									<= prompt.MaxActivationDistance then
-								lastFire=os.clock()
-								local dispatched=triggerMachinePrompt(prompt)
-								farm.lastPromptTarget,farm.lastPromptAt=target,os.clock()
-								debugEvent("PROMPT","post_teleport_sync_retry",{
-									machine=target.Name,stage=stage,dispatched=dispatched,
-									contactMoved=stage >= 2 or not inRange,
-									msAfterArrival=math.floor((os.clock()-placedAt)*1000+0.5),
-								})
-							else
-								increment("machineSyncBlocked")
-								debugThrottled("machine_sync_blocked_"..tostring(target),2,
-									"PROMPT","post_teleport_sync_blocked",{machine=target.Name,stage=stage},"WARN")
-							end
-						end
 						if prompt.Enabled and not activated and farm.placed and not checking
-							and os.clock() - placedAt >= 1.45
-							and os.clock() - lastProgressAt >= 1.45
-							and os.clock() - lastContactAt >= 1.6
+							and os.clock() - placedAt >= 0.8
+							and os.clock() - lastProgressAt >= 0.8
+							and os.clock() - lastContactAt >= 1.2
 							and (root.Position - part.Position).Magnitude <= prompt.MaxActivationDistance + 3 then
 							lastContactAt = os.clock()
 							local currentProgress = getProgress(target)
@@ -6475,7 +5714,6 @@ local function newMachineAutofarm()
 								debugLog(string.format("first fire %s %.2fs after place", target.Name, os.clock() - placedAt))
 							end
 							triggerMachinePrompt(prompt)
-							farm.lastPromptTarget,farm.lastPromptAt = target,os.clock()
 						end
 						if autoUse.enabled and activated and not usedItem and farm.placed
 							and not checking and not (skillcheckProtected and skillcheckProtected())
@@ -6494,6 +5732,7 @@ local function newMachineAutofarm()
 						if not verifyTarget and UNLOAD.floorStatus(verifyTarget, verifyStatus) then
 							finished = true
 							UNLOAD.pickupBefore.completed = true
+							UNLOAD.pickupBefore.active = false
 							pickupCircuit.finalized = true
 							pickupCoordinator.home = nil
 							pickupCoordinator.owner = nil
@@ -6504,7 +5743,6 @@ local function newMachineAutofarm()
 									ms=math.floor((now - handoffStartedAt) * 1000 + 0.5),
 								})
 								handoffStartedAt, handoffFrom, handoffReason = nil, nil, nil
-								handoffReadyAt,handoffReadyTarget,handoffHideObserved = nil,nil,false
 								debugStatus.handoffPending = "None"
 							end
 							debugEvent("MACHINE", "all_complete", { autoElevator=OPTIONS.AutoElevator,
@@ -6591,10 +5829,10 @@ local function newMachineAutofarm()
 		end, function()
 			local function active() return alive and farm.enabled and runId == myId end
 			while active() do
-                if farm.floorTransitionConfirmed or farm.awaitingFreshObjectives then
-                    task.wait(0.12)
-                    continue
-                end
+				if farm.floorTransitionConfirmed then
+					task.wait(0.05)
+					continue
+				end
 				-- Let the blackout/fuse worker finish before any elevator correction
 				-- or final teleport. Sounds are prompts to check state, not proof
 				-- that server-side elevator entry has been registered.
@@ -6671,15 +5909,12 @@ local function newMachineAutofarm()
 							and farm.elevatorSource ~= farm.elevatorSoundPath and not farm.elevatorTransit then
 							farm.elevatorTarget = nil
 						end
-                        if not farm.elevatorTarget and not farm.finalizing
-                            and not farm.awaitingFreshObjectives
-                            and os.clock() >= (farm.elevatorFastRetryAt or 0)
-                            and os.clock() >= (farm.elevatorCountdownHoldUntil or 0)
-                            and not farm.elevatorTransit and not farm.elevatorEmergencyLocked
-                            and os.clock()-farm.allDoneSince >= 0.20
-                            and not (skillcheckProtected and skillcheckProtected()) then
-                            farm.elevatorFastRetryAt = os.clock() + 0.75
-                            increment("elevatorFastDispatch")
+						if not farm.elevatorTarget and not farm.finalizing
+							and os.clock() >= (farm.elevatorCountdownHoldUntil or 0)
+							and not farm.elevatorTransit and not farm.elevatorEmergencyLocked
+							and os.clock()-farm.allDoneSince >= 0.20
+							and not (skillcheckProtected and skillcheckProtected()) then
+							increment("elevatorFastDispatch")
 							debugEvent("MACHINE","elevator_fast_dispatch", {
 								reason=UNLOAD.floorState.completionReason },"WARN")
 							finishAtElevator(active)
@@ -6905,13 +6140,10 @@ local function newMachineAutofarm()
 	function farm.disable()
 		local wasEnabled = farm.enabled
 		farm.enabled = false
-		if farm.hideState then farm.hideState.active = false end
-        farm.soundDoneTarget,farm.soundDoneUntil = nil,0
-        farm.mainReadyUntil,farm.elevatorDoorOpenUntil = 0,0
-        resetFlushSignals()
-        farm.awaitingFreshObjectives = false
-        farm.elevatorFastRetryAt = 0
-        farm.allDoneSince = nil
+		farm.soundDoneTarget,farm.soundDoneUntil = nil,0
+		farm.mainReadyUntil,farm.elevatorDoorOpenUntil = 0,0
+		resetFlushSignals()
+		farm.allDoneSince = nil
 		farm.elevatorWatchFired = false
 		farm.elevatorEmergencyLocked = false
 		farm.elevatorTarget = nil
@@ -6930,9 +6162,10 @@ local function newMachineAutofarm()
 			if protected then
 				debugEvent("MACHINE", "disable_exit_deferred_skillcheck", { ui=checkType }, "INFO")
 			else
-				leaveObjective("machine_autofarm_disabled", true, 0)
-				-- Disabling automation must not teleport the character to a random
-				-- elevator, especially when an incomplete objective remains.
+				leaveObjective("machine_autofarm_disabled", true)
+				if OPTIONS.AutoElevator then
+					goElevator(true, function() return alive and not farm.enabled end)
+				end
 			end
 		end
 	end
@@ -7477,8 +6710,7 @@ local function debugReport()
 		string.format("SessionSeconds=%.2f PlaceId=%s JobId=%s",
 			os.clock() - debugStart,tostring(game.PlaceId),tostring(game.JobId)),
 		"Mode=" .. OPTIONS.MovementMode .. " underMapDepth=" .. tostring(OPTIONS.TweenDepth),
-		"Movement policy=AFK machine/pickup/fuse/return routes use surface teleports only; unsupported targets rejected",
-		"VoidGuard=grounded checkpoint; auto-recovery; lock after 3 recoveries/30s; deathless safety first",
+		"Movement policy=instant objective handoffs and Auto Hide; routine pickups/finish routes use selected mode",
 		"UI layout=Manual (ESP, view, movement), AFK (machine automation, survival, pickups, blackout, automatic item use), Diagnostics",
 		"Movement priority=instant objective handoffs/Auto Hide; routine pickups follow movement selection; prompt spam stays at 16/s",
 		"LOS=disabled only for prompts; pickup routing uses monster-to-pickup raycasts (client-side estimates)",
@@ -7488,24 +6720,21 @@ local function debugReport()
 		"Skillcheck protection=normally defer exits and travel; immediate danger or health loss permits urgent escape",
 		"Elevator check=platform, alternative elevator position, and optional replicated state; no server entry guarantee",
 		"Pickups=before machines only; 24s phase budget and 8s no-progress cutoff",
-				"Elevator fallback=short grounded CFrame steps only; backup after 3.5-11s; 15s watchdog with bounded retry if entry unverified",
+				"Elevator fallback=physical supported walking even on floor; backup after 3.5-11s; 15s watchdog with bounded retry if entry unverified",
 		"Ability=press F once per detected machine completion; no cooldown HUD polling or Ability remote",
 		"Ability input dispatched is not proof the game accepted it; active skillchecks block completion handling",
-		"Prompts=enabled-aware lookup, visibility events, teleport-only contact correction; dispatched is not confirmed",
+		"Prompts=enabled-aware lookup, visibility events, Humanoid move and single mode-specific correction; dispatched is not confirmed",
 		"Snake safety=client-only collidable rectangular guard follows every TSnakes; live rectangular below-snake pickup exclusion; checks on route/prompt/retry",
 		"Autofarm prompt correction=teleport-only, no Humanoid Move/MoveTo or walking keys; elevator touch-entry recovery remains independent",
 		"Item hotkeys=executor keypress preferred, VIM fallback; input success does not prove item effect",
 		"AbilityConfig: " .. fieldString(ABILITY),
 		"Death export=automatic when observed health <= 0 (once per life)",
-		"Handoff timing=objective completion to prompt dispatch (full ms); separate prompt-not-ready and ready-to-dispatch ms; main cue may preposition before prompt spawns",
-		"Prompt activation=instant initial fire is unverified; recheck at 0.14/0.38/0.78s only without progress; bounded safe snap and secondary retries; no Humanoid walking",
-		"Fusebox activation=dispatched input is unverified; retries 0.18/0.43s and requires selected prompt disabled before marking blackout box handled",
-		"Sound cues=MainMachineFillingUp means base done; MainMachineCompleted means main done; Flush secondary; Fuses blackout; Countdown StopSound early hint; DoorClosing final only when all objectives complete",
-		"Elevator choice=after final machines use ElevatorDoor Parent ancestry; blackout box=opposite of last closed elevator door; quarantine new map until real objectives spawn; throttle geometry fallback",
+		"Handoff timing=objective completion/unavailable to first immediate prompt dispatch; progression wakeup is value event-driven",
+		"Sound cues=MainMachineFillingUp means base done; MainMachineCompleted means main done; Flush is secondary; Fuses starts blackout; ElevatorCountdown StopSound is early hint; ElevatorDoorClosing confirms floor completion",
+		"Elevator choice=after final machines use ElevatorDoor Parent ancestry; blackout box=opposite of last closed elevator door; 2s geometry fallback for actual elevator",
         "Blackout=fuse objects under workspace.Items collected separately before chosen fusebox; Item Autofarm ignores Fuse",
-		"Threat detection=physical BasePart cores only (Folder HRP-safe) + short approaching-velocity prediction + vertical separation + explicit chase event",
-		"Auto Hide transitions=damage interrupts all machine phases; shelter enemies checked across monster types; >=2.5s dwell plus >=1.5s continuously clear; at 1 HP hold until healed or Auto Hide disabled",
-		"CriticalHealthPolicy=at or below 1 HP all machine movement pauses at safe shelter; main-stage prepositioning rejects enemy exposure",
+		"Threat detection=nearest active moving core + short approaching-velocity prediction + vertical separation + explicit chase event",
+		"Auto Hide transitions=asynchronous exit request, immediate emergency teleport, 0.15s minimum chase hold, 0.10s clear debounce",
 		"Session objective target=1000 machine completions in a single 0-HP-free streak; GOAL.Streak resets to zero on death",
 		"FloorState: " .. fieldString({ observed=UNLOAD.floorState.seen,
 			completed=UNLOAD.floorState.completed,finished=UNLOAD.floorState.finished,
@@ -7517,22 +6746,11 @@ local function debugReport()
 		"Stats: " .. fieldString(debugStats),
 		"Goal: " .. fieldString(GOAL),
 		"Status: " .. fieldString(debugStatus),
-		"AutoHideState: " .. fieldString(machineFarm and machineFarm.hideState and {
-			active=machineFarm.hideState.active,reason=machineFarm.hideState.reason,
-			seconds=machineFarm.hideState.active and
-				string.format("%.2f",os.clock()-machineFarm.hideState.since) or "0",
-			shelterReached=machineFarm.hideState.shelterReached,
-		} or { active=false }),
 		string.format("Performance: firstObjectiveMs=%d handoffs=%d averageMs=%.1f maxMs=%d lastMs=%d slowScans=%d cacheRefreshes=%d cacheHits=%d",
 			debugStats.firstObjectiveMs,debugStats.handoffs,
 			debugStats.handoffs > 0 and debugStats.handoffTotalMs / debugStats.handoffs or 0,
 			debugStats.handoffMaxMs,debugStats.handoffLastMs,debugStats.slowMachineScans,
 			debugStats.targetCacheRefreshes,debugStats.targetCacheHits),
-		"HandoffDetail: " .. fieldString({ promptNotReadyMs=debugStats.handoffPromptWaitMs,
-			readyToDispatchMs=debugStats.handoffReadyMoveMs,longWaits=debugStats.handoffLongWaits,
-			slowReadyMoves=debugStats.handoffSlowReadyMoves,mainPrestageAttempts=debugStats.mainPrestageAttempts,
-			mainPrestageSuccess=debugStats.mainPrestageSuccess,mainPrestageBlocked=debugStats.mainPrestageBlocked,
-			mainStageFallbacks=debugStats.mainStageFallbacks }),
 		"Movement: " .. fieldString({ mode=OPTIONS.MovementMode,depth=OPTIONS.TweenDepth,speed=PICKUP_TRAVEL.Speed }),
 		"Rendering3D=" .. (OPTIONS.Disable3DRendering and "disabled" or "enabled"),
 		"SelenaCamera: " .. fieldString({ enabled=UNLOAD.selenaLook.enabled,chasing=UNLOAD.selenaLook.chaseSeen,
@@ -7544,6 +6762,7 @@ local function debugReport()
 			debugStats.underMapGuardBlocks,debugStats.pickupTweenDistance),
 		"PickupTiming=Before; 0.14s teleport / 0.11s tween pickup-only interruptible gaps",
 		"PickupPhase: " .. fieldString({ completed=UNLOAD.pickupBefore.completed,
+			active=UNLOAD.pickupBefore.active,
 			started=UNLOAD.pickupBefore.started ~= nil,mapLoaded=UNLOAD.pickupBefore.mapRef ~= nil }),
 		"PickupGuard: " .. fieldString({ paused=pickupCircuit.paused,finalized=pickupCircuit.finalized,
 			contactRetries=debugStats.pickupContactRetries,contactRecovered=debugStats.pickupContactRecovered,
@@ -7618,7 +6837,7 @@ supervise("diagnostic UI", function() return alive end, function()
 		if main.Visible then for _, refresh in ipairs(toggleRefreshers) do refresh() end end
 		if main.Visible then
 			local working = (machineFarm.enabled and "MACHINE") or (pickupBusy() and "PICKUPS") or "IDLE"
-			headerStatus.Text = working .. "  •  " .. (BUILD:match("v%d+%.%d+%.%d+") or "RAVA")
+			headerStatus.Text = working .. "  •  v2.6.45"
 			headerStatus.TextColor3 = working == "IDLE" and UI.muted or UI.good
 			footerLabel.Text = string.format("%s   •   %s   •   %d moves", BUILD, OPTIONS.MovementMode,
 				debugStats.teleports + debugStats.underMapTweens)
