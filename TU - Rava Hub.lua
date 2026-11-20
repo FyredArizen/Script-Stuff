@@ -68,7 +68,7 @@ local OPTIONS = {
 	MovementMode="Teleport",TweenDepth=-15,Disable3DRendering=false,
 }
 
-local BUILD = "TU Rava Hub v2.6.45"
+local BUILD = "TU Rava Hub v2.6.46"
 local debugStart = os.clock()
 local LOG_LIMIT = 4000
 local debugLines, debugIndex, debugLast = {}, 0, {}
@@ -156,6 +156,8 @@ local debugStats = {
 	soundMainCompleted=0,soundMainCompletedDoor=0,soundMainCompletionVerified=0,
 	soundBlackout=0,soundBlackoutDispatches=0,soundBlackoutDeferred=0,
 	soundWakeups=0,soundHandoffs=0,soundIgnored=0,
+	voidLandingsBlocked=0,voidDropsDetected=0,voidRecoveries=0,voidRecoveryFailures=0,
+	voidCircuitTrips=0,voidSurfaceSnapshots=0,voidTweenRoutesBlocked=0,
 }
 -- Tracks the user's actual goal: 1,000 machine completions without reaching 0 HP.
 -- Total machine completions remain separate because a cumulative count would
@@ -355,6 +357,169 @@ local function cancelMotion(owner)
 	end
 end
 UNLOAD.cancelMovement = cancelMotion
+
+-- Avoid sending the character into missing collision geometry (especially
+-- the elevator's old unverified -20-stud fallback). An AFK session should
+-- prefer a skipped objective to falling below the map and losing a life.
+do
+    local guard = { blocked=false, recovering=false, safeCFrame=nil,
+        safeMap=nil, safePart=nil, safeAt=0, previousRoot=nil,
+        sampleAt=0, recentRecoveries={}, lastMovementAt=0 }
+    UNLOAD.voidGuard = guard
+
+    local function floorBelow(point, maxDrop, character)
+        if typeof(point) ~= "Vector3" then return nil end
+        if point.Y <= workspace.FallenPartsDestroyHeight + 25 then return nil end
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        local ignore = {}
+        if character then table.insert(ignore, character) end
+        local snakePlates = workspace:FindFirstChild("TU_Rava_SnakeGuards")
+        if snakePlates then table.insert(ignore, snakePlates) end
+        params.FilterDescendantsInstances = ignore
+        pcall(function() params.RespectCanCollide = true end)
+        -- Several passes ignore decorative, transparent or non-collidable
+        -- surfaces without ignoring legitimate glass or solid platforms.
+        for attempt=1,7 do
+            local hit = workspace:Raycast(point + Vector3.new(0,2,0),
+                Vector3.new(0,-(maxDrop+2),0),params)
+            if not hit then return nil end
+            local part = hit.Instance
+            local vertical = point.Y - hit.Position.Y
+            if hit.Normal.Y >= 0.48 and vertical >= -0.15 and vertical <= maxDrop
+                and (part == workspace.Terrain or (part and part.CanCollide)) then
+                return hit
+            end
+            if not part then return nil end
+            table.insert(ignore,part)
+            params.FilterDescendantsInstances=ignore
+        end
+        return nil
+    end
+
+    function guard.landingOK(where, owner)
+        if guard.blocked or guard.recovering then return false,"recovery_locked" end
+        if typeof(where) ~= "Vector3" then return false,"invalid_position" end
+        if where.Y <= workspace.FallenPartsDestroyHeight + 35 then
+            return false,"near_destroy_height"
+        end
+        local character=player.Character
+        -- The approach to a prompt may be somewhat higher than the ground;
+        -- require a genuinely collidable floor in the landing column.
+        if not floorBelow(where,22,character) then
+            return false,"no_supported_landing"
+        end
+        return true,"ground_found"
+    end
+
+    function guard.noteMove(owner,where)
+        guard.lastMovementAt=os.clock()
+    end
+
+    function guard.recover(reason, root)
+        if guard.recovering or guard.blocked then return false end
+        guard.recovering=true
+        local character=player.Character
+        local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+        local safe=guard.safeCFrame
+        local sameMap=guard.safeMap == workspace:FindFirstChild("Map")
+        -- A saved platform from the previous floor is not a safe destination.
+        local valid=safe and sameMap and guard.safePart and guard.safePart.Parent
+            and floorBelow(safe.Position,10,character)
+        local ok=false
+        motionPauseUntil=math.max(motionPauseUntil,os.clock()+2.0)
+        if valid and character and root and root.Parent and humanoid
+            and humanoid.Health > 0 then
+            pcall(cancelMotion)
+            if UNLOAD.abortOrbit then pcall(UNLOAD.abortOrbit) end
+            ok=pcall(function()
+                root.Anchored=false
+                root.AssemblyLinearVelocity=Vector3.zero
+                root.AssemblyAngularVelocity=Vector3.zero
+                root.CFrame=(safe+Vector3.new(0,1.5,0))
+            end)
+            ok=ok and root.Parent ~= nil
+                and (root.Position-(safe.Position+Vector3.new(0,1.5,0))).Magnitude < 7
+        end
+        if ok then
+            increment("voidRecoveries")
+            local now=os.clock()
+            table.insert(guard.recentRecoveries,now)
+            while #guard.recentRecoveries > 0
+                and now-guard.recentRecoveries[1] > 30 do
+                table.remove(guard.recentRecoveries,1)
+            end
+            if #guard.recentRecoveries >= 3 then
+                -- Repeated recoveries indicate a bad map/route: lock motion.
+                guard.blocked=true
+                increment("voidCircuitTrips")
+            end
+        else
+            increment("voidRecoveryFailures")
+            -- No proven support => stop all future automated movements.
+            guard.blocked=true
+        end
+        debugEvent("VOID",ok and "safe_position_restored" or "recovery_failed",{
+            reason=reason,restored=ok,locked=guard.blocked,
+            rootY=root and math.floor(root.Position.Y) or "missing",
+            savedY=safe and math.floor(safe.Position.Y) or "none",
+            mapMatched=sameMap,
+        },ok and "WARN" or "ERROR")
+        guard.recovering=false
+        return ok
+    end
+
+    local elapsed=0
+    local conn=RunService.Heartbeat:Connect(function(dt)
+        if not alive or guard.recovering or guard.blocked then return end
+        elapsed+=dt
+        if elapsed < 0.08 then return end
+        elapsed=0
+        local character=player.Character
+        local root=character and character:FindFirstChild("HumanoidRootPart")
+        local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+        if not root or not root.Parent or not humanoid or humanoid.Health <= 0 then return end
+        if root ~= guard.previousRoot then
+            guard.previousRoot=root
+            guard.safeCFrame=nil
+            guard.safePart=nil
+            guard.safeMap=nil
+            guard.safeAt=0
+            guard.recentRecoveries={}
+        end
+        local pos=root.Position
+        local time=os.clock()
+        local supported=(not root.Anchored and not activeMotion)
+            and floorBelow(pos,8,character)
+        if supported then
+            -- A stable landing snapshot is trustworthy only with solid support.
+            if (not guard.safeCFrame) or time-guard.safeAt > 0.20 then
+                guard.safeCFrame=root.CFrame
+                guard.safePart=supported.Instance
+                guard.safeMap=workspace:FindFirstChild("Map")
+                guard.safeAt=time
+                increment("voidSurfaceSnapshots")
+            end
+            return
+        end
+        local lowerThanSafe=guard.safeCFrame
+            and pos.Y < guard.safeCFrame.Position.Y - 17
+        local nearKillHeight=pos.Y <= workspace.FallenPartsDestroyHeight + 45
+        local falling=root.AssemblyLinearVelocity.Y < -12
+        -- Only recover when there's no ground within a generous lower column.
+        -- This avoids interrupting normal jumps and server floor transitions.
+        local farBelowSafe=guard.safeCFrame
+            and pos.Y < guard.safeCFrame.Position.Y - 35
+        if (nearKillHeight or (lowerThanSafe and falling) or farBelowSafe)
+            and not floorBelow(pos,30,character) then
+            increment("voidDropsDetected")
+            guard.recover(nearKillHeight and "kill_height" or "falling_below_floor",root)
+        end
+    end)
+    table.insert(connections,conn)
+    table.insert(cleanups,function() guard.blocked=true end)
+end
+
 local function instantTeleport(destination, keepGoing, owner, mode)
 	local emergency = mode == "emergency" or mode == "elevator"
 	if not alive or not keepGoing() then return false end
@@ -390,6 +555,14 @@ local function instantTeleport(destination, keepGoing, owner, mode)
 		debugThrottled("root_" .. owner, 5, "MOVE", "root_missing", { owner=owner }, "WARN")
 		return false
 	end
+	local landingOK, landingWhy = UNLOAD.voidGuard.landingOK(destination.Position,owner)
+	if not landingOK then
+		increment("voidLandingsBlocked")
+		debugThrottled("unsafe_landing_"..tostring(owner),1.5,"VOID",
+			"teleport_rejected",{ owner=owner,reason=landingWhy,
+			to=tostring(destination.Position) },"WARN")
+		return false
+	end
 	local from = root.Position
 	local distance = (from - destination.Position).Magnitude
 	if distance < 0.25 then return true end
@@ -416,6 +589,7 @@ local function instantTeleport(destination, keepGoing, owner, mode)
 			{ owner=owner,drift=string.format("%.2f",drift),target=tostring(destination.Position) }, "WARN")
 		return false
 	end
+	UNLOAD.voidGuard.noteMove(owner,destination.Position)
 	increment("teleports")
 	debugEvent("MOVE", "teleport", {
 		owner=owner,mode=emergency and "emergency" or "routine",
@@ -448,6 +622,13 @@ local function tweenUnderMap(destination, keepGoing, owner, mode)
 	if not root or not root:IsDescendantOf(workspace) then return false, "missing_root" end
 	local from = root.Position
 	local goal = destination.Position
+	local landingOK,landingWhy=UNLOAD.voidGuard.landingOK(goal,owner)
+	if not landingOK then
+		increment("voidLandingsBlocked")
+		debugThrottled("bad_tween_landing_"..tostring(owner),2,"VOID",
+			"tween_rejected",{owner=owner,reason=landingWhy},"WARN")
+		return false,landingWhy
+	end
 	if (from - goal).Magnitude < 0.25 then return true, "already_there" end
 	if not emergency and infectedNear and infectedNear(goal, owner == "pickup" and PICKUP_TRAVEL.SafetyRadius or 15) then
 		increment("underMapGuardBlocks")
@@ -614,6 +795,14 @@ local function teleportCharacter(destination, keepGoing, owner, mode)
 	if owner == "machine" and (mode == "handoff" or mode == "hide") then
 		return instantTeleport(destination, keepGoing, owner,
 			mode == "hide" and "emergency" or "fast")
+	end
+	-- AFK movement is always surface teleport: anchored under-map tweens can
+	-- strand the character beneath a removed platform or moving elevator.
+	if owner == "machine" or owner == "pickup" or owner == "return" then
+		if OPTIONS.MovementMode == "Tween" then
+			increment("voidTweenRoutesBlocked")
+		end
+		return instantTeleport(destination, keepGoing, owner, mode)
 	end
 	if OPTIONS.MovementMode == "Teleport" then
 		return instantTeleport(destination, keepGoing, owner, mode)
@@ -1377,6 +1566,11 @@ do
             return false,"enemy_nearby"
         end
         if not keepGoing() or player.Character ~= character then return false,"interrupted" end
+        local okay,why=UNLOAD.voidGuard.landingOK(destination,"prompt")
+        if not okay then
+            increment("voidLandingsBlocked")
+            return false,why
+        end
         local success,err=pcall(function()
             root.AssemblyLinearVelocity=Vector3.zero
             root.AssemblyAngularVelocity=Vector3.zero
@@ -1462,6 +1656,11 @@ do
                 if infectedNear and (infectedNear(root.Position,radiusRisk)
                     or infectedNear(goal,radiusRisk)) then
                     result="enemy_nearby" break
+                end
+                local landingOK=UNLOAD.voidGuard.landingOK(goal,"prompt_orbit")
+                if not landingOK then
+                    increment("voidLandingsBlocked")
+                    result="orbit_landing_unsafe" break
                 end
                 root.AssemblyLinearVelocity=Vector3.zero
                 root.AssemblyAngularVelocity=Vector3.zero
@@ -4382,7 +4581,13 @@ local function newMachineAutofarm()
 			end
 			return pos, best, bestKind, scanned
 		end
-		return fallback, nil, "unverified_offset", scanned
+		-- Never aim at an arbitrary -20 stud offset: it may be below the map.
+		if UNLOAD.voidGuard and UNLOAD.voidGuard.landingOK(fallback,"elevator_fallback") then
+			return fallback,nil,"unverified_offset_grounded",scanned
+		end
+		debugThrottled("elevator_void_fallback",2,"VOID",
+			"unsupported_elevator_offset_skipped",{position=tostring(fallback)},"WARN")
+		return nil
 	end
 	local function platformContains(part, point)
 		if not part or not part.Parent then return false end
@@ -6655,7 +6860,8 @@ local function debugReport()
 		string.format("SessionSeconds=%.2f PlaceId=%s JobId=%s",
 			os.clock() - debugStart,tostring(game.PlaceId),tostring(game.JobId)),
 		"Mode=" .. OPTIONS.MovementMode .. " underMapDepth=" .. tostring(OPTIONS.TweenDepth),
-		"Movement policy=instant objective handoffs and Auto Hide; routine pickups/finish routes use selected mode",
+		"Movement policy=AFK machine/pickup/fuse/return routes use surface teleports only; unsupported targets rejected",
+		"VoidGuard=grounded checkpoint; auto-recovery; lock after 3 recoveries/30s; deathless safety first",
 		"UI layout=Manual (ESP, view, movement), AFK (machine automation, survival, pickups, blackout, automatic item use), Diagnostics",
 		"Movement priority=instant objective handoffs/Auto Hide; routine pickups follow movement selection; prompt spam stays at 16/s",
 		"LOS=disabled only for prompts; pickup routing uses monster-to-pickup raycasts (client-side estimates)",
